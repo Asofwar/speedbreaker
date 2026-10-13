@@ -316,14 +316,20 @@ namespace gpu::bars
     // "WINNER" polaroid over asphalt and leaves; the title's and Controls'
     // key art have the same shape) is one opaque textured quad of the front
     // end, centred, x +-1.104 and y +-0.981 of the 16:9 band. On a 16:9
-    // screen it hides the world (a thin border of it shows at the top and
-    // bottom, as on the console, where a TV's overscan hid it); past the band
-    // (Hor+ beside it, Vert+ above and below it) the world rendered behind
-    // it showed: the race's road and cars at the sides of the results on an
-    // iPhone (2868x1320). What a 16:9 screen shows of it is kept, the art's
-    // own pixels too; everything else past the band (what no 16:9 screen
-    // shows) is filled black, as a 16:9 picture's letterbox. Thresholds in
-    // band units. The nearest draws it must not take: the fades and dims
+    // screen it hides the world but for a thin border at the top and bottom
+    // (y 0.981 to 1: ~7 of 720 rows each), where the race behind it shows;
+    // a real 360's own output has that border too (HDMI captures of the
+    // results screen), and a TV's overscan hid it. Past the band (Hor+
+    // beside it, Vert+ above and below it) the world rendered behind it
+    // showed as well: the race's road and cars at the sides of the results
+    // on an iPhone (2868x1320). The art's own pixels are all kept, past the
+    // band too; everything else is filled black on every screen shape, 16:9
+    // too: past the band (what no 16:9 screen shows, as a 16:9 picture's
+    // letterbox) and, inside it, the rows between the picture's top or
+    // bottom edge and the band's (what a period TV's overscan hid). The
+    // title's and Controls' key art have black around them already, so their
+    // fill changes nothing on screen. Thresholds in band units. The nearest
+    // draws it must not take: the fades and dims
     // (+-1.29: flat, and the widen, stretch and cover rules' own), the pause
     // dim (C8 alpha) and its gradients, the vid cam's noise and dark overlays
     // (3C alpha, x +-0.70), the overlay at the intro's start (x +-1.104, B8
@@ -366,13 +372,14 @@ namespace gpu::bars
         return true;
     }
 
-    // What a backdrop fills, inside the draw's scissor: what lies past the
-    // band (the columns beside it under Hor+, the rows above and below it
-    // under Vert+; at most one of the view scales is below 1) and outside
-    // the backdrop's own box, up to kFillEdge: per side, the part beyond the
-    // box and, where the box reaches into that side, the parts above and
-    // below it (Hor+; left and right of it under Vert+). At most 6.
-    inline uint32_t BackdropRects(const Box& b, const float ps[4], float hostW, float hostH, const Rect& scissor, float scaleX, float scaleY,
+    // What a backdrop fills past the band, inside the draw's scissor: what
+    // lies past it (the columns beside it under Hor+, the rows above and
+    // below it under Vert+; at most one of the view scales is below 1) and
+    // outside the backdrop's own box, up to kFillEdge: per side, the part
+    // beyond the box and, where the box reaches into that side, the parts
+    // above and below it (Hor+; left and right of it under Vert+). At most
+    // 6; none at 16:9.
+    inline uint32_t PastBandRects(const Box& b, const float ps[4], float hostW, float hostH, const Rect& scissor, float scaleX, float scaleY,
         Rect out[6])
     {
         uint32_t n = 0;
@@ -408,6 +415,45 @@ namespace gpu::bars
             add(-e, b.x0, inB, -scaleY);
         }
         return n;
+    }
+
+    // The overscan rows, inside the draw's scissor: inside the band, the
+    // rows between the backdrop's top edge and the band's and between its
+    // bottom edge and the band's (y +-0.981 to +-1 of the band for the
+    // results picture), across the band's width. Where the band's edge is
+    // the screen's (y at 16:9 and under Hor+, x at 16:9 and under Vert+)
+    // they reach kFillEdge, as the fills past the band do (at 2x with
+    // half-pixel centres the outermost row's centre lies past clip 1); where
+    // it isn't, they stop at it and PastBandRects' rectangles go on from
+    // there, meeting them on the same pixel edge (gpu::bars::Edge). None
+    // where the box reaches the band's edge. At most 2.
+    inline uint32_t OverscanRows(const Box& b, const float ps[4], float hostW, float hostH, const Rect& scissor, float scaleX, float scaleY,
+        Rect out[2])
+    {
+        uint32_t n = 0;
+        auto add = [&](float cx0, float cx1, float cy0, float cy1) {
+            if (cx1 <= cx0 || cy1 <= cy0)
+                return;
+            const Rect c = Intersect(ClipToHost(cx0, cx1, cy0, cy1, ps, hostW, hostH), scissor);
+            if (!Empty(c) && n < 2)
+                out[n++] = c;
+        };
+        const float e = kFillEdge;
+        const float bandX = scaleX < 1.0f ? scaleX : e, bandY = scaleY < 1.0f ? scaleY : e;
+        add(-bandX, bandX, b.y1, bandY);
+        add(-bandX, bandX, -bandY, b.y0);
+        return n;
+    }
+
+    // What a backdrop fills, inside the draw's scissor: everything outside
+    // its box but the columns inside the band beside it (none for a picture
+    // as wide as the band): PastBandRects' and then OverscanRows'
+    // rectangles, which never overlap. At most 8.
+    inline uint32_t BackdropRects(const Box& b, const float ps[4], float hostW, float hostH, const Rect& scissor, float scaleX, float scaleY,
+        Rect out[8])
+    {
+        const uint32_t n = PastBandRects(b, ps, hostW, hostH, scissor, scaleX, scaleY, out);
+        return n + OverscanRows(b, ps, hostW, hostH, scissor, scaleX, scaleY, out + n);
     }
 
     // The posScale that stretches the quad's box over [-edge, edge] in clip
@@ -459,7 +505,7 @@ namespace gpu::bars
         Box box{};          // the quad's, clip space
         uint32_t argb = 0;  // its colour
         uint32_t rectCount = 0;
-        Rect rects[6]{};
+        Rect rects[8]{};    // a bar's 2, a black frame's 2, a backdrop's 8
         float posScale[4]{};
     };
 
@@ -482,13 +528,14 @@ namespace gpu::bars
     }
 
     // The register checks for a backdrop, before any vertex is read:
-    // Candidate's, but over a large t0 (a picture, not the white texture).
+    // Candidate's, but over a large t0 (a picture, not the white texture),
+    // at every screen shape (16:9 too: its overscan rows).
     inline bool BackdropCandidate(const Draw& d, const BackdropRule& rule = {})
     {
         const float* c = d.c;
         const bool yScale = d.frontEndY > 0.0f ? std::fabs(std::fabs(c[5]) - d.frontEndY) <= d.frontEndY * 1e-5f
                                                : d.frontEndY == 0.0f && d.scaleY >= 1.0f;
-        return (d.scaleX < 1.0f || d.scaleY < 1.0f) && !d.occlusion && d.prim == 13 && d.count == 4 && d.frontEndShader && d.leftAlone &&
+        return !d.occlusion && d.prim == 13 && d.count == 4 && d.frontEndShader && d.leftAlone &&
             c[3] == 0.0f && c[4] == 0.0f && c[6] == 0.0f && c[7] == 0.0f && yScale && (d.vte & 0xF) == 0xF &&
             (d.blend0 == 0x07060706u || d.blend0 == 0x00010001u) && d.t0Sampled && d.t0Width >= rule.minTexels && d.t0Height >= rule.minTexels;
     }

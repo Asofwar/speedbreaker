@@ -691,17 +691,21 @@ static void PlantedBackdrop(const char* what, const BackdropRule& wrong)
 }
 
 // The backdrop's fill against pixel centres: every pixel of the scissor
-// past the band and outside the box is filled, exactly once; nothing in the
-// band or the box is (ties within 1/256 pixel skipped). `rects` makes the
-// rectangles (BackdropRects, or a planted fault). Returns the wrong pixels.
+// outside the box is filled, exactly once, if it lies past the band or in
+// a row above or below the box (the band's overscan rows, at every shape,
+// 16:9 too); nothing in the box is, nor in the band beside it within its
+// rows (ties within 1/256 pixel skipped). `rects` makes the rectangles
+// (BackdropRects, or a planted fault). Returns the wrong pixels; the
+// overscan pixels it checked (in the band, above or below the box) go to
+// `overscan`.
 using BackdropRectsFn = uint32_t (*)(const Box&, const float*, float, float, const Rect&, float, float, Rect*);
 static int BackdropOracle(const char* what, float sx, float sy, const Box& b, const float ps[4], float hostW, float hostH, const Rect& scissor,
-    BackdropRectsFn rects, bool print = true)
+    BackdropRectsFn rects, bool print = true, int* overscan = nullptr)
 {
-    Rect r[6]{};
+    Rect r[8]{};
     const uint32_t n = rects(b, ps, hostW, hostH, scissor, sx, sy, r);
     const float pxX = std::fabs(ps[0]) * hostW * 0.5f, pxY = std::fabs(ps[1]) * hostH * 0.5f;
-    int wrong = 0, ties = 0;
+    int wrong = 0, ties = 0, rows = 0;
     for (int32_t y = scissor.y0; y < scissor.y1; y++)
         for (int32_t x = scissor.x0; x < scissor.x1; x++)
         {
@@ -719,23 +723,28 @@ static int BackdropOracle(const char* what, float sx, float sy, const Box& b, co
             // centres the first row's centre is past clip 1, still the band).
             const bool inBand = (sx >= 1.0f || std::fabs(cx) < sx) && (sy >= 1.0f || std::fabs(cy) < sy);
             const bool inBox = cx > b.x0 && cx < b.x1 && cy > b.y0 && cy < b.y1;
+            const bool pastRows = cy > b.y1 || cy < b.y0;  // above or below the box
+            const bool want = !inBox && (!inBand || pastRows);
+            rows += inBand && pastRows;
             int filled = 0;
             for (uint32_t i = 0; i < n; i++)
                 filled += x >= r[i].x0 && x < r[i].x1 && y >= r[i].y0 && y < r[i].y1;
-            if (filled != ((inBand || inBox) ? 0 : 1))
+            if (filled != (want ? 1 : 0))
             {
                 if (print && wrong < 3 && std::getenv("EDGE_BARS_DEBUG"))
-                    printf("    wrong px %d,%d: clip %.5f %.5f, band %d box %d filled %d\n", x, y, cx, cy, inBand, inBox, filled);
+                    printf("    wrong px %d,%d: clip %.5f %.5f, band %d box %d rows %d filled %d\n", x, y, cx, cy, inBand, inBox, pastRows, filled);
                 wrong++;
             }
         }
+    if (overscan)
+        *overscan = rows;
     if (print)
     {
         printf("backdrop fill %s: %u rect(s)", what, n);
         for (uint32_t i = 0; i < n; i++)
             printf(" [%d,%d)x[%d,%d)", r[i].x0, r[i].x1, r[i].y0, r[i].y1);
-        printf(", %d pixel(s) wrong (%d on an edge, skipped)\n", wrong, ties);
-        CHECK(wrong == 0, "%s: %d pixels filled wrongly (in the band or the box, twice, or left)", what, wrong);
+        printf(", %d overscan px, %d pixel(s) wrong (%d on an edge, skipped)\n", rows, wrong, ties);
+        CHECK(wrong == 0, "%s: %d pixels filled wrongly (in the box or beside it in the band, twice, or left)", what, wrong);
     }
     return wrong;
 }
@@ -801,7 +810,8 @@ static void BackdropTests()
     };
     const Case cases[] = { { "2560x1080", 0.75f, 1.0f }, { "2868x1320 (iPhone 18 Pro Max)", 0.818182f, 1.0f }, { "3440x1440", 0.744186f, 1.0f },
         { "32:9", 0.5f, 1.0f }, { "1.95:1 (the picture past the screen edge)", 0.912f, 1.0f }, { "1280x800", 1.0f, 0.9f },
-        { "1024x768", 1.0f, 0.75f }, { "1200x800", 1.0f, 0.84375f } };
+        { "1024x768", 1.0f, 0.75f }, { "1200x800", 1.0f, 0.84375f }, { "1280x720 (16:9)", 1.0f, 1.0f },
+        { "2732x2048 (iPad Pro)", 1.0f, 0.750366f }, { "3024x1898 (MacBook Pro 14)", 1.0f, 0.896207f } };
     int wrong = 0;
     for (const Case& c : cases)
     {
@@ -823,28 +833,65 @@ static void BackdropTests()
     }
     printf("backdrop fill: %d wrong pixel(s) over %zu shapes\n", wrong, std::size(cases));
     {
+        // The overscan rows at the 8 screen shapes, 1x and 2x (half-pixel
+        // centres): the results picture leaves rows of the band above and
+        // below it at every shape, 16:9 too, and each of them is filled
+        // once (the oracle above, which also counts them).
+        printf("\nbackdrop overscan rows:\n");
+        int rowsWrong = 0;
+        for (const Shape& sh : kShapes)
+        {
+            const Box results{ -kBackdropX * sh.sx, kBackdropX * sh.sx, -kBackdropY * sh.sy, kBackdropY * sh.sy };
+            char what[160];
+            int px1 = 0, px2 = 0;
+            snprintf(what, sizeof(what), "%s, overscan rows, 1x", sh.name);
+            rowsWrong += BackdropOracle(what, sh.sx, sh.sy, results, ps, 1280, 2048, frame, BackdropRects, true, &px1);
+            snprintf(what, sizeof(what), "%s, overscan rows, 2x, half-pixel", sh.name);
+            rowsWrong += BackdropOracle(what, sh.sx, sh.sy, results, half, 2560, 4096, frame2, BackdropRects, true, &px2);
+            // Rows: 0.019 of the band's half height each, ~7 * sy at 1x
+            // (5 at 4:3), across the band's width.
+            const int rowsMin = int(0.019f * sh.sy * 360.0f) - 1, wide = int(1280.0f * std::min(sh.sx, 1.0f)) - 2;
+            CHECK(px1 >= 2 * rowsMin * wide && px2 >= 4 * 2 * rowsMin * wide, "%s: overscan px %d (1x) %d (2x), want >= %d and %d", sh.name, px1,
+                px2, 2 * rowsMin * wide, 8 * rowsMin * wide);
+        }
+        printf("backdrop overscan rows: %d wrong pixel(s) over %zu shapes x 1x, 2x\n", rowsWrong, std::size(kShapes));
+    }
+    {
         // The rectangles themselves, 2868x1320 at 1x: columns past the
         // picture's sides (x +-1.104 band = 0.9033 clip: from column 1218,
-        // to 62), and the corners past the band (0.8182 clip: column 1164)
-        // above and below it (y +-0.981: rows 0..6 and 713..719).
-        Rect r[6]{};
+        // to 62), the corners past the band (0.8182 clip: column 1164)
+        // above and below it (y +-0.981: rows 0..6 and 713..719), and the
+        // overscan rows between them, inside the band (columns 116..1163).
+        Rect r[8]{};
         const Box results{ -kBackdropX * 0.818182f, kBackdropX * 0.818182f, -kBackdropY, kBackdropY };
         const uint32_t n = BackdropRects(results, ps, 1280, 2048, frame, 0.818182f, 1.0f, r);
-        const Rect want[6] = { { 1218, 0, 1280, 720 }, { 1164, 0, 1218, 7 }, { 1164, 713, 1218, 720 }, { 0, 0, 62, 720 }, { 62, 0, 116, 7 },
-            { 62, 713, 116, 720 } };
-        CHECK(n == 6, "iPhone: %u rects, want 6", n);
-        for (uint32_t i = 0; i < n && i < 6; i++)
+        const Rect want[8] = { { 1218, 0, 1280, 720 }, { 1164, 0, 1218, 7 }, { 1164, 713, 1218, 720 }, { 0, 0, 62, 720 }, { 62, 0, 116, 7 },
+            { 62, 713, 116, 720 }, { 116, 0, 1164, 7 }, { 116, 713, 1164, 720 } };
+        CHECK(n == 8, "iPhone: %u rects, want 8", n);
+        for (uint32_t i = 0; i < n && i < 8; i++)
             CHECK(Same(r[i], want[i]), "iPhone: rect %u [%d,%d)x[%d,%d), want [%d,%d)x[%d,%d)", i, r[i].x0, r[i].x1, r[i].y0, r[i].y1, want[i].x0,
                 want[i].x1, want[i].y0, want[i].y1);
         // Vert+: the rows above and below the band, whole (the picture stops
-        // inside it in y and past the screen in x).
+        // inside it in y and past the screen in x), then the band's overscan
+        // rows (y +-0.981 x 0.75 = 0.736: rows 90..94 and 625..629).
         const Box r43{ -kBackdropX, kBackdropX, -kBackdropY * 0.75f, kBackdropY * 0.75f };
         const uint32_t n43 = BackdropRects(r43, ps, 1280, 2048, frame, 1.0f, 0.75f, r);
-        CHECK(n43 == 2 && Same(r[0], Rect{ 0, 0, 1280, 90 }) && Same(r[1], Rect{ 0, 630, 1280, 720 }), "4:3: %u rects [%d,%d)x[%d,%d) ...", n43,
-            r[0].x0, r[0].x1, r[0].y0, r[0].y1);
-        // 16:9: nothing.
+        CHECK(n43 == 4 && Same(r[0], Rect{ 0, 0, 1280, 90 }) && Same(r[1], Rect{ 0, 630, 1280, 720 }) && Same(r[2], Rect{ 0, 90, 1280, 95 }) &&
+                Same(r[3], Rect{ 0, 625, 1280, 630 }),
+            "4:3: %u rects [%d,%d)x[%d,%d) [%d,%d)x[%d,%d) ...", n43, r[0].x0, r[0].x1, r[0].y0, r[0].y1, r[2].x0, r[2].x1, r[2].y0, r[2].y1);
+        // 16:9: the overscan rows alone, rows 0..6 and 713..719, the whole
+        // width; none for a picture over the whole band.
         const Box r169{ -kBackdropX, kBackdropX, -kBackdropY, kBackdropY };
-        CHECK(BackdropRects(r169, ps, 1280, 2048, frame, 1.0f, 1.0f, r) == 0, "16:9: a backdrop fills nothing");
+        const uint32_t n169 = BackdropRects(r169, ps, 1280, 2048, frame, 1.0f, 1.0f, r);
+        CHECK(n169 == 2 && Same(r[0], Rect{ 0, 0, 1280, 7 }) && Same(r[1], Rect{ 0, 713, 1280, 720 }), "16:9: %u rects [%d,%d)x[%d,%d) ...", n169,
+            r[0].x0, r[0].x1, r[0].y0, r[0].y1);
+        const Box whole{ -1.0f, 1.0f, -1.0f, 1.0f };
+        CHECK(BackdropRects(whole, ps, 1280, 2048, frame, 1.0f, 1.0f, r) == 0, "16:9: a picture over the whole band fills nothing at 1x");
+        // ... and at 2x with half-pixel centres only the top row, whose
+        // centre lies past clip 1 (the picture is one host row lower: its
+        // bottom edge is past the frame's).
+        const uint32_t n2 = BackdropRects(whole, half, 2560, 4096, frame2, 1.0f, 1.0f, r);
+        CHECK(n2 == 1 && Same(r[0], Rect{ 0, 0, 2560, 1 }), "16:9 2x: %u rects [%d,%d)x[%d,%d) ...", n2, r[0].x0, r[0].x1, r[0].y0, r[0].y1);
     }
     printf("\nplanted, backdrop fill (each must fail):\n");
     {
@@ -863,7 +910,7 @@ static void BackdropTests()
             return BlackoutRects(ps, w, h, sc, sx, sy, out);
         });
         run("past the picture only (no corners)", [](const Box& b, const float* ps, float w, float h, const Rect& sc, float sx, float sy, Rect* out) {
-            Rect r[6]{};
+            Rect r[8]{};
             const uint32_t n = BackdropRects(b, ps, w, h, sc, sx, sy, r);
             uint32_t m = 0;
             for (uint32_t i = 0; i < n; i++)
@@ -877,6 +924,69 @@ static void BackdropTests()
             wider.x1 = std::min(b.x1, sx);
             return BackdropRects(wider, ps, w, h, sc, sx, sy, out);
         });
+        // The overscan rows, planted: each must fail. runOverscan checks
+        // every shape at 1x and 2x; with `every`, each shape must fail (16:9
+        // included), else at least one (a fault only some shapes have).
+        auto runOverscan = [&](const char* what, BackdropRectsFn f, bool every) {
+            int bad = 0, shapesFailing = 0;
+            for (const Case& c : cases)
+            {
+                const Box results{ -kBackdropX * c.sx, kBackdropX * c.sx, -kBackdropY * c.sy, kBackdropY * c.sy };
+                const int here = BackdropOracle(what, c.sx, c.sy, results, ps, 1280, 2048, frame, f, false) +
+                    BackdropOracle(what, c.sx, c.sy, results, half, 2560, 4096, frame2, f, false);
+                bad += here;
+                shapesFailing += here > 0;
+            }
+            printf("planted %s: %d wrong pixel(s), %d of %zu shapes\n", what, bad, shapesFailing, std::size(cases));
+            CHECK(every ? shapesFailing == int(std::size(cases)) : bad > 0, "planted %s: %d of %zu shapes failed", what, shapesFailing,
+                std::size(cases));
+        };
+        // 811cdf2's fill: past the band only, the overscan rows left.
+        runOverscan("no overscan rows (past the band only, as 811cdf2)", [](const Box& b, const float* ps, float w, float h, const Rect& sc, float sx,
+            float sy, Rect* out) { return PastBandRects(b, ps, w, h, sc, sx, sy, out); }, true);
+        // Rows only where something lies past the band: 16:9 left.
+        runOverscan("overscan rows only on wide and tall screens", [](const Box& b, const float* ps, float w, float h, const Rect& sc, float sx,
+            float sy, Rect* out) {
+            const uint32_t n = PastBandRects(b, ps, w, h, sc, sx, sy, out);
+            return n + (sx < 1.0f || sy < 1.0f ? OverscanRows(b, ps, w, h, sc, sx, sy, out + n) : 0u);
+        }, false);
+        // Rows to clip 1 where the band's edge is the screen's (no
+        // kFillEdge): at 2x the outermost row and column are left.
+        runOverscan("overscan rows to clip 1, not kFillEdge", [](const Box& b, const float* ps, float w, float h, const Rect& sc, float sx, float sy,
+            Rect* out) {
+            uint32_t n = PastBandRects(b, ps, w, h, sc, sx, sy, out);
+            const float bx = std::min(sx, 1.0f), by = std::min(sy, 1.0f);
+            for (const Rect& r : { ClipToHost(-bx, bx, b.y1, by, ps, w, h), ClipToHost(-bx, bx, -by, b.y0, ps, w, h) })
+                if (const Rect c = Intersect(r, sc); !Empty(c))
+                    out[n++] = c;
+            return n;
+        }, false);
+        // Rows across the whole screen under Hor+: twice where the fill
+        // past the band has them already.
+        runOverscan("overscan rows across the whole screen", [](const Box& b, const float* ps, float w, float h, const Rect& sc, float sx, float sy,
+            Rect* out) {
+            const uint32_t n = PastBandRects(b, ps, w, h, sc, sx, sy, out);
+            return n + OverscanRows(b, ps, w, h, sc, 1.0f, sy, out + n);
+        }, false);
+        // Rows from just inside the picture: its own top and bottom rows
+        // blacked.
+        runOverscan("overscan rows from inside the picture", [](const Box& b, const float* ps, float w, float h, const Rect& sc, float sx, float sy,
+            Rect* out) {
+            Box in = b;
+            in.y0 += 0.01f;
+            in.y1 -= 0.01f;
+            const uint32_t n = PastBandRects(b, ps, w, h, sc, sx, sy, out);
+            return n + OverscanRows(in, ps, w, h, sc, sx, sy, out + n);
+        }, true);
+        // Rows short of the picture: a row of the race left above it.
+        runOverscan("overscan rows short of the picture", [](const Box& b, const float* ps, float w, float h, const Rect& sc, float sx, float sy,
+            Rect* out) {
+            Box out_ = b;
+            out_.y0 -= 0.01f;
+            out_.y1 += 0.01f;
+            const uint32_t n = PastBandRects(b, ps, w, h, sc, sx, sy, out);
+            return n + OverscanRows(out_, ps, w, h, sc, sx, sy, out + n);
+        }, true);
     }
 
     printf("\nbackdrop plan (the draw as the renderer hands it over):\n");
@@ -884,15 +994,57 @@ static void BackdropTests()
         const Matrix iphone = FrontEndMatrix(0.818182f, 1.0f), deck = FrontEndMatrix(1.0f, 0.9f), m169 = FrontEndMatrix(1.0f, 1.0f);
         const EPolys results = Polys(Rectangle(-kBackdropX, kBackdropX, -kBackdropY, kBackdropY, 0.818182f, 1.0f, kBackdropColour), iphone);
         const Draw d = BackdropDraw(iphone, 0.818182f, 1.0f, ps);
-        const Rect want[6] = { { 1218, 0, 1280, 720 }, { 1164, 0, 1218, 7 }, { 1164, 713, 1218, 720 }, { 0, 0, 62, 720 }, { 62, 0, 116, 7 },
-            { 62, 713, 116, 720 } };
-        BackdropPlanCase("iPhone results", d, results, Fill::Backdrop, 6, want);
-        const Rect deckWant[2] = { { 0, 0, 1280, 36 }, { 0, 684, 1280, 720 } };
+        const Rect want[8] = { { 1218, 0, 1280, 720 }, { 1164, 0, 1218, 7 }, { 1164, 713, 1218, 720 }, { 0, 0, 62, 720 }, { 62, 0, 116, 7 },
+            { 62, 713, 116, 720 }, { 116, 0, 1164, 7 }, { 116, 713, 1164, 720 } };
+        BackdropPlanCase("iPhone results", d, results, Fill::Backdrop, 8, want);
+        // The Deck (1280x800): the rows past the band (0..35, 684..719),
+        // then its overscan rows (y 0.981 x 0.9 = 0.883: 36..41, 678..683).
+        const Rect deckWant[4] = { { 0, 0, 1280, 36 }, { 0, 684, 1280, 720 }, { 0, 36, 1280, 42 }, { 0, 678, 1280, 684 } };
         BackdropPlanCase("Deck results", BackdropDraw(deck, 1.0f, 0.9f, ps),
-            Polys(Rectangle(-kBackdropX, kBackdropX, -kBackdropY, kBackdropY, 1.0f, 0.9f, kBackdropColour), deck), Fill::Backdrop, 2, deckWant);
-        // Never at 16:9 (nothing past the band to fill).
-        BackdropPlanCase("16:9 results", BackdropDraw(m169, 1.0f, 1.0f, ps),
-            Polys(Rectangle(-kBackdropX, kBackdropX, -kBackdropY, kBackdropY, 1.0f, 1.0f, kBackdropColour), m169), Fill::None);
+            Polys(Rectangle(-kBackdropX, kBackdropX, -kBackdropY, kBackdropY, 1.0f, 0.9f, kBackdropColour), deck), Fill::Backdrop, 4, deckWant);
+        // 16:9 too: its overscan rows alone (rows 0..6 and 713..719), also
+        // from a ppc/ without the Vert+ hooks (no front-end y scale).
+        const Draw d169 = BackdropDraw(m169, 1.0f, 1.0f, ps);
+        const EPolys results169 = Polys(Rectangle(-kBackdropX, kBackdropX, -kBackdropY, kBackdropY, 1.0f, 1.0f, kBackdropColour), m169);
+        const Rect want169[2] = { { 0, 0, 1280, 7 }, { 0, 713, 1280, 720 } };
+        BackdropPlanCase("16:9 results", d169, results169, Fill::Backdrop, 2, want169);
+        Draw old169 = d169;
+        old169.frontEndY = 0.0f;
+        BackdropPlanCase("16:9 results, no Vert+ hooks", old169, results169, Fill::Backdrop, 2, want169);
+        // ... and at 2x with half-pixel centres: the picture one host row
+        // lower (its top at 2 x 6.84 + 1 = 14.7, its bottom at 1427.3):
+        // rows 0..14 and 1427..1439.
+        float half169[4];
+        FrontEndPs(half169, 640.5f, 360.5f);
+        const Rect want169x2[2] = { { 0, 0, 2560, 15 }, { 0, 1427, 2560, 1440 } };
+        BackdropPlanCase("16:9 results, 2x", BackdropDraw(m169, 1.0f, 1.0f, half169, 2560.0f, 4096.0f, Rect{ 0, 0, 2560, 1440 }), results169,
+            Fill::Backdrop, 2, want169x2);
+        // Every register check refuses at 16:9 as elsewhere (a fade, a dim
+        // or the HUD never gets this far: MatchBackdrop's cases above run
+        // at 16:9 too).
+        auto refuse169 = [&](const char* what, auto change) {
+            Draw x = d169;
+            Matrix m = m169;
+            change(x, m);
+            x.c = m.c;
+            char name[96];
+            snprintf(name, sizeof(name), "16:9, %s", what);
+            BackdropPlanCase(name, x, results169, Fill::None);
+        };
+        refuse169("taken by another rule", [](Draw& x, Matrix&) { x.leftAlone = false; });
+        refuse169("not the front-end shader", [](Draw& x, Matrix&) { x.frontEndShader = false; });
+        refuse169("inside an occlusion query", [](Draw& x, Matrix&) { x.occlusion = true; });
+        refuse169("two quads", [](Draw& x, Matrix&) { x.count = 8; });
+        refuse169("additive blend", [](Draw& x, Matrix&) { x.blend0 = 0x01060106; });
+        refuse169("t0 not sampled", [](Draw& x, Matrix&) { x.t0Sampled = false; });
+        refuse169("t0 32x32 (the white texture)", [](Draw& x, Matrix&) { x.t0Width = x.t0Height = 32; });
+        refuse169("x translation c3", [](Draw&, Matrix& m) { m.c[3] = 0.01f; });
+        refuse169("c5 not the front end's y scale", [](Draw& x, Matrix&) { x.frontEndY = 0.83f; });
+        refuse169("VTE x offset off", [](Draw& x, Matrix&) { x.vte = 0x43D; });
+        EPolys faded169 = results169;
+        for (auto& w : faded169.w)
+            w[3] = 0xB87F7F7F;
+        BackdropPlanCase("16:9, alpha B8 (a fade-in)", d169, faded169, Fill::None);
         // A flat full-band layer over the 32x32 white texture is not a
         // picture (the black frame's and the fades' kind).
         Draw flat = d;
@@ -922,7 +1074,7 @@ static void BackdropTests()
         refuse("VTE y offset off", [](Draw& x, Matrix&) { x.vte = 0x437; });
         Draw opaque = d;
         opaque.blend0 = 0x00010001;
-        BackdropPlanCase("blending off", opaque, results, Fill::Backdrop, 6, want);
+        BackdropPlanCase("blending off", opaque, results, Fill::Backdrop, 8, want);
         // PlanFill (bars and black frames) never takes it: the renderer asks
         // PlanBackdrop only when PlanFill found nothing.
         CHECK(RunPlan(d, results).fill == Fill::None, "PlanFill took the backdrop");

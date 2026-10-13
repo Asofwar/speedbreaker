@@ -4,6 +4,38 @@ What changed in each SpeedBreaker release, newest first. Each release's notes on
 its entry here, and the game shows the entry once, the first time a new version starts (offline:
 it's built into the game).
 
+## v0.1.5
+
+### What's new
+
+- Settings > Controls: every keyboard control can be reassigned, and each control has two keys.
+  Choose a row, Left or Right for its first or second key, press A or Enter, then the new key; Y
+  clears a key, X puts a row's defaults back, Reset page the whole table. The default keys are
+  unchanged (the arrows steer as well as A and D), and the left stick click gets a key of its own,
+  Z. Thanks to love-gamer, who wrote it (GitHub pull request #12).
+- Settings > Graphics > Upscaling has a third choice, FSR 1 (AMD FidelityFX Super Resolution 1),
+  for a window much larger than the Internal Resolution (1x on a 1440p, MacBook or 4K screen):
+  curves, wires and diagonals stay smooth where bicubic shows steps, such as lamp posts against
+  the sky or the speedometer's needle. It is used only when the picture is enlarged. Bicubic stays
+  the default. Not on iPhone and iPad.
+- The race results screen no longer shows a thin strip of the race above and below it. An Xbox 360
+  draws that strip too, and a TV of the time hid it past the edge of its screen; today's screens
+  show the whole picture, so it is now black, on every screen shape (Steam Deck, 16:9 and others).
+
+### More about it
+
+- The Controls page: the keys are saved by name in settings.toml's `[keys]` table (`w`,
+  `left_shift`, `none`). F1, Esc (it cancels a wait) and the Cmd and Windows keys can't be
+  assigned. If you go back to v0.1.4 and change a setting there, it forgets the Controls page's
+  keys.
+- FSR 1: Sharpening sets its sharpening pass too (0.3 of its full strength by default). Bicubic
+  stays the default because FSR 1 makes foliage look a little painted, costs more GPU time (about
+  1 ms a frame on an M1 Pro at 1080p, 0.1 ms on a Steam Machine), and with Internal Resolution on
+  Auto most screens aren't enlarged at all.
+- Updating keeps your saves, settings and the installed game, and needs no disc image: on a Mac,
+  drag the new app into Applications and choose Replace, then Open Anyway once more; on SteamOS,
+  unpack the new download over the old folder.
+
 ## v0.1.4
 
 ### What's new

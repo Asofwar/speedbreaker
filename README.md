@@ -71,12 +71,12 @@ and a settings menu you can open mid-race.
   on the console.
 - **The original look:** sunlit roads and shadows as on the console, the picture a real Xbox 360
   sends to a TV (the game's own display gamma), correct colours on Apple devices, proper car paint
-  and mirror reflections, and distant textures that don't shimmer. Anti-aliasing, sharpening, a
-  Brightness setting and up to 16x anisotropic filtering are also available.
+  and mirror reflections, and distant textures that don't shimmer. Anti-aliasing, sharpening,
+  FSR 1 upscaling, a Brightness setting and up to 16x anisotropic filtering are also available.
 - **A guided installer.** It finds your disc image, checks that it is the right game, and
   verifies all 49 files as it copies them. An interrupted install never leaves a broken game.
 - **Your controller, or the keyboard.** Controllers work as an Xbox 360 pad, with hot-plugging
-  and rumble support.
+  and rumble support. Every keyboard control can be reassigned in the settings.
 - **A settings menu that pauses the game.** Open it with F1, Back + Start, or a three-finger
   tap. Every change applies at once, and *Quit Game* leaves the game from a controller too.
 - **Suspend and resume on iPhone and iPad.** Switch away and the game freezes; come back and it
@@ -346,7 +346,7 @@ is B, Square is X and Triangle is Y.
 
 | Xbox 360 control | Controller | Keyboard |
 |---|---|---|
-| Left stick | Left stick | A / D steer (the arrow keys also move it) |
+| Left stick | Left stick | A / D or Left / Right steer; Up / Down push it up and down |
 | Right trigger | Right trigger | W |
 | Left trigger | Left trigger | S |
 | A / B / X / Y | Bottom / right / left / top face button | Space / Backspace / Left Shift / Left Ctrl |
@@ -355,7 +355,7 @@ is B, Square is X and Triangle is Y.
 | Start | Start / Menu / Options | Enter |
 | Back | Back / View / Create | Esc |
 | Right stick | Right stick | O / L up and down, K / ; left and right |
-| Stick clicks | Press a stick in | C (right) |
+| Stick clicks | Press a stick in | Z (left), C (right) |
 
 - One player, one controller: the first one connected is used, and you can plug one in at any
   time. The keyboard always works as well.
@@ -363,7 +363,11 @@ is B, Square is X and Triangle is Y.
   you let go, a hold after a quarter of a second.
 - The game shifts gears with the right stick, so from the keyboard you shift with O and L.
   Holding both keys of a pair centres the stick.
-- There is no button remapping and no mouse control in game.
+- Every keyboard control can be reassigned: **Settings > Controls** (F1). Each control has two
+  keys: choose a row, Left or Right for its first or second key, press A or Enter, then the key
+  you want (Esc or B cancels). Y or Backspace clears a key, X or Delete puts the row's defaults
+  back, and *Reset page* restores this whole table. A key may drive several controls, as the
+  arrows do. There is no mouse control in game.
 
 **To open the settings:**
 
@@ -408,8 +412,8 @@ then Yes, puts it back.
 | Option | Choices | Default |
 |---|---|---|
 | Anti-Aliasing | On / Off | On |
-| Upscaling | Bicubic / Bilinear | Bicubic |
-| Sharpening | 0.00 to 1.00 | 0.30 (0 turns it off) |
+| Upscaling | Bicubic / Bilinear / FSR 1 | Bicubic. FSR 1 (AMD FidelityFX Super Resolution 1) keeps curves, wires and diagonals smooth when the picture is enlarged a lot, such as 1x on a 1440p or 4K screen; it is used only when the picture is enlarged, costs a little more GPU time, and makes foliage look slightly painted. Not on iPhone and iPad. |
+| Sharpening | 0.00 to 1.00 | 0.30 (0 turns it off). With FSR 1, the share of its sharpening pass's full strength. |
 | Anisotropic Filtering | Auto / Off / 2x / 4x / 8x / 16x / Original | Auto: 16x on dedicated graphics cards and M-series iPads, 4x elsewhere. Original uses each texture's own setting, as on the 360. |
 | Mipmaps | On / Off | On, so distant textures don't shimmer |
 | Internal Resolution | Auto / 1x (720p) / 1.5x (1080p) / 2x (1440p) / 3x (2160p) | Auto: enough to cover your screen, within what the device can afford (whole scales only: 1x, 2x, 3x, or 3x2 on an ultrawide). On iPhone and iPad, Auto always picks 1x. |
@@ -419,6 +423,10 @@ game while its window isn't in front.
 
 **Input:** Stick Deadzone (8%; raise it if the car steers by itself), Trigger Deadzone (2%), and
 Vibration (On).
+
+**Controls:** the keyboard keys for each Xbox 360 control, two per control, as in the table under
+[Controls](#controls). The keys are saved by name in `settings.toml`'s `[keys]` table (`w`,
+`left_shift`, `keypad_1`, or `none`; `runtime/user/key_names.h` lists them).
 
 **Advanced:** Asynchronous Shaders (On: an object is skipped for a frame or two while its shader
 compiles, instead of the game stuttering), Performance Overlay (Off: fps, frame times, and CPU
@@ -550,7 +558,7 @@ SpeedBreaker folder instead: `data/`, `data/game` and `cache/`.
 2. A notice says where the zip file went: your **Desktop** (on SteamOS, pick it up in Desktop
    Mode, or in the Desktop app on a Steam Frame), the **SpeedBreaker** folder in the Files app on
    iPhone and iPad, or the data folder above when there is no Desktop. Its name says which
-   version you were running, for example `speedbreaker-bug-report-v0.1.4-<date>_<time>.zip`.
+   version you were running, for example `speedbreaker-bug-report-v0.1.5-<date>_<time>.zip`.
 3. Open an [issue][issues], attach the zip, and say what you were doing, what you expected, what
    happened, and roughly how long into the session it happened.
 
@@ -749,6 +757,7 @@ research.
 | [SDL3](https://www.libsdl.org/) | Windows, input, audio, app lifecycle | zlib |
 | [Dear ImGui](https://github.com/ocornut/imgui) (Omar Cornut) | The installer and settings UI | MIT |
 | [Roboto](https://fonts.google.com/specimen/Roboto) (Google) | The UI font | Apache-2.0 |
+| [FidelityFX Super Resolution 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR) (AMD) | The FSR 1 Upscaling choice | MIT |
 | [o1heap](https://github.com/pavel-kirienko/o1heap) (Pavel Kirienko) | The guest heap allocator | MIT |
 | [glslang](https://github.com/KhronosGroup/glslang) and [SPIRV-Tools](https://github.com/KhronosGroup/SPIRV-Tools) (Khronos) | Shader compilation at runtime | BSD-3-Clause and others; Apache-2.0 |
 | [MoltenVK](https://github.com/KhronosGroup/MoltenVK) and the [Vulkan Loader](https://github.com/KhronosGroup/Vulkan-Loader) (Khronos) | Vulkan on Mac, iPhone and iPad | Apache-2.0 |

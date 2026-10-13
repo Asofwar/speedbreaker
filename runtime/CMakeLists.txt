@@ -79,6 +79,20 @@ target_link_libraries(imgui PUBLIC SDL3::SDL3 Vulkan::Vulkan)
 file(READ ${IMGUI}/fonts/Roboto-Medium.ttf UI_FONT_HEX HEX)
 string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," UI_FONT_BYTES "${UI_FONT_HEX}")
 file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/generated/ui_font.inc "${UI_FONT_BYTES}\n")
+# AMD FidelityFX Super Resolution 1 (thirdparty/fsr1, vendored, unmodified):
+# the text of its two headers, compiled in (generated/fsr1_headers.inc) for
+# Upscaling's FSR 1 shaders, which glslang compiles while the game runs
+# (video/fsr1.cpp). An edit of either reconfigures.
+set(FSR1 ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/fsr1)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${FSR1}/ffx_a.h ${FSR1}/ffx_fsr1.h)
+set(fsr1_inc "// Generated from runtime/thirdparty/fsr1 by runtime/CMakeLists.txt. Do not edit.\n")
+foreach(name ffx_a ffx_fsr1)
+    file(READ ${FSR1}/${name}.h fsr1_hex HEX)
+    string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," fsr1_bytes "${fsr1_hex}")
+    string(APPEND fsr1_inc "constexpr unsigned char k_${name}[] = { ${fsr1_bytes}0 };\n")
+endforeach()
+file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/generated/fsr1_headers.inc.new "${fsr1_inc}")
+configure_file(${CMAKE_CURRENT_BINARY_DIR}/generated/fsr1_headers.inc.new ${CMAKE_CURRENT_BINARY_DIR}/generated/fsr1_headers.inc COPYONLY)
 target_include_directories(SpeedBreaker PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 # The "What's new" note (ui/whats_new.cpp): this version's entry in
 # CHANGELOG.md, from its "## v<version>" heading to the next "## " one,

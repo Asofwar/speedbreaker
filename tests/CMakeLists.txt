@@ -44,8 +44,33 @@ sb_test(gpu_choice_test)
 # video::FitPicture's pictures.
 sb_test(glare_fit_test SOURCES ${RT}/video/picture_fit.cpp)
 # The post-processing's split at the 16:9 band's edge (video/band_filter.h,
-# video::BandOf) against the edge-bar fills and a model of the filters.
+# video::BandOf) against the edge-bar fills and a model of the filters
+# (FSR 1's EASU taps and RCAS neighbours too).
 sb_test(band_filter_test SOURCES ${RT}/video/picture_fit.cpp)
+# Settings > Graphics > Upscaling's FSR 1: which pass draws a frame
+# (video/upscale.h, header only, on video::FitPicture's pictures), Sharpening
+# as RCAS's strength, the constants against AMD's formulas, and the shaders'
+# GLSL (video/fsr1.cpp, with runtime/generated/fsr1_headers.inc): AMD's
+# headers compiled in unchanged, the band rules in their code, the
+# presenter's use of them. It writes the GLSL to fsr1_glsl for the check
+# after it.
+sb_test(fsr1_test SOURCES ${RT}/video/fsr1.cpp ${RT}/video/picture_fit.cpp
+    ARGS ${RT}/thirdparty/fsr1 ${RT}/video ${CMAKE_CURRENT_BINARY_DIR}/fsr1_glsl)
+target_include_directories(fsr1_test PRIVATE ${CMAKE_BINARY_DIR}/runtime/generated)
+# Those shaders compiled to SPIR-V for Vulkan, as the game's glslang does
+# (only where glslangValidator is installed).
+find_program(SB_GLSLANG_VALIDATOR glslangValidator)
+if(SB_GLSLANG_VALIDATOR)
+    foreach(shader easu.comp rcas.frag rcas_tone.frag)
+        add_test(NAME fsr1_glsl_check_${shader} COMMAND ${SB_GLSLANG_VALIDATOR} -V --target-env vulkan1.1
+            ${CMAKE_CURRENT_BINARY_DIR}/fsr1_glsl/${shader} -o ${CMAKE_CURRENT_BINARY_DIR}/fsr1_glsl/${shader}.spv)
+        set_tests_properties(fsr1_glsl_check_${shader} PROPERTIES DEPENDS fsr1_test)
+    endforeach()
+endif()
+# Upscaling's values in settings.toml (user/settings.cpp as the game links
+# it): "fsr1" read, saved and read back, the environment's override, an
+# unknown value; in a scratch folder.
+sb_test(settings_scaling_test SOURCES ${RT}/user/settings.cpp ARGS ${CMAKE_CURRENT_BINARY_DIR}/settings_scaling_scratch)
 # Internal Resolution Auto's budget on iPhones and iPads, chip by chip
 # (video/scale_budget.cpp), and the scale it makes on the phones' screens.
 sb_test(scale_budget_test SOURCES ${RT}/video/scale_budget.cpp ${RT}/video/picture_fit.cpp)
@@ -137,6 +162,18 @@ sb_test(memory_status_test SOURCES ${RT}/kernel/memory_status.cpp ${RT}/platform
 # The version line in the log, and when the "What's new" note shows
 # (user/version_check.h, header only).
 sb_test(version_check_test)
+# The keys a Controls row can hold and their names in settings.toml
+# (user/key_names.h, header only), each row against SDL's scancode name.
+find_package(SDL3 REQUIRED CONFIG)
+sb_test(key_names_test)
+target_link_libraries(key_names_test PRIVATE SDL3::SDL3)
+# The Key options (Settings > Controls): the table, the [keys] names in the
+# file, and what Set accepts (user/settings.cpp and the toml++ XenonRecomp
+# vendors; no SDL).
+sb_test(settings_keys_test SOURCES ${RT}/user/settings.cpp)
+target_include_directories(settings_keys_test SYSTEM PRIVATE ${ROOT}/tools/XenonRecomp/thirdparty/tomlplusplus/include)
+# The keyboard's controls and how held keys become a pad (hid/key_map.h), header only.
+sb_test(key_map_test)
 # Check for Updates' logic: versions, GitHub's JSON, curl's output and the
 # release notes (update/check.cpp, self-contained).
 sb_test(update_check_test SOURCES ${RT}/update/check.cpp)
