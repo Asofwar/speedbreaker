@@ -22,6 +22,7 @@
 //     follows it only when they differ;
 //   - VK_SUBOPTIMAL_KHR and VK_ERROR_OUT_OF_DATE_KHR are reasons to build
 //     again (a SUBOPTIMAL at an unchanged size at most once per backoff);
+//     what else an acquire or a present can say is ClassifySurfaceResult's;
 //   - on iOS a view that doesn't fill its window is fitted back first (the
 //     surface is its layer: following it would follow SDL's mistake);
 //   - a landscape-only app (SpeedBreaker on iPhone) never takes a portrait
@@ -67,6 +68,34 @@ namespace video
         Suboptimal,
         OutOfDate,
     };
+
+    // The VkResult values ClassifySurfaceResult tells apart: Vulkan's own
+    // numbers (this header stays free of Vulkan's; presenter.cpp checks
+    // them against vulkan_core.h at compile time).
+    constexpr int32_t kVkSuccess = 0;
+    constexpr int32_t kVkSuboptimal = 1000001003;                // VK_SUBOPTIMAL_KHR
+    constexpr int32_t kVkErrorDeviceLost = -4;                   // VK_ERROR_DEVICE_LOST
+    constexpr int32_t kVkErrorSurfaceLost = -1000000000;         // VK_ERROR_SURFACE_LOST_KHR
+    constexpr int32_t kVkErrorOutOfDate = -1000001004;           // VK_ERROR_OUT_OF_DATE_KHR
+    constexpr int32_t kVkErrorFullScreenLost = -1000255000;      // VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT
+
+    // What a frame does with what vkAcquireNextImageKHR or vkQueuePresentKHR
+    // returned (`vkResult`, a VkResult's value). Only `image` lets a frame use
+    // the image index an acquire wrote: with any other result there is none.
+    // v0.1.4 went on after VK_ERROR_SURFACE_LOST_KHR or VK_ERROR_DEVICE_LOST
+    // with an index the acquire never wrote, and submitted work waiting on a
+    // semaphore nothing would signal. After a present, `image` says the image
+    // went to the screen (its timing is then watched).
+    struct SurfaceOutcome
+    {
+        bool image = false;        // VK_SUCCESS, VK_SUBOPTIMAL_KHR
+        bool report = false;       // `result` goes to SwapchainPolicy::Reported: a reason to build the swapchain again
+        SurfaceResult result = SurfaceResult::Suboptimal;
+        bool surfaceLost = false;  // VK_ERROR_SURFACE_LOST_KHR: the window's surface is gone; a new one, then a swapchain on it
+        bool deviceLost = false;   // VK_ERROR_DEVICE_LOST: nothing can be drawn again (video::DeviceLost)
+        bool other = false;        // anything else (out of memory, a timeout): this frame is skipped, and the result logged
+    };
+    SurfaceOutcome ClassifySurfaceResult(int32_t vkResult);
 
     // What the presenter read this frame.
     struct SurfaceState

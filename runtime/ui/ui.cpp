@@ -6,6 +6,7 @@
 #include <kernel/xam.h>
 #include <report/report.h>
 #include <user/settings.h>
+#include <video/presenter.h>
 #include <video/swapchain_policy.h>
 
 #include <imgui.h>
@@ -340,6 +341,11 @@ namespace ui
 
         void CheckVk(VkResult result)
         {
+            // A lost device (ImGui's own font upload submits and waits) takes
+            // the one fatal path at once (video/presenter.h); anything else is
+            // only logged, as before.
+            if (result == VK_ERROR_DEVICE_LOST)
+                video::DeviceLost("ImGui (the UI)");
             if (result != VK_SUCCESS)
                 fprintf(stderr, "[ui] Vulkan error %d\n", int(result));
         }

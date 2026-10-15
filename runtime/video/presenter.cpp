@@ -19,6 +19,7 @@
 #include <cpu/guest_time.h>
 #include "vblank_lock.h"
 #include "display_tone.h"
+#include <gpu/front_ring.h>
 #include <ui/ui.h>
 #if defined(__APPLE__) && TARGET_OS_IOS
 #include <platform/ios_ui.h>
@@ -35,8 +36,16 @@
 #include <condition_variable>
 #include <deque>
 #include <fstream>
+#include <type_traits>
 #include <utility>
 #include <vulkan/vulkan.h>
+
+#include <signal.h>
+
+// swapchain_policy.h's copies of the VkResult values it tells apart.
+static_assert(video::kVkSuccess == VK_SUCCESS && video::kVkSuboptimal == VK_SUBOPTIMAL_KHR &&
+    video::kVkErrorDeviceLost == VK_ERROR_DEVICE_LOST && video::kVkErrorSurfaceLost == VK_ERROR_SURFACE_LOST_KHR &&
+    video::kVkErrorOutOfDate == VK_ERROR_OUT_OF_DATE_KHR && video::kVkErrorFullScreenLost == VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT);
 
 namespace video
 {
@@ -133,10 +142,31 @@ namespace video
         std::atomic<uint64_t> s_repeated{ 0 }, s_shown{ 0 };  // see PresentStats
         std::atomic<int64_t> s_guestVblank{ 0 };
         std::atomic<uint64_t> s_guestVblanks{ 0 };
+        // Under s_pendingMutex: frames handed over so far (SubmitFrontImage,
+        // SubmitFrontBuffer), each one's serial; the waiting frame's, and the
+        // one the presenter took last, whose read of it is queued once
+        // s_lastQueued (its vkQueueSubmit returned). The logs name frames by
+        // it, so a frame dropped or written over can be told from the next.
+        uint64_t s_frontSerial = 0, s_pendingSerial = 0, s_lastSerial = 0;
+        bool s_lastQueued = false;
+
+        // Under s_pendingMutex: the waiting frame (s_pendingSerial) will
+        // never be shown. Counted for the [perf] line (s_dropped), and logged
+        // the first 3 times and then every 100th, with the frame's serial.
+        void NoteDropped(const char* why)
+        {
+            const uint64_t n = ++s_dropped;
+            if (n <= 3 || n % 100 == 0)
+                fprintf(stderr, "[video] frame %llu dropped: %s (%llu so far)\n", (unsigned long long)s_pendingSerial, why,
+                    (unsigned long long)n);
+        }
 
         // The last frame shown, drawn again under the UI while the game
         // presents nothing new (null image: the CPU path's, in s_source).
-        // Main thread, under s_frontUseMutex.
+        // Main thread, under s_frontUseMutex; s_lastImage is also written
+        // only under s_pendingMutex (when a frame is taken, and in
+        // ReleaseFrontImage), where ClaimFrontImage reads it: the renderer
+        // doesn't write the image of the frame the presenter took last.
         VkImage s_lastImage = VK_NULL_HANDLE;
         uint32_t s_lastWidth = 0, s_lastHeight = 0, s_lastAspectW = 0, s_lastAspectH = 0;
         // Held from taking the renderer's image until the frame using it is
@@ -234,8 +264,15 @@ namespace video
         // shared queue, wait on it under the queue mutex.
         void WaitIdle()
         {
-            std::lock_guard lock(s_queueMutex);
-            vkQueueWaitIdle(s_queue);
+            VkResult r;
+            {
+                std::lock_guard lock(s_queueMutex);
+                r = vkQueueWaitIdle(s_queue);
+            }
+            // Out of the lock: a thread other than the main one waits in
+            // DeviceLost for the main thread, which takes it to present.
+            if (r == VK_ERROR_DEVICE_LOST)
+                DeviceLost("vkQueueWaitIdle (the presenter)");
         }
 
         bool Check(VkResult r, const char* what)
@@ -243,6 +280,135 @@ namespace video
             if (r != VK_SUCCESS)
                 fprintf(stderr, "[video] %s failed: %d\n", what, int(r));
             return r == VK_SUCCESS;
+        }
+
+        // ---------------------------------------------------------------
+        // A lost device (DeviceLost, presenter.h). 0 until one is seen, 1
+        // while its first witness writes the log line and the crash report,
+        // 2 once they're written.
+        std::atomic<int> s_deviceLost{ 0 };
+        std::atomic<const char*> s_deviceLostIn{ "" };  // the first witness's call, for the message
+        // Who ends the game afterwards: the main thread once it has told the
+        // player (1), or a thread that waited for the main thread in vain (2).
+        // The first to claim it; the other waits for the process to end.
+        std::atomic<int> s_deviceLostExit{ 0 };
+        std::thread::id s_mainThread;  // Initialize's: the window's thread
+
+        // The crash report of a lost device: report/crash.cpp's own writer,
+        // handed what a signal would have given it, so the report has a
+        // crash's form, place and next-launch notice. SIGABRT, a failed
+        // check's signal; its registers are zeros (nothing was interrupted),
+        // and its stack is this thread's, from DeviceLost's caller out.
+        void WriteDeviceLostReport()
+        {
+            siginfo_t info{};
+            info.si_signo = SIGABRT;
+            ucontext_t context{};
+#ifdef __APPLE__
+            // There the machine state is a pointer away (to zeros here).
+            std::remove_pointer_t<decltype(context.uc_mcontext)> machine{};
+            context.uc_mcontext = &machine;
+#endif
+            report::WriteCrashReport(SIGABRT, &info, &context);
+        }
+
+        // Main thread: the player is told in a message box, since the window
+        // can't show anything any more. Not in SteamOS Game Mode: no desktop
+        // is on screen there to show one, and a box nobody can see would
+        // hold the game open (Steam shows that it ended, and the next launch
+        // mentions the crash report).
+        void TellDeviceLost()
+        {
+            // Not the game's last sound looping under the message, nor a
+            // rumble carrying on.
+            apu::SuspendOutput();
+            hid::Shutdown();
+            if (s_gameMode)
+            {
+                fprintf(stderr, "[video] Game Mode: no message box (nothing could show it)\n");
+                return;
+            }
+            const std::string text = std::format(
+                "The graphics device stopped working (VK_ERROR_DEVICE_LOST in {}). The GPU or its driver gave up on the "
+                "game's work (a GPU timeout or reset, or a driver fault), and nothing more can be drawn, so SpeedBreaker "
+                "has to close.\n\nA crash report was saved in {}. To send it, start the game again and choose Settings > "
+                "Advanced > Save Bug Report.",
+                s_deviceLostIn.load(std::memory_order_relaxed), report::ScrubHome(report::LogDirectory().string()));
+            if (!SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "SpeedBreaker: the GPU stopped", text.c_str(), s_window))
+                fprintf(stderr, "[video] the message box couldn't be shown: %s\n", SDL_GetError());
+        }
+
+        [[noreturn]] void ExitAfterDeviceLost()
+        {
+            fflush(stderr);
+            report::FlushLog();  // the lines above, into the session log, before _Exit
+            std::_Exit(4);
+        }
+
+        // Another thread ends the process.
+        [[noreturn]] void Park()
+        {
+            while (true)
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+
+        // After DeviceLost's report: the main thread tells the player and
+        // ends the game; any other thread waits for it to.
+        [[noreturn]] void EndAfterDeviceLost()
+        {
+            // The report first (its writer waits a quarter of a second for
+            // the log at most).
+            for (int i = 0; i < 100 && s_deviceLost.load(std::memory_order_acquire) != 2; i++)
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            int unclaimed = 0;
+            if (std::this_thread::get_id() != s_mainThread)
+            {
+                // A message box is the main thread's: macOS and iOS show one
+                // only there, and SDL hands one asked for elsewhere over to
+                // it and waits, which a main thread itself waiting here would
+                // never answer. RunFrame comes here at its next frame, as
+                // does any Vulkan call of the main thread's that returns
+                // VK_ERROR_DEVICE_LOST; this thread waits, holding nothing.
+                // A main thread that doesn't come in 10 s (stuck elsewhere):
+                // the game ends from here, untold, with the log and the report.
+                for (int i = 0; i < 200 && s_deviceLostExit.load(std::memory_order_acquire) == 0; i++)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                if (!s_deviceLostExit.compare_exchange_strong(unclaimed, 2, std::memory_order_acq_rel))
+                    Park();  // the main thread is telling the player, and exits after
+                fprintf(stderr, "[video] the main thread didn't come in 10 s to tell the player: exiting without a message\n");
+                ExitAfterDeviceLost();
+            }
+            if (!s_deviceLostExit.compare_exchange_strong(unclaimed, 1, std::memory_order_acq_rel))
+            {
+                // This very thread, come back in from inside its own message
+                // box (a handler its run loop called): not a wait for itself.
+                if (unclaimed == 1)
+                    ExitAfterDeviceLost();
+                Park();  // a thread that gave up waiting for this one is ending the game
+            }
+            TellDeviceLost();
+            ExitAfterDeviceLost();
+        }
+
+        // VK_ERROR_SURFACE_LOST_KHR (main thread): the window's Vulkan
+        // surface is gone, and with it every swapchain on it. RunFrame makes
+        // a new one (RecreateSurface) before anything else is built.
+        bool s_surfaceLost = false;
+        int s_surfaceTries = 0;  // new surfaces made since a frame was last presented
+
+        void NoteSurfaceLost(const char* where)
+        {
+            if (!std::exchange(s_surfaceLost, true) && s_surfaceTries < 3)
+                fprintf(stderr, "[video] the window's surface was lost (VK_ERROR_SURFACE_LOST_KHR in %s): making a new one\n", where);
+        }
+
+        // An acquire or present result ClassifySurfaceResult has no rule for
+        // (out of memory, a timeout): logged, the first few.
+        void LogSurfaceResult(const char* where, VkResult r)
+        {
+            static int logged = 0;
+            if (logged < 10)
+                fprintf(stderr, "[video] %s returned %d%s\n", where, int(r), ++logged == 10 ? " (no more of these logged)" : "");
         }
 
         uint32_t FindMemoryType(uint32_t bits, VkMemoryPropertyFlags flags)
@@ -465,6 +631,10 @@ namespace video
                     if (t.swapchain == s_waitSwapchain)
                         r = s_waitForPresent(s_device, t.swapchain, t.id, 50'000'000);
                 }
+                // (Out of the swapchain lock: the main thread takes it to
+                // build a swapchain.)
+                if (r == VK_ERROR_DEVICE_LOST)
+                    DeviceLost("vkWaitForPresentKHR (the present waiter)");
                 int64_t now = NowNs();
                 {
                     std::lock_guard lock(s_timingMutex);
@@ -494,8 +664,12 @@ namespace video
         Extent SurfaceExtent()
         {
             VkSurfaceCapabilitiesKHR caps{};
-            if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(s_physical, s_surface, &caps) != VK_SUCCESS)
+            if (VkResult r = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(s_physical, s_surface, &caps); r != VK_SUCCESS)
+            {
+                if (r == VK_ERROR_SURFACE_LOST_KHR)
+                    NoteSurfaceLost("vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
                 return {};
+            }
             return SurfaceExtent(caps);
         }
 
@@ -560,8 +734,15 @@ namespace video
             if ((s_presentScale < 1.0f || s_viewScaled) && platform::ios::SetDrawableScale(s_window, s_presentScale))
                 s_viewScaled = true;
 #endif
-            VkSurfaceCapabilitiesKHR caps;
-            vkGetPhysicalDeviceSurfaceCapabilitiesKHR(s_physical, s_surface, &caps);
+            VkSurfaceCapabilitiesKHR caps{};
+            if (VkResult r = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(s_physical, s_surface, &caps); r != VK_SUCCESS)
+            {
+                // Nothing below means anything without them (v0.1.4 went on
+                // with whatever the struct held). RunFrame tries again.
+                if (r == VK_ERROR_SURFACE_LOST_KHR)
+                    NoteSurfaceLost("vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
+                return false;
+            }
             const VkExtent2D previous = s_swapExtent;
             // A landscape-only iPhone takes no portrait swapchain under a
             // landscape interface (swapchain_policy.h): the same size turned,
@@ -582,7 +763,16 @@ namespace video
             uint32_t count = 0;
             vkGetPhysicalDeviceSurfaceFormatsKHR(s_physical, s_surface, &count, nullptr);
             std::vector<VkSurfaceFormatKHR> formats(count);
-            vkGetPhysicalDeviceSurfaceFormatsKHR(s_physical, s_surface, &count, formats.data());
+            if (VkResult r = vkGetPhysicalDeviceSurfaceFormatsKHR(s_physical, s_surface, &count, formats.data());
+                (r != VK_SUCCESS && r != VK_INCOMPLETE) || count == 0)
+            {
+                // None to pick from (the surface lost since its capabilities
+                // were read): RunFrame tries again.
+                if (r == VK_ERROR_SURFACE_LOST_KHR)
+                    NoteSurfaceLost("vkGetPhysicalDeviceSurfaceFormatsKHR");
+                return false;
+            }
+            formats.resize(count);
             // B8G8R8A8_UNORM in plain sRGB: the picture is sRGB-encoded.
             // MoltenVK lists each format in every color space it knows (asked
             // for VK_EXT_swapchain_colorspace or not), and the last
@@ -646,8 +836,18 @@ namespace video
                     }
             }
             info.clipped = VK_TRUE;
-            if (!Check(vkCreateSwapchainKHR(s_device, &info, nullptr, &s_swapchain), "vkCreateSwapchainKHR"))
+            const VkResult created = vkCreateSwapchainKHR(s_device, &info, nullptr, &s_swapchain);
+            if (created == VK_ERROR_DEVICE_LOST)
+                DeviceLost("vkCreateSwapchainKHR");
+            if (created == VK_ERROR_SURFACE_LOST_KHR)
+                NoteSurfaceLost("vkCreateSwapchainKHR");
+            if (!Check(created, "vkCreateSwapchainKHR"))
+            {
+                // A failed command's output is undefined: no swapchain, so
+                // RunFrame builds one again rather than draw to garbage.
+                s_swapchain = VK_NULL_HANDLE;
                 return false;
+            }
             {
                 // Once per change: the V-Sync setting's effect, in the log.
                 static int logged = -1;
@@ -1702,6 +1902,7 @@ void main()
 
     bool Initialize()
     {
+        s_mainThread = std::this_thread::get_id();  // where DeviceLost tells the player
         if (const char* h = std::getenv("NFSMW_HEADLESS"); h && h[0] == '1')
             return false;
 #if defined(__APPLE__) && TARGET_OS_IOS
@@ -1831,9 +2032,17 @@ void main()
         std::vector<VkExtensionProperties> avail(extAvail);
         vkEnumerateDeviceExtensionProperties(s_physical, nullptr, &extAvail, avail.data());
         bool presentId = false, presentWait = false, hostImport = false, shadingRate = false, displayTiming = false;
+        bool mirrorClamp = false;
+#ifdef VK_EXT_depth_bias_control
+        bool depthBiasControl = false;
+#endif
         for (auto& e : avail)
         {
             displayTiming |= strcmp(e.extensionName, VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME) == 0;
+            mirrorClamp |= strcmp(e.extensionName, VK_KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_EXTENSION_NAME) == 0;
+#ifdef VK_EXT_depth_bias_control
+            depthBiasControl |= strcmp(e.extensionName, VK_EXT_DEPTH_BIAS_CONTROL_EXTENSION_NAME) == 0;
+#endif
             if (strcmp(e.extensionName, "VK_KHR_portability_subset") == 0)
                 devExts.push_back("VK_KHR_portability_subset");
             hostImport |= strcmp(e.extensionName, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME) == 0;
@@ -1858,6 +2067,51 @@ void main()
         }
         if (hostImport)
             devExts.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+        // The renderer's samplers mirror once (Xenos's mirror clamp modes)
+        // where the device can: the extension (core in Vulkan 1.2 as an
+        // optional feature) is listed where the address mode is there; on
+        // MoltenVK, a Mac's GPU or an Apple family 7 one. Enabling it
+        // enables the address mode, with no feature structure (the device's
+        // feature chain stays as it was). Without it they clamp unmirrored,
+        // as before.
+        if (mirrorClamp)
+            devExts.push_back(VK_KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_EXTENSION_NAME);
+        // The renderer's depth is float32 for both guest formats, and a
+        // float depth buffer's constant depth bias is in steps of each
+        // primitive's own precision: the guest's unorm24 (D24S8) bias, right
+        // for depths 0.5..1, halved below 0.5 and quartered below 0.25 (the
+        // sun shadow map's casters near the light). VK_EXT_depth_bias_control
+        // with its FORCE_UNORM representation gives it in unorm24's steps
+        // throughout (RADV, the Deck's driver, has it; MoltenVK doesn't, and
+        // there it stays as before); depthBiasExact too where the device has
+        // it.
+        // Enabling it changes nothing else (vkCmdSetDepthBias stays the
+        // format's steps). NFSMW_DEPTH_BIAS_UNORM=0 leaves it off (an A/B
+        // switch): the device is created as without it.
+#ifdef VK_EXT_depth_bias_control
+        VkPhysicalDeviceDepthBiasControlFeaturesEXT depthBiasFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_BIAS_CONTROL_FEATURES_EXT };
+        const char* unormBias = std::getenv("NFSMW_DEPTH_BIAS_UNORM");
+        const bool unormBiasOff = unormBias && unormBias[0] == '0';
+        if (depthBiasControl && !unormBiasOff)
+        {
+            VkPhysicalDeviceFeatures2 features2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+            features2.pNext = &depthBiasFeatures;
+            vkGetPhysicalDeviceFeatures2(s_physical, &features2);
+            depthBiasControl = depthBiasFeatures.depthBiasControl && depthBiasFeatures.leastRepresentableValueForceUnormRepresentation;
+        }
+        else
+            depthBiasControl = false;
+        if (depthBiasControl)
+        {
+            // Only what the renderer uses (not floatRepresentation).
+            const VkBool32 exact = depthBiasFeatures.depthBiasExact;
+            depthBiasFeatures = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_BIAS_CONTROL_FEATURES_EXT };
+            depthBiasFeatures.depthBiasControl = VK_TRUE;
+            depthBiasFeatures.leastRepresentableValueForceUnormRepresentation = VK_TRUE;
+            depthBiasFeatures.depthBiasExact = exact;
+            devExts.push_back(VK_EXT_DEPTH_BIAS_CONTROL_EXTENSION_NAME);
+        }
+#endif
         // NFSMW_SHADING_RATE=<w>x<h>: an experiment (presenter.h).
         uint32_t rateW = 0, rateH = 0;
         VkPhysicalDeviceFragmentShadingRateFeaturesKHR rateFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR };
@@ -1973,6 +2227,13 @@ void main()
             hostQueryReset.pNext = const_cast<void*>(dci.pNext);
             dci.pNext = &hostQueryReset;
         }
+#ifdef VK_EXT_depth_bias_control
+        if (depthBiasControl)
+        {
+            depthBiasFeatures.pNext = const_cast<void*>(dci.pNext);
+            dci.pNext = &depthBiasFeatures;
+        }
+#endif
         dci.pEnabledFeatures = &features;
         dci.queueCreateInfoCount = 1;
         dci.pQueueCreateInfos = &qci;
@@ -2054,7 +2315,19 @@ void main()
             hostImport ? (PFN_vkGetMemoryHostPointerPropertiesEXT)vkGetDeviceProcAddr(s_device, "vkGetMemoryHostPointerPropertiesEXT") : nullptr,
             (PFN_vkCmdBeginRenderingKHR)vkGetDeviceProcAddr(s_device, "vkCmdBeginRenderingKHR"),
             (PFN_vkCmdEndRenderingKHR)vkGetDeviceProcAddr(s_device, "vkCmdEndRenderingKHR"), rateW, rateH, occlusionCounting,
-            hostQueryReset.hostQueryReset ? (PFN_vkResetQueryPool)vkGetDeviceProcAddr(s_device, "vkResetQueryPool") : nullptr };
+            hostQueryReset.hostQueryReset ? (PFN_vkResetQueryPool)vkGetDeviceProcAddr(s_device, "vkResetQueryPool") : nullptr,
+            mirrorClamp };
+#ifdef VK_EXT_depth_bias_control
+        if (depthBiasControl)
+        {
+            s_context.cmdSetDepthBias2 = (PFN_vkCmdSetDepthBias2EXT)vkGetDeviceProcAddr(s_device, "vkCmdSetDepthBias2EXT");
+            s_context.depthBiasExact = s_context.cmdSetDepthBias2 && depthBiasFeatures.depthBiasExact;
+        }
+        fprintf(stderr, "[video] depth bias of D24S8 targets: %s\n", s_context.cmdSetDepthBias2
+                ? (s_context.depthBiasExact ? "in unorm24 steps, exact (VK_EXT_depth_bias_control)" : "in unorm24 steps (VK_EXT_depth_bias_control)")
+            : unormBiasOff ? "the float depth's steps (NFSMW_DEPTH_BIAS_UNORM=0): less below depth 0.5"
+                           : "the float depth's steps (no VK_EXT_depth_bias_control FORCE_UNORM on this device): less below depth 0.5");
+#endif
         s_contextReady = true;
         s_settingsGeneration = settings::Generation();
         fprintf(stderr, "[video] %s, swapchain %ux%u%s\n", props.deviceName, s_swapExtent.width, s_swapExtent.height, GeometryNote().c_str());
@@ -2236,13 +2509,14 @@ void main()
 
         std::lock_guard lock(s_pendingMutex);
         if (s_pendingNew)
-            s_dropped++;
+            NoteDropped("replaced by a newer frame before it was taken");
         s_pending = std::move(pixels);
         s_pendingWidth = width;
         s_pendingHeight = height;
         s_pendingAspectW = s_pendingAspectH = 0;
         s_pendingNew = true;
         s_pendingVblank = s_guestVblank.load(std::memory_order_relaxed);
+        s_pendingSerial = ++s_frontSerial;
     }
 
     namespace
@@ -2432,6 +2706,12 @@ void main()
 
     void SuspendGame()
     {
+        // The game is ending (DeviceLost): nothing to stop. An app event
+        // delivered inside its message box's run loop (iOS) would otherwise
+        // wait on the lost device again, and come back into DeviceLost on
+        // the thread already showing the box.
+        if (s_deviceLost.load(std::memory_order_acquire) != 0)
+            return;
         if (s_window)
             s_swapPolicy.Suspended();
         // 1. Every guest clock stops at one instant. The game's threads, its
@@ -2449,12 +2729,13 @@ void main()
         // 3. Then no GPU work may start (Metal refuses it from an inactive
         // app). What was submitted finishes, its completions running their
         // guest callbacks at the frozen time.
+        bool lost = false;
         {
             std::lock_guard lock(s_queueMutex);
             if (!s_background.load(std::memory_order_relaxed) && s_queue)
             {
                 s_background.store(true, std::memory_order_release);
-                vkQueueWaitIdle(s_queue);
+                lost = vkQueueWaitIdle(s_queue) == VK_ERROR_DEVICE_LOST;
                 if (SuspendGpuOnly())
                 {
                     s_visible.store(false, std::memory_order_relaxed);  // as 7303475 did: the watchdog pauses
@@ -2462,6 +2743,8 @@ void main()
                 }
             }
         }
+        if (lost)
+            DeviceLost("vkQueueWaitIdle (suspending the game)");  // out of the queue lock, as WaitIdle
         if (!changed)
             return;
         fprintf(stderr, "[suspend] suspended: the game's clocks stop at guest %.3f s (vblank %llu, audio frame %llu)\n",
@@ -2471,6 +2754,8 @@ void main()
 
     void ResumeGame()
     {
+        if (s_deviceLost.load(std::memory_order_acquire) != 0)
+            return;  // the game is ending (DeviceLost): nothing to start again, the sound included
         // 1. GPU work may start: a submit parked in WaitForeground goes out,
         // still at the frozen time.
         bool held;
@@ -2586,10 +2871,58 @@ void main()
                 s_swapReason = nullptr;
             }
         }
+
+        // After VK_ERROR_SURFACE_LOST_KHR (NoteSurfaceLost): a new Vulkan
+        // surface from SDL for the same window, then a swapchain on it, as
+        // CheckSwapchain builds one. Nothing can be built on the old surface,
+        // and v0.1.4 never made another: an acquire on it left its image
+        // index unwritten, and the frame was drawn and submitted with it.
+        // Main thread, while the app is active. False while that fails:
+        // RunFrame tries again a little later, the window stays as it was
+        // and can still be closed.
+        bool RecreateSurface()
+        {
+            WaitIdle();
+            DestroySwapchain();
+            if (s_surface)
+                SDL_Vulkan_DestroySurface(s_instance, s_surface, nullptr);
+            s_surface = VK_NULL_HANDLE;
+            s_surfaceTries++;
+            const bool log = s_surfaceTries <= 3 || s_surfaceTries % 100 == 0;
+            if (!SDL_Vulkan_CreateSurface(s_window, s_instance, nullptr, &s_surface))
+            {
+                s_surface = VK_NULL_HANDLE;
+                if (log)
+                    fprintf(stderr, "[video] a new surface for the window failed (try %d): %s\n", s_surfaceTries, SDL_GetError());
+                return false;
+            }
+            // Vulkan wants a surface's support asked before a swapchain is
+            // made on it; the device's queue family was chosen for the old one.
+            VkBool32 supported = VK_FALSE;
+            if (vkGetPhysicalDeviceSurfaceSupportKHR(s_physical, s_queueFamily, s_surface, &supported) != VK_SUCCESS || !supported)
+            {
+                if (log)
+                    fprintf(stderr, "[video] the window's new surface can't be presented to from the device's queue (try %d)\n", s_surfaceTries);
+                return false;  // (the next try destroys it)
+            }
+            s_surfaceLost = false;
+            if (log)
+                fprintf(stderr, "[video] a new surface for the window (try %d)\n", s_surfaceTries);
+            s_swapReason = "a new surface";
+            CreateSwapchain();  // or RunFrame's, once it can (minimised)
+            s_swapReason = nullptr;
+            return true;
+        }
     }
 
     bool RunFrame()
     {
+        // Another thread found the device lost (DeviceLost): the player is
+        // told from here, the main thread, and the game ends. Before
+        // anything else: a game that stopped sending frames would otherwise
+        // never bring this thread to a Vulkan call that says so.
+        if (s_deviceLost.load(std::memory_order_acquire) != 0)
+            EndAfterDeviceLost();
         DeliverTestAppEvents();
         ui::Tick();
         platform::thermal::Poll();  // about once a second
@@ -2660,6 +2993,13 @@ void main()
             hid::Resume();  // the game's last rumble again
             s_inputSuspended = false;
         }
+        // The window's surface was lost: a new one before anything reads or
+        // builds on it (nothing does while there is none).
+        if (s_surfaceLost && !RecreateSurface())
+        {
+            SDL_Delay(100);
+            return true;
+        }
         CheckSwapchain();
         SuspendAudit();
         hid::SetBlocked(ui::CapturingInput());
@@ -2691,6 +3031,17 @@ void main()
                 aspectH = s_pendingAspectH;
                 s_pendingNew = false;
                 frameVblank = s_pendingVblank;
+                if (!pixels.empty() || gpuImage)
+                {
+                    // In the same hold of the lock as the take: from here on
+                    // the renderer writes its next frames into another image
+                    // (ClaimFrontImage), not this one, whose read is queued
+                    // only after the waits below. Null: the CPU path's frame
+                    // stays in s_source.
+                    s_lastImage = gpuImage;
+                    s_lastSerial = s_pendingSerial;
+                    s_lastQueued = false;
+                }
             }
         }
         const bool upload = !pixels.empty();
@@ -2699,7 +3050,6 @@ void main()
             frameVblank = 0;
         if (upload || gpuImage)
         {
-            s_lastImage = gpuImage;  // null: the CPU path's frame stays in s_source
             s_lastWidth = w;
             s_lastHeight = h;
             s_lastAspectW = aspectW;
@@ -2752,7 +3102,8 @@ void main()
         RegionCapture gameCapture;
 
         Frame& f = s_frames[s_frameIndex];
-        vkWaitForFences(s_device, 1, &f.inFlight, VK_TRUE, UINT64_MAX);
+        if (vkWaitForFences(s_device, 1, &f.inFlight, VK_TRUE, UINT64_MAX) == VK_ERROR_DEVICE_LOST)
+            DeviceLost("vkWaitForFences (the presenter's frame)");
         if (f.timed)
         {
             uint64_t ts[3];
@@ -2770,19 +3121,38 @@ void main()
             vkDestroyImageView(s_device, f.sourceView, nullptr);  // the last use of this frame slot has finished
             f.sourceView = VK_NULL_HANDLE;
         }
-        uint32_t imageIndex;
+        uint32_t imageIndex = 0;
         VkResult acquire = vkAcquireNextImageKHR(s_device, s_swapchain, UINT64_MAX, f.imageAvailable, VK_NULL_HANDLE, &imageIndex);
-        // Either is for the next frame's CheckSwapchain, which runs before
-        // its acquire (one decision a frame: the policy counts in frames).
-        if (acquire == VK_SUBOPTIMAL_KHR)
-            s_swapPolicy.Reported(SurfaceResult::Suboptimal);  // this frame is drawn and presented anyway
-        if (acquire == VK_ERROR_OUT_OF_DATE_KHR)
+        const SurfaceOutcome acquired = ClassifySurfaceResult(acquire);
+        if (acquired.deviceLost)
+            DeviceLost("vkAcquireNextImageKHR");
+        // SUBOPTIMAL or OUT_OF_DATE is for the next frame's CheckSwapchain,
+        // which runs before its acquire (one decision a frame: the policy
+        // counts in frames). A SUBOPTIMAL frame is drawn and presented anyway.
+        if (acquired.report)
+            s_swapPolicy.Reported(acquired.result);
+        if (!acquired.image)
         {
-            s_swapPolicy.Reported(SurfaceResult::OutOfDate);
-            // Screenshots wait for the next frame drawn.
-            std::lock_guard lock(s_captureMutex);
-            for (auto& promise : captures)
-                s_captureRequests.push_back(std::move(promise));
+            // No image, so no index to draw to, and nothing will signal
+            // imageAvailable: this frame is skipped. A lost surface is made
+            // again at the next frame's start.
+            if (acquired.surfaceLost)
+                NoteSurfaceLost("vkAcquireNextImageKHR");
+            else if (acquired.other)
+                LogSurfaceResult("vkAcquireNextImageKHR", acquire);
+            {
+                // Screenshots wait for the next frame drawn.
+                std::lock_guard lock(s_captureMutex);
+                for (auto& promise : captures)
+                    s_captureRequests.push_back(std::move(promise));
+            }
+            if (acquired.other)
+            {
+                // Nothing in the next frame changes what made it fail: not
+                // a busy loop on it.
+                frontLock.unlock();
+                SDL_Delay(16);
+            }
             return true;
         }
         vkResetFences(s_device, 1, &f.inFlight);
@@ -3162,7 +3532,30 @@ void main()
         si.signalSemaphoreCount = 1;
         si.pSignalSemaphores = &s_renderDone[imageIndex];
         std::unique_lock queueLock(s_queueMutex);
-        vkQueueSubmit(s_queue, 1, &si, f.inFlight);
+        const VkResult submitted = vkQueueSubmit(s_queue, 1, &si, f.inFlight);
+        if (submitted == VK_ERROR_DEVICE_LOST)
+        {
+            // Not held over the message box, whose run loop may deliver
+            // app events (iOS) to handlers that take them.
+            queueLock.unlock();
+            frontLock.unlock();
+            DeviceLost("vkQueueSubmit (the presenter)");
+        }
+        if (submitted != VK_SUCCESS)
+        {
+            // Out of memory: the fence reset above would never signal, and
+            // this frame slot's next wait would hang the window for good. A
+            // crash report instead, as the renderer's failed submits make.
+            fprintf(stderr, "[video] vkQueueSubmit failed: %d\n", int(submitted));
+            abort();
+        }
+        {
+            // This frame's read of its image is in the queue: a later write
+            // of it comes after the read (the renderer's barrier orders it).
+            // Only a ring of one front image writes it then (ClaimFrontImage).
+            std::lock_guard lock(s_pendingMutex);
+            s_lastQueued = true;
+        }
         frontLock.unlock();
 
         VkPresentInfoKHR pi{ VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
@@ -3230,7 +3623,12 @@ void main()
         int64_t presented = NowNs();
         VkResult present = vkQueuePresentKHR(s_queue, &pi);
         queueLock.unlock();
-        if (s_presentTiming && (present == VK_SUCCESS || present == VK_SUBOPTIMAL_KHR))
+        const SurfaceOutcome shown = ClassifySurfaceResult(present);
+        if (shown.deviceLost)
+            DeviceLost("vkQueuePresentKHR");
+        if (shown.image)
+            s_surfaceTries = 0;  // a surface that works
+        if (s_presentTiming && shown.image)
         {
             std::lock_guard lock(s_timingMutex);
             s_timings.push_back({ id, s_swapchain, presented, frameVblank });
@@ -3242,7 +3640,8 @@ void main()
             CapturedFrame frame;
             if (gameCapture.buffer)
             {
-                vkWaitForFences(s_device, 1, &f.inFlight, VK_TRUE, UINT64_MAX);
+                if (vkWaitForFences(s_device, 1, &f.inFlight, VK_TRUE, UINT64_MAX) == VK_ERROR_DEVICE_LOST)
+                    DeviceLost("vkWaitForFences (a screenshot)");
                 frame = FinishRegionCapture(gameCapture);
             }
             for (auto& promise : captures)
@@ -3250,7 +3649,8 @@ void main()
         }
         if (captureBuffer)
         {
-            vkWaitForFences(s_device, 1, &f.inFlight, VK_TRUE, UINT64_MAX);
+            if (vkWaitForFences(s_device, 1, &f.inFlight, VK_TRUE, UINT64_MAX) == VK_ERROR_DEVICE_LOST)
+                DeviceLost("vkWaitForFences (a frame saved for a check)");
             void* mapped = nullptr;
             vkMapMemory(s_device, captureMemory, 0, captureSize, 0, &mapped);
             std::string path = captureIndex >= 0 ? std::format("build/present_check_{}.ppm", captureIndex)
@@ -3275,9 +3675,14 @@ void main()
             vkDestroyBuffer(s_device, captureBuffer, nullptr);
             vkFreeMemory(s_device, captureMemory, nullptr);
         }
-        // The next frame's CheckSwapchain builds again (before its acquire).
-        if (present == VK_ERROR_OUT_OF_DATE_KHR || present == VK_SUBOPTIMAL_KHR)
-            s_swapPolicy.Reported(present == VK_ERROR_OUT_OF_DATE_KHR ? SurfaceResult::OutOfDate : SurfaceResult::Suboptimal);
+        // The next frame's CheckSwapchain builds again (before its acquire),
+        // or its start makes a new surface first.
+        if (shown.report)
+            s_swapPolicy.Reported(shown.result);
+        if (shown.surfaceLost)
+            NoteSurfaceLost("vkQueuePresentKHR");
+        else if (shown.other)
+            LogSurfaceResult("vkQueuePresentKHR", present);
         s_frameIndex = (s_frameIndex + 1) % FRAMES_IN_FLIGHT;
         return true;
     }
@@ -3288,7 +3693,7 @@ void main()
             return;
         std::lock_guard lock(s_pendingMutex);
         if (s_pendingNew)
-            s_dropped++;
+            NoteDropped("replaced by a newer frame before it was taken");
         s_pending.clear();
         s_pendingImage = image;
         s_pendingWidth = width;
@@ -3297,12 +3702,77 @@ void main()
         s_pendingAspectH = aspectHeight;
         s_pendingNew = true;
         s_pendingVblank = s_guestVblank.load(std::memory_order_relaxed);
+        s_pendingSerial = ++s_frontSerial;
+    }
+
+    int ClaimFrontImage(const VkImage* images, int count)
+    {
+        if (!s_window || count < 1)
+            return 0;  // no presenter takes frames (SubmitFrontImage drops them)
+        std::lock_guard lock(s_pendingMutex);
+        const gpu::FrontChoice choice = gpu::ChooseFrontImage(images, count, s_lastImage, s_pendingImage);
+        if (choice.kind == gpu::FrontChoice::Kind::TakenBack)
+        {
+            // Every image in use: the presenter's, and a frame it hasn't
+            // taken yet, which this swap would replace a moment later anyway.
+            // Taken back now, so the presenter can't take it in the meantime
+            // and read it while it is written. (CPU-path pixels waiting
+            // beside it stay waiting.)
+            NoteDropped("its image taken back for a newer frame (the presenter had two to take)");
+            s_pendingImage = VK_NULL_HANDLE;
+            s_pendingNew = !s_pending.empty();
+        }
+        else if (choice.kind == gpu::FrontChoice::Kind::Presenter && !s_lastQueued)
+        {
+            // NFSMW_FRONT_IMAGES=1 (v0.1.4's one image): the presenter took
+            // this frame and hasn't queued its read yet (it waits in
+            // vkWaitForFences or vkAcquireNextImageKHR), so the swap's write
+            // comes first and the next frame is shown in its place, then
+            // again as itself. Neither the dropped nor the repeated count
+            // sees that: counted here as dropped, and logged likewise (once
+            // a frame: a second swap before that read loses no other).
+            static uint64_t overwritten = 0, lastOverwritten = 0;
+            if (s_lastSerial != lastOverwritten)
+            {
+                lastOverwritten = s_lastSerial;
+                ++overwritten;
+                ++s_dropped;
+                if (overwritten <= 3 || overwritten % 100 == 0)
+                    fprintf(stderr, "[video] frame %llu written over before the presenter queued its read: frame %llu is shown in "
+                        "its place, then again (one front image; %llu so far)\n", (unsigned long long)s_lastSerial,
+                        (unsigned long long)s_frontSerial + 1, (unsigned long long)overwritten);
+            }
+        }
+        return choice.index;
     }
 
     void WaitGpuIdle()
     {
         if (s_device)
             WaitIdle();
+    }
+
+    void DeviceLost(const char* what)
+    {
+        // Nothing will be drawn again: the hang watchdog stands down (it
+        // counts no time while the window can't be seen), or it would write
+        // a hang report about the frames that stopped while the player
+        // reads the message.
+        s_visible.store(false, std::memory_order_relaxed);
+        int none = 0;
+        if (s_deviceLost.compare_exchange_strong(none, 1, std::memory_order_acq_rel))
+        {
+            s_deviceLostIn.store(what, std::memory_order_relaxed);
+            fprintf(stderr, "[video] the GPU device was lost (VK_ERROR_DEVICE_LOST in %s), %.1f s into the session: the GPU or its "
+                "driver gave up on the game's work (a GPU timeout or reset, a driver fault; on MoltenVK a Metal command buffer "
+                "error), and nothing can be drawn again. The crash report below is for it (its signal a stand-in, its registers "
+                "zeros); then the game exits\n", what, report::SessionSeconds());
+            WriteDeviceLostReport();
+            s_deviceLost.store(2, std::memory_order_release);
+        }
+        else
+            fprintf(stderr, "[video] VK_ERROR_DEVICE_LOST in %s too\n", what);
+        EndAfterDeviceLost();
     }
 
     PresentStats GetPresentStats()

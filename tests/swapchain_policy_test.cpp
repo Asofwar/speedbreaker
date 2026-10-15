@@ -453,6 +453,26 @@ static void Choose(Extent surface, Orientation interface, bool landscapeOnly, Ex
         want.width, want.height, refused ? " refused" : "");
 }
 
+// What a frame does with an acquire's or a present's result
+// (ClassifySurfaceResult): only VK_SUCCESS and VK_SUBOPTIMAL_KHR give an
+// image (v0.1.4 drew to the index an acquire that returned
+// VK_ERROR_SURFACE_LOST_KHR or VK_ERROR_DEVICE_LOST never wrote); a lost
+// surface and a lost device are told apart from the rest; out of date and
+// exclusive fullscreen lost build the swapchain again.
+static void Classify(const char* name, int32_t result, bool image, bool report, SurfaceResult reported, bool surfaceLost,
+    bool deviceLost, bool other)
+{
+    const SurfaceOutcome o = ClassifySurfaceResult(result);
+    printf("%-45s image %d, report %d%s, surface lost %d, device lost %d, other %d\n", name, o.image, o.report,
+        o.report ? (o.result == SurfaceResult::OutOfDate ? " (out of date)" : " (suboptimal)") : "", o.surfaceLost, o.deviceLost,
+        o.other);
+    CHECK(o.image == image && o.report == report && (!report || o.result == reported) && o.surfaceLost == surfaceLost &&
+        o.deviceLost == deviceLost && o.other == other, "%s (%d)", name, int(result));
+    // One way on: an image, or one reason there is none.
+    CHECK(int(o.image) + int(!o.image && o.report) + int(o.surfaceLost) + int(o.deviceLost) + int(o.other) == 1, "%s: one outcome",
+        name);
+}
+
 static void Ui(float ww, float wh, Extent fb, float wantW, float wantH, float wantScale, bool fromSwapchain)
 {
     UiDisplay u = FitUiDisplay(ww, wh, fb);
@@ -493,6 +513,20 @@ int main()
     Planted("suboptimalBackoff 100", [](SwapchainRules& r) { r.suboptimalBackoff = 100; });
     Planted("repairEvery 1", [](SwapchainRules& r) { r.repairEvery = 1; });
     Planted("repairPatience 100000", [](SwapchainRules& r) { r.repairPatience = 100000; });
+
+    printf("\nacquire and present results:\n");
+    Classify("VK_SUCCESS", kVkSuccess, true, false, {}, false, false, false);
+    Classify("VK_SUBOPTIMAL_KHR", kVkSuboptimal, true, true, SurfaceResult::Suboptimal, false, false, false);
+    Classify("VK_ERROR_OUT_OF_DATE_KHR", kVkErrorOutOfDate, false, true, SurfaceResult::OutOfDate, false, false, false);
+    Classify("VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT", kVkErrorFullScreenLost, false, true, SurfaceResult::OutOfDate, false, false,
+        false);
+    Classify("VK_ERROR_SURFACE_LOST_KHR", kVkErrorSurfaceLost, false, false, {}, true, false, false);
+    Classify("VK_ERROR_DEVICE_LOST", kVkErrorDeviceLost, false, false, {}, false, true, false);
+    // Vulkan's numbers for the rest (vulkan_core.h).
+    Classify("VK_NOT_READY", 1, false, false, {}, false, false, true);
+    Classify("VK_TIMEOUT", 2, false, false, {}, false, false, true);
+    Classify("VK_ERROR_OUT_OF_HOST_MEMORY", -1, false, false, {}, false, false, true);
+    Classify("VK_ERROR_OUT_OF_DEVICE_MEMORY", -2, false, false, {}, false, false, true);
 
     printf("\nUI display:\n");
     Ui(956, 440, kLandscape, 956, 440, 3.0f, false);           // iPhone 18 Pro Max, as it should be

@@ -606,7 +606,7 @@ namespace gpu
                         " | memory: %.0f MB (targets %.0f in %u, textures %.0f in %u, scaled %.0f, front %.0f), device %.0f of %.0f MB,"
                         " image blocks %u (%.0f MB: %.0f MB in %u images), %u spare (%.0f MB), %u images alone (%.0f MB)"
                         " | images: %llu made (%.0f us each), %llu allocations (%.1f ms); blocks: %llu from the spare, %llu allocated here,"
-                        " %llu by the memory thread (%.1f ms each), %llu freed%s\n",
+                        " %llu by the memory thread (%.1f ms each), %llu freed; textures evicted %llu (%.0f MB), %llu out of memory%s\n",
                         120.0 / secs, worstMs, cpBusyMs, drawsPerFrame > 0 ? cpBusyMs * 1000.0 / drawsPerFrame : 0.0,
                         drawsPerFrame, double(st.tileSkips - last.tileSkips) / 120,
                         double(st.constantUploads - last.constantUploads) / 120,
@@ -637,7 +637,10 @@ namespace gpu
                         (unsigned long long)(memory.fromSpare - lastMemory.fromSpare), (unsigned long long)(memory.blocksHere - lastMemory.blocksHere),
                         (unsigned long long)(memory.spareBlocks - lastMemory.spareBlocks),
                         memory.spareBlocks > lastMemory.spareBlocks ? double(memory.spareNs - lastMemory.spareNs) / 1e6 / double(memory.spareBlocks - lastMemory.spareBlocks) : 0.0,
-                        (unsigned long long)(memory.blocksFreed - lastMemory.blocksFreed), tailText.c_str());
+                        (unsigned long long)(memory.blocksFreed - lastMemory.blocksFreed),
+                        (unsigned long long)(memory.textureEvictions - lastMemory.textureEvictions),
+                        double(memory.textureEvictedBytes - lastMemory.textureEvictedBytes) / 1048576.0,
+                        (unsigned long long)(memory.textureReclaims - lastMemory.textureReclaims), tailText.c_str());
                     lastMemory = memory;
                     lastShown = shown;
                     lastWorld = world;

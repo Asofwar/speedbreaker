@@ -32,6 +32,15 @@
 // bar only when it ends short of the screen edge). Nothing inside the band
 // changes, and the strips get the quad's own colour, alpha and blend.
 //
+// Menus dim the world behind them the same way (GitHub issue #19: the
+// blacklist's and the showcase car's screens, on a 16:10 Mac and the Deck):
+// one translucent dark quad, a backdrop or a vignette, centred and short of
+// the band's edges like the black frame, but not opaque black on the white
+// texture, so the black frame's rule passed it by and the world showed
+// undimmed in the strips past the band. The inset overlay rule takes any
+// colour, alpha and texture in that shape, and fills the same strips with
+// its stretched copy, blended as it is.
+//
 // Units: the frame's clip space after the front-end matrix (w = 1), and
 // "band units" = clip / view scale (x / scaleX, y / scaleY): +-1 are the
 // 16:9 frame's edges, what a 16:9 screen shows.
@@ -426,6 +435,54 @@ namespace gpu::bars
         out[3] = ps[3] + by * ps[1];
     }
 
+    // An inset overlay: a menu's translucent backdrop or vignette over the
+    // world (the blacklist's and the showcase car's screens, GitHub issue
+    // #19). The black frame's shape, any colour (one on all four vertices),
+    // any alpha, any texture: about 0.97 of the band's width and a little
+    // less of its height, so on a 16:9 screen a thin border of the world
+    // shows round it (as on the console, where a TV's overscan hid it) and
+    // past the band (Vert+ above and below it, Hor+ beside it) strips of the
+    // world showed undimmed. Thresholds in band units, the black frame's;
+    // the nearest draws it must not take are the black frame's (the fades
+    // and dims at +-1.29, the title key art and the overlay at ~57 s at x
+    // +-1.104, the vid cam's overlays at x +-0.70 and dialog boxes at
+    // +-0.58, a full-band layer at +-1.0, the pause dim's gradients off
+    // centre); the HUD's pieces are small or off centre. A black frame
+    // fading in or out (alpha below F0) is one, filled the same way. Only
+    // alpha-blended draws (OverlayCandidate): an unblended quad of this shape
+    // is an opaque picture, whose stretched copy would smear it.
+    struct OverlayRule
+    {
+        float centreMax = 0.01f;                     // |the box's centre|, each axis
+        float extentMin = 0.90f, extentMax = 0.99f;  // half its width and half its height
+        float cornerTolerance = 1e-3f;               // clip units, as Rule's
+    };
+
+    // An inset overlay: one axis-aligned rectangle, one colour on all four
+    // vertices (any colour, any alpha), centred in the band and covering most
+    // of it in x and y while stopping short of its edges. Its box goes to
+    // `box`.
+    inline bool MatchOverlay(const Vertex v[4], float scaleX, float scaleY, const OverlayRule& rule = {}, Box* box = nullptr)
+    {
+        if (!(scaleX > 0.0f && scaleY > 0.0f))
+            return false;
+        for (int i = 1; i < 4; i++)
+            if (v[i].argb != v[0].argb)
+                return false;
+        Box b;
+        if (!RectangleBox(v, rule.cornerTolerance, b))
+            return false;
+        const float midX = (b.x0 + b.x1) * 0.5f / scaleX, midY = (b.y0 + b.y1) * 0.5f / scaleY;
+        const float halfX = (b.x1 - b.x0) * 0.5f / scaleX, halfY = (b.y1 - b.y0) * 0.5f / scaleY;
+        if (!(std::fabs(midX) <= rule.centreMax && std::fabs(midY) <= rule.centreMax))
+            return false;
+        if (!(halfX >= rule.extentMin && halfX <= rule.extentMax && halfY >= rule.extentMin && halfY <= rule.extentMax))
+            return false;
+        if (box)
+            *box = b;
+        return true;
+    }
+
     // A front-end draw as gpu/renderer.cpp sees it once the widen, stretch,
     // cover and band-clip rules are done: what PlanFill decides from.
     struct Draw
@@ -447,12 +504,13 @@ namespace gpu::bars
         Rect scissor{};               // the draw's scissor (host pixels)
     };
 
-    enum class Fill : uint8_t { None, LeftBar, RightBar, Blackout, Backdrop };
+    enum class Fill : uint8_t { None, LeftBar, RightBar, Blackout, Backdrop, Overlay };
 
-    // What to draw after the draw: for a bar or a black frame, `rectCount`
-    // more copies of it (none for a bar that reaches the screen edge), with
-    // `posScale` and each rectangle as the scissor; for a backdrop, each
-    // rectangle cleared to opaque black (its picture must not be copied).
+    // What to draw after the draw: for a bar, a black frame or an inset
+    // overlay, `rectCount` more copies of it (none for a bar that reaches the
+    // screen edge), with `posScale` and each rectangle as the scissor; for a
+    // backdrop, each rectangle cleared to opaque black (its picture must not
+    // be copied).
     struct Plan
     {
         Fill fill = Fill::None;
@@ -523,6 +581,67 @@ namespace gpu::bars
         p.box = box;
         p.argb = v[0].argb;
         p.rectCount = BackdropRects(box, d.posScale, d.hostW, d.hostH, d.scissor, d.scaleX, d.scaleY, p.rects);
+        return p;
+    }
+
+    // The register checks for an inset overlay, before any vertex is read:
+    // Candidate's, with a view narrower than the screen in x or y (at 16:9
+    // there's nothing past the band to fill), alpha blending only (an
+    // unblended quad of that shape is a picture: OverlayRule) and any
+    // texture (a vignette's gradient, or none).
+    inline bool OverlayCandidate(const Draw& d)
+    {
+        const float* c = d.c;
+        const bool yScale = d.frontEndY > 0.0f ? std::fabs(std::fabs(c[5]) - d.frontEndY) <= d.frontEndY * 1e-5f
+                                               : d.frontEndY == 0.0f && d.scaleY >= 1.0f;
+        return (d.scaleX < 1.0f || d.scaleY < 1.0f) && !d.occlusion && d.prim == 13 && d.count == 4 && d.frontEndShader && d.leftAlone &&
+            c[3] == 0.0f && c[4] == 0.0f && c[6] == 0.0f && c[7] == 0.0f && yScale && (d.vte & 0xF) == 0xF && d.blend0 == 0x07060706u;
+    }
+
+    // The plan for an inset overlay (PlanFill's for bars and black frames,
+    // PlanBackdrop's for backdrops; the renderer asks this one last). Any
+    // colour passes, so vertex 0 is read first: it lies on a corner of the
+    // box, so a quad whose vertex 0 is nowhere near 0.90..0.99 of the band
+    // out on both axes (the extents give or take the centring and the corner
+    // tolerance) is refused after its four reads, not sixteen (a front-end
+    // frame has hundreds of quads). The fill is the black frame's: copies
+    // stretched over the frame, in the strips past the band.
+    template <class ReadWord>
+    Plan PlanOverlay(const Draw& d, ReadWord&& read, const OverlayRule& rule = {})
+    {
+        Plan p;
+        if (!OverlayCandidate(d))
+            return p;
+        const float* c = d.c;
+        Vertex v[4];
+        for (uint32_t k = 0; k < 4; k++)
+        {
+            uint32_t w[4];
+            for (uint32_t j = 0; j < 4; j++)
+                if (!read(k, j, w[j]))
+                    return p;
+            float q[3];
+            std::memcpy(q, w, sizeof(q));
+            v[k] = { q[0] * c[0] + q[1] * c[1] + q[2] * c[2] + c[3], q[0] * c[4] + q[1] * c[5] + q[2] * c[6] + c[7], w[3] };
+            if (k == 0)
+            {
+                // (Generous by 0.001: only a quick refusal, MatchOverlay decides.)
+                auto corner = [&](float a, float scale) {
+                    const float out = std::fabs(a) / scale, slack = rule.centreMax + rule.cornerTolerance / scale + 0.001f;
+                    return out >= rule.extentMin - slack && out <= rule.extentMax + slack;
+                };
+                if (!(d.scaleX > 0.0f && d.scaleY > 0.0f && corner(v[0].x, d.scaleX) && corner(v[0].y, d.scaleY)))
+                    return p;
+            }
+        }
+        Box box{};
+        if (!MatchOverlay(v, d.scaleX, d.scaleY, rule, &box))
+            return p;
+        p.fill = Fill::Overlay;
+        p.box = box;
+        p.argb = v[0].argb;
+        p.rectCount = BlackoutRects(d.posScale, d.hostW, d.hostH, d.scissor, d.scaleX, d.scaleY, p.rects);
+        CoverFrame(box, d.posScale, p.posScale);
         return p;
     }
 

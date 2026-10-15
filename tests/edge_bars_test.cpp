@@ -1,7 +1,8 @@
 // Tests for gpu::bars (runtime/gpu/edge_bars.h): which front-end quads are
-// the police vid-cam's side bars or the intro's black frame, what they fill
-// past the 16:9 band, the stretched copy's posScale, the band clip's rows,
-// and the whole plan the renderer asks for (PlanFill) on the draws as
+// the police vid-cam's side bars, the intro's black frame, a full-band
+// backdrop or a menu's inset overlay, what they fill past the 16:9 band, the
+// stretched copy's posScale, the band clip's rows, and the whole plan the
+// renderer asks for (PlanFill, PlanBackdrop, PlanOverlay) on the draws as
 // dumped. From the repo root:
 //   clang++ -std=c++20 -O2 -UNDEBUG -Iruntime tests/edge_bars_test.cpp -o build/edge_bars_test
 //   build/edge_bars_test
@@ -583,7 +584,7 @@ static Draw S2Draw(const Matrix& m, float sx, float sy, const float ps[4], float
 static const char* Name(Fill f)
 {
     return f == Fill::RightBar ? "right bar" : f == Fill::LeftBar ? "left bar" : f == Fill::Blackout ? "black frame"
-        : f == Fill::Backdrop ? "backdrop" : "none";
+        : f == Fill::Backdrop ? "backdrop" : f == Fill::Overlay ? "inset overlay" : "none";
 }
 
 // Runs PlanFill over the ePolys; the reader fails for vertices from
@@ -926,6 +927,271 @@ static void BackdropTests()
         // PlanFill (bars and black frames) never takes it: the renderer asks
         // PlanBackdrop only when PlanFill found nothing.
         CHECK(RunPlan(d, results).fill == Fill::None, "PlanFill took the backdrop");
+    }
+}
+
+// ---- The inset overlay (a menu's translucent backdrop or vignette) ----
+
+// GitHub issue #19's shape: about 0.97 of the band's width and a little less
+// of its height, translucent black (the blacklist's and the showcase car's
+// screens; not yet measured with NFSMW_LOG_FRONTEND, so the thresholds are
+// the black frame's and the cases cover its whole range).
+constexpr float kOverlayX = 0.970f, kOverlayY = 0.930f;
+constexpr uint32_t kOverlayColour = 0x80000000;
+
+static void MatchOver(const char* what, const Quad& q, float sx, float sy, bool want, const OverlayRule& rule)
+{
+    Box box{};
+    const bool got = MatchOverlay(q.v, sx, sy, rule, &box);
+    CHECK(got == want, "%s at x %.4f y %.4f: %s, want %s", what, sx, sy, got ? "inset overlay" : "none", want ? "inset overlay" : "none");
+}
+
+// Every inset-overlay match case. Returns the failures it added (for planting).
+static int OverlayCases(const OverlayRule& rule)
+{
+    const int before = g_failures;
+    for (const Shape& s : kShapes)
+    {
+        auto at = [&](float x0, float x1, float y0, float y1, uint32_t argb) { return Rectangle(x0, x1, y0, y1, s.sx, s.sy, argb); };
+        MatchOver("translucent overlay", at(-kOverlayX, kOverlayX, -kOverlayY, kOverlayY, kOverlayColour), s.sx, s.sy, true, rule);
+        MatchOver("vignette (white, textured)", at(-kOverlayX, kOverlayX, -kOverlayY, kOverlayY, 0xFFFFFFFF), s.sx, s.sy, true, rule);
+        MatchOver("faint grey", at(-kOverlayX, kOverlayX, -kOverlayY, kOverlayY, 0x20404040), s.sx, s.sy, true, rule);
+        MatchOver("transparent", at(-kOverlayX, kOverlayX, -kOverlayY, kOverlayY, 0x00000000), s.sx, s.sy, true, rule);
+        // The black frames are the shape too (PlanFill takes them first; one
+        // fading in or out is this rule's).
+        MatchOver("black frame", at(-kFrameX, kFrameX, -kFrameY, kFrameY, kFrameColour), s.sx, s.sy, true, rule);
+        MatchOver("black frame at ~57 s, fading", at(-kFrameX, kFrameX, -kFrameY57, kFrameY57, 0x7E000000), s.sx, s.sy, true, rule);
+        // What must show the world as before (or is another rule's).
+        MatchOver("~57 s overlay (B8)", at(-1.104f, 1.104f, -0.978f, 0.985f, 0xB8000000), s.sx, s.sy, false, rule);
+        MatchOver("title key art", at(-1.104f, 1.104f, -0.981f, 0.981f, 0xFF7F7F7F), s.sx, s.sy, false, rule);
+        MatchOver("fade", at(-1.29f, 1.29f, -1.30f, 1.30f, 0xFF000000), s.sx, s.sy, false, rule);
+        MatchOver("dim", at(-1.29f, 1.29f, -1.25f, 1.25f, 0x80000000), s.sx, s.sy, false, rule);
+        MatchOver("loading band", at(-1.29f, 1.29f, -0.30f, 0.30f, 0xFF000000), s.sx, s.sy, false, rule);
+        MatchOver("full band", at(-1.0f, 1.0f, -1.0f, 1.0f, 0x80000000), s.sx, s.sy, false, rule);
+        MatchOver("noise overlay", at(-0.692f, 0.709f, -1.058f, 1.050f, 0x3C727272), s.sx, s.sy, false, rule);
+        MatchOver("vid cam dark overlay", at(-0.712f, 0.668f, -0.893f, 0.908f, 0x3C000000), s.sx, s.sy, false, rule);
+        MatchOver("cam dialog box", at(-0.578f, 0.586f, -0.167f, 0.569f, 0xFD000000), s.sx, s.sy, false, rule);
+        MatchOver("pause dim centre", at(-0.53f, 0.57f, -1.91f, 1.91f, 0xC8000000), s.sx, s.sy, false, rule);
+        MatchOver("pause dim side gradient shape", at(0.569f, 1.117f, -1.905f, 1.913f, 0xC8000000), s.sx, s.sy, false, rule);
+        MatchOver("right bar", at(0.651f, 1.406f, -1.024f, 1.039f, 0xFD000000), s.sx, s.sy, false, rule);
+        MatchOver("minimap piece", at(-0.73f, -0.46f, -1.02f, -0.53f, 0xFE7F7F7F), s.sx, s.sy, false, rule);
+        MatchOver("brush 15299000", at(-0.90f, 0.90f, -1.07f, -0.58f, 0xFF000000), s.sx, s.sy, false, rule);
+        MatchOver("overlay width, full height", at(-kOverlayX, kOverlayX, -1.0f, 1.0f, kOverlayColour), s.sx, s.sy, false, rule);
+        MatchOver("full width, overlay height", at(-1.0f, 1.0f, -kOverlayY, kOverlayY, kOverlayColour), s.sx, s.sy, false, rule);
+        MatchOver("a dialog panel 0.80 x 0.60", at(-0.80f, 0.80f, -0.60f, 0.60f, 0xC0000000), s.sx, s.sy, false, rule);
+        // A gradient (its vertices' colours differ): not one colour.
+        Quad grad = at(-kOverlayX, kOverlayX, -kOverlayY, kOverlayY, kOverlayColour);
+        grad.v[2].argb = grad.v[3].argb = 0x00000000;
+        MatchOver("a gradient", grad, s.sx, s.sy, false, rule);
+    }
+    // Each threshold from both sides, on the Deck and at 32:9.
+    const Shape shapes[] = { { "Deck", 1.0f, 0.9f }, { "32:9", 0.5f, 1.0f } };
+    for (const Shape& s : shapes)
+    {
+        auto quad = [&](float dx, float dy, float hx, float hy) {
+            return Rectangle(dx - hx, dx + hx, dy - hy, dy + hy, s.sx, s.sy, kOverlayColour);
+        };
+        MatchOver("centre x +0.009", quad(0.009f, 0.0f, kOverlayX, kOverlayY), s.sx, s.sy, true, rule);
+        MatchOver("centre x +0.011", quad(0.011f, 0.0f, kOverlayX, kOverlayY), s.sx, s.sy, false, rule);
+        MatchOver("centre y -0.009", quad(0.0f, -0.009f, kOverlayX, kOverlayY), s.sx, s.sy, true, rule);
+        MatchOver("centre y -0.011", quad(0.0f, -0.011f, kOverlayX, kOverlayY), s.sx, s.sy, false, rule);
+        MatchOver("half width 0.895", quad(0.0f, 0.0f, 0.895f, kOverlayY), s.sx, s.sy, false, rule);
+        MatchOver("half width 0.905", quad(0.0f, 0.0f, 0.905f, kOverlayY), s.sx, s.sy, true, rule);
+        MatchOver("half width 0.985", quad(0.0f, 0.0f, 0.985f, kOverlayY), s.sx, s.sy, true, rule);
+        MatchOver("half width 0.995", quad(0.0f, 0.0f, 0.995f, kOverlayY), s.sx, s.sy, false, rule);
+        MatchOver("half height 0.895", quad(0.0f, 0.0f, kOverlayX, 0.895f), s.sx, s.sy, false, rule);
+        MatchOver("half height 0.905", quad(0.0f, 0.0f, kOverlayX, 0.905f), s.sx, s.sy, true, rule);
+        MatchOver("half height 0.985", quad(0.0f, 0.0f, kOverlayX, 0.985f), s.sx, s.sy, true, rule);
+        MatchOver("half height 0.995", quad(0.0f, 0.0f, kOverlayX, 0.995f), s.sx, s.sy, false, rule);
+        Quad mixed = quad(0.0f, 0.0f, kOverlayX, kOverlayY);
+        mixed.v[3].argb = 0x81000000;
+        MatchOver("one vertex's colour differs", mixed, s.sx, s.sy, false, rule);
+        Quad off = quad(0.0f, 0.0f, kOverlayX, kOverlayY);
+        off.v[2].y += 0.01f;
+        MatchOver("a vertex 0.01 off its corner", off, s.sx, s.sy, false, rule);
+        Quad nearly = quad(0.0f, 0.0f, kOverlayX, kOverlayY);
+        nearly.v[2].y += 0.0005f;
+        MatchOver("a vertex 0.0005 off its corner", nearly, s.sx, s.sy, true, rule);
+        Quad bowtie = quad(0.0f, 0.0f, kOverlayX, kOverlayY);
+        std::swap(bowtie.v[1], bowtie.v[2]);
+        MatchOver("bow-tie order", bowtie, s.sx, s.sy, false, rule);
+    }
+    return g_failures - before;
+}
+
+static void PlantedOverlay(const char* what, const OverlayRule& wrong)
+{
+    const int saved = g_failures;
+    g_quiet = true;
+    const int failed = OverlayCases(wrong);
+    g_quiet = false;
+    g_failures = saved;
+    printf("planted %-26s %d case(s) fail\n", what, failed);
+    CHECK(failed > 0, "planted %s: every overlay case still passes", what);
+}
+
+// Runs PlanOverlay over the ePolys, as RunPlan does PlanFill.
+static Plan RunOverlay(const Draw& d, const EPolys& e, uint32_t limit = 4, int* reads = nullptr)
+{
+    int n = 0;
+    const Plan p = PlanOverlay(d, [&](uint32_t k, uint32_t j, uint32_t& word) {
+        n++;
+        word = e.w[k & 3][j & 3];
+        return k < limit;
+    });
+    if (reads)
+        *reads = n;
+    return p;
+}
+
+static void OverlayPlanCase(const char* what, const Draw& d, const EPolys& e, Fill want, uint32_t wantN = 0, const Rect* wantRects = nullptr,
+    uint32_t limit = 4)
+{
+    const Plan p = RunOverlay(d, e, limit);
+    printf("overlay plan %s: %s, %u rect(s)", what, Name(p.fill), p.rectCount);
+    for (uint32_t i = 0; i < p.rectCount; i++)
+        printf(" [%d,%d)x[%d,%d)", p.rects[i].x0, p.rects[i].x1, p.rects[i].y0, p.rects[i].y1);
+    printf("\n");
+    CHECK(p.fill == want, "%s: %s, want %s", what, Name(p.fill), Name(want));
+    if (p.fill != want || want == Fill::None)
+        return;
+    CHECK(p.rectCount == wantN, "%s: %u rects, want %u", what, p.rectCount, wantN);
+    for (uint32_t i = 0; i < p.rectCount && i < wantN; i++)
+        CHECK(Same(p.rects[i], wantRects[i]), "%s: rect %u [%d,%d)x[%d,%d), want [%d,%d)x[%d,%d)", what, i, p.rects[i].x0, p.rects[i].x1,
+            p.rects[i].y0, p.rects[i].y1, wantRects[i].x0, wantRects[i].x1, wantRects[i].y0, wantRects[i].y1);
+    // The copy: the quad's box stretched over the frame, in its own colour.
+    float q[4];
+    CoverFrame(p.box, d.posScale, q);
+    CHECK(std::memcmp(q, p.posScale, sizeof(q)) == 0, "%s: posScale %.5f %.5f %.5f %.5f, want %.5f %.5f %.5f %.5f", what, p.posScale[0],
+        p.posScale[1], p.posScale[2], p.posScale[3], q[0], q[1], q[2], q[3]);
+    CHECK(p.argb == e.w[0][3], "%s: colour %08X, want %08X", what, p.argb, e.w[0][3]);
+}
+
+static void OverlayTests()
+{
+    printf("\ninset overlay:\n");
+    OverlayCases(OverlayRule{});
+    {
+        // Guards: no view scale, and the box written on a match only.
+        const Quad o = Rectangle(-kOverlayX, kOverlayX, -kOverlayY, kOverlayY, 1.0f, 0.9f, kOverlayColour);
+        Box b{ 9.0f, 9.0f, 9.0f, 9.0f };
+        CHECK(!MatchOverlay(o.v, 0.0f, 0.9f, OverlayRule{}, &b) && !MatchOverlay(o.v, 1.0f, -0.9f, OverlayRule{}, &b) && b.x0 == 9.0f,
+            "an inset overlay with no view scale");
+        const Quad bar = Rectangle(0.651f, 1.406f, -1.024f, 1.039f, 1.0f, 0.9f, 0xFD000000);
+        CHECK(!MatchOverlay(bar.v, 1.0f, 0.9f, OverlayRule{}, &b) && b.x0 == 9.0f, "a miss leaves the box as it was");
+        CHECK(MatchOverlay(o.v, 1.0f, 0.9f, OverlayRule{}, &b) && b.x0 == o.v[0].x && b.x1 == o.v[1].x && b.y0 == o.v[0].y && b.y1 == o.v[2].y,
+            "a match writes the overlay's box");
+        // The black frame's rule never takes a translucent one, nor the side bar's.
+        CHECK(!MatchBlackout(o.v, 1.0f, 0.9f) && MatchSideBar(o.v, 1.0f, 0.9f) == Side::None, "a translucent overlay is no black frame or bar");
+    }
+    printf("overlay match cases at %zu screen shapes checked\n", std::size(kShapes));
+    printf("\nplanted, inset overlay (each must fail a case):\n");
+    auto plant = [](const char* what, auto set) { OverlayRule r; set(r); PlantedOverlay(what, r); };
+    plant("centreMax 0", [](OverlayRule& r) { r.centreMax = 0.0f; });
+    plant("centreMax 0.02", [](OverlayRule& r) { r.centreMax = 0.02f; });
+    plant("extentMin 0.89", [](OverlayRule& r) { r.extentMin = 0.89f; });
+    plant("extentMin 0.91", [](OverlayRule& r) { r.extentMin = 0.91f; });
+    plant("extentMax 0.98", [](OverlayRule& r) { r.extentMax = 0.98f; });
+    plant("extentMax 1.00", [](OverlayRule& r) { r.extentMax = 1.00f; });
+    plant("cornerTolerance 0.02", [](OverlayRule& r) { r.cornerTolerance = 0.02f; });
+    plant("cornerTolerance 0.0001", [](OverlayRule& r) { r.cornerTolerance = 0.0001f; });
+
+    printf("\ninset overlay plan (the draw as the renderer hands it over):\n");
+    float ps[4];
+    FrontEndPs(ps);
+    const Rect frame2{ 0, 0, 2560, 1440 };
+    const Matrix deck = FrontEndMatrix(1.0f, 0.9f), w329 = FrontEndMatrix(0.5f, 1.0f), m169 = FrontEndMatrix(1.0f, 1.0f);
+    const EPolys overlayDeck = Polys(Rectangle(-kOverlayX, kOverlayX, -kOverlayY, kOverlayY, 1.0f, 0.9f, kOverlayColour), deck);
+    const Draw d = S2Draw(deck, 1.0f, 0.9f, ps);
+    // The rows above and below the band, whole: the black frame's fill.
+    const Rect deckWant[2] = { { 0, 0, 1280, 36 }, { 0, 684, 1280, 720 } };
+    OverlayPlanCase("Deck, translucent", d, overlayDeck, Fill::Overlay, 2, deckWant);
+    const Rect w329Want[2] = { { 1920, 0, 2560, 1440 }, { 0, 0, 640, 1440 } };
+    OverlayPlanCase("32:9, translucent", S2Draw(w329, 0.5f, 1.0f, ps, 2560, 4096, frame2),
+        Polys(Rectangle(-kOverlayX, kOverlayX, -kOverlayY, kOverlayY, 0.5f, 1.0f, kOverlayColour), w329), Fill::Overlay, 2, w329Want);
+    // 16:9: nothing past the band, so not even looked at.
+    OverlayPlanCase("16:9", S2Draw(m169, 1.0f, 1.0f, ps), Polys(Rectangle(-kOverlayX, kOverlayX, -kOverlayY, kOverlayY, 1.0f, 1.0f, kOverlayColour), m169),
+        Fill::None);
+    // Any texture: a vignette's 256x256 gradient, or none sampled.
+    Draw textured = d;
+    textured.t0Width = textured.t0Height = 256;
+    OverlayPlanCase("Deck, a 256x256 vignette", textured, overlayDeck, Fill::Overlay, 2, deckWant);
+    textured.t0Sampled = false;
+    OverlayPlanCase("Deck, no texture", textured, overlayDeck, Fill::Overlay, 2, deckWant);
+    // A ppc/ from before the Vert+ hooks: Hor+ only.
+    Draw old = S2Draw(w329, 0.5f, 1.0f, ps, 2560, 4096, frame2);
+    old.frontEndY = 0.0f;
+    OverlayPlanCase("32:9, old ppc/", old, Polys(Rectangle(-kOverlayX, kOverlayX, -kOverlayY, kOverlayY, 0.5f, 1.0f, kOverlayColour), w329),
+        Fill::Overlay, 2, w329Want);
+    // Each register check refuses on its own.
+    auto refuse = [&](const char* what, auto change) {
+        Draw x = d;
+        Matrix m = deck;
+        change(x, m);
+        x.c = m.c;
+        OverlayPlanCase(what, x, overlayDeck, Fill::None);
+    };
+    refuse("blending off (a picture)", [](Draw& x, Matrix&) { x.blend0 = 0x00010001; });
+    refuse("additive blend", [](Draw& x, Matrix&) { x.blend0 = 0x01060106; });
+    refuse("a triangle list", [](Draw& x, Matrix&) { x.prim = 4; });
+    refuse("two quads", [](Draw& x, Matrix&) { x.count = 8; });
+    refuse("not the front-end shader", [](Draw& x, Matrix&) { x.frontEndShader = false; });
+    refuse("taken by another rule", [](Draw& x, Matrix&) { x.leftAlone = false; });
+    refuse("inside an occlusion query", [](Draw& x, Matrix&) { x.occlusion = true; });
+    refuse("x translation c3", [](Draw&, Matrix& m) { m.c[3] = 0.01f; });
+    refuse("y translation c7", [](Draw&, Matrix& m) { m.c[7] = 0.01f; });
+    refuse("c5 not the front end's y scale", [](Draw& x, Matrix&) { x.frontEndY = 0.83f; });
+    refuse("VTE y offset off", [](Draw& x, Matrix&) { x.vte = 0x437; });
+    OverlayPlanCase("vertex 0 past the buffer", d, overlayDeck, Fill::None, 0, nullptr, 0);
+    OverlayPlanCase("vertex 3 past the buffer", d, overlayDeck, Fill::None, 0, nullptr, 3);
+    // The other rules: PlanFill and PlanBackdrop don't take a translucent
+    // one; an opaque black frame is PlanFill's (the renderer asks it first).
+    CHECK(RunPlan(d, overlayDeck).fill == Fill::None, "PlanFill took a translucent overlay");
+    CHECK(PlanBackdrop(textured, [&](uint32_t k, uint32_t j, uint32_t& word) { word = overlayDeck.w[k & 3][j & 3]; return k < 4; }).fill ==
+            Fill::None,
+        "PlanBackdrop took a translucent overlay");
+    const EPolys frameDeck = Polys(Rectangle(-kFrameX, kFrameX, -kFrameY, kFrameY, 1.0f, 0.9f, kFrameColour), deck);
+    CHECK(RunPlan(d, frameDeck).fill == Fill::Blackout, "the opaque black frame is PlanFill's");
+    // Reads: none when a register check refuses, vertex 0's four when it is
+    // nowhere near the overlay's corners (a HUD piece), all sixteen for one.
+    int reads = -1;
+    Draw tri = d;
+    tri.prim = 4;
+    RunOverlay(tri, overlayDeck, 4, &reads);
+    CHECK(reads == 0, "a refused draw: %d reads, want 0", reads);
+    RunOverlay(d, Polys(Rectangle(-0.73f, -0.46f, -1.02f, -0.53f, 1.0f, 0.9f, 0xFE7F7F7F), deck), 4, &reads);
+    CHECK(reads == 4, "a minimap piece: %d reads, want 4", reads);
+    RunOverlay(d, overlayDeck, 4, &reads);
+    CHECK(reads == 16, "an overlay: %d reads, want 16", reads);
+    // Vertex 0's quick refusal is never stricter than the match: at the
+    // thresholds' edges, with vertex 0 on each corner in turn, PlanOverlay
+    // and MatchOverlay agree.
+    {
+        int disagree = 0, matched = 0;
+        const Shape shapes[] = { { "Deck", 1.0f, 0.9f }, { "4:3", 1.0f, 0.75f }, { "32:9", 0.5f, 1.0f }, { "21:9", 0.75f, 1.0f } };
+        const float centres[] = { -0.0099f, 0.0f, 0.0099f }, halves[] = { 0.8995f, 0.9005f, 0.95f, 0.9895f, 0.9905f };
+        for (const Shape& s : shapes)
+        {
+            const Matrix m = FrontEndMatrix(s.sx, s.sy);
+            const Draw ds = S2Draw(m, s.sx, s.sy, ps);
+            for (float cx : centres)
+                for (float cy : centres)
+                    for (float hx : halves)
+                        for (float hy : halves)
+                            for (int rot = 0; rot < 4; rot++)
+                            {
+                                const Quad q0 = Rectangle(cx - hx, cx + hx, cy - hy, cy + hy, s.sx, s.sy, kOverlayColour);
+                                Quad q;
+                                for (int k = 0; k < 4; k++)
+                                    q.v[k] = q0.v[(k + rot) & 3];
+                                const bool want = MatchOverlay(q.v, s.sx, s.sy);
+                                const bool got = RunOverlay(ds, Polys(q, m)).fill == Fill::Overlay;
+                                matched += want;
+                                disagree += want != got;
+                            }
+        }
+        printf("overlay plan vs match at the thresholds: %d of them match, %d disagree\n", matched, disagree);
+        CHECK(matched > 0 && disagree == 0, "PlanOverlay and MatchOverlay disagree %d time(s)", disagree);
     }
 }
 
@@ -1290,6 +1556,7 @@ int main()
     }
 
     BackdropTests();
+    OverlayTests();
 
     printf("\n%s (%d failure%s)\n", g_failures ? "FAILED" : "all passed", g_failures, g_failures == 1 ? "" : "s");
     return g_failures ? 1 : 0;

@@ -10,14 +10,18 @@
 #include <unordered_set>
 #include "block_ranges.h"
 #include "edge_bars.h"
+#include "front_ring.h"
 #include "memory_plan.h"
 #include "pipeline_cache_header.h"
 #include "shader_translator.h"
 #include "zpd_report.h"
 #include "depth24_glsl.h"
 #include "depth_only.h"
+#include "poly_offset.h"
 #include "render_scale.h"
 #include "shared_memory_glsl.h"
+#include "texture_budget.h"
+#include "texture_formats.h"
 #include "xenos/registers.h"
 
 #include <kernel/vmem.h>
@@ -122,8 +126,15 @@ namespace gpu::renderer
             return t;
         }
 
+        // A Vulkan call the renderer can't go on without: a failure is logged,
+        // then abort() writes a crash report. A lost device instead takes the
+        // presenter's way out (video::DeviceLost): logged and reported the
+        // same, then the player is told and the game exits. Not with the
+        // queue lock held (the main thread takes it to present).
         void Check(VkResult r, const char* what)
         {
+            if (r == VK_ERROR_DEVICE_LOST)
+                video::DeviceLost(what);
             if (r != VK_SUCCESS)
             {
                 fprintf(stderr, "[renderer] %s failed: %d\n", what, int(r));
@@ -282,8 +293,10 @@ namespace gpu::renderer
         // (VkMemoryDedicatedRequirements) and any image when a block can't be
         // had keep their own allocation, as before. A block whose images all
         // went is a spare too, freed by the thread after a few seconds unused
-        // beside another. Images are destroyed only with the GPU idle
-        // (DestroyImage), so a range can be handed out again at once.
+        // beside another. Images are destroyed only with the GPU idle, or
+        // (textures the cache evicted) once the submission that could last
+        // use them has completed (DestroyImage), so a range can be handed out
+        // again at once.
         // NFSMW_IMAGE_POOL=0: an allocation per image (the old path);
         // NFSMW_IMAGE_BLOCK_MB: the block size (16-1024).
         struct ImageBlock
@@ -471,6 +484,11 @@ namespace gpu::renderer
         }
 
         void DestroyImage(Image& img);
+        // An image allocation failed for want of memory (`need` bytes):
+        // evicts and frees what the texture cache can give (`round` 0: its
+        // oldest textures; 1: every one the frame being recorded hasn't
+        // drawn). False when nothing was freed (the failure stands).
+        bool ReclaimTextureMemory(VkDeviceSize need, uint32_t round);
 
         // `imageNext`, `viewNext`: chained to the image's and its view's create infos.
         // `fallible`: an image or view the device turns down returns an empty
@@ -496,6 +514,11 @@ namespace gpu::renderer
             ici.usage = usage;
             ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
             VkResult result = vkCreateImage(s_dev, &ici, nullptr, &img.image);
+            // (Out of memory already: room from the texture cache, as for
+            // its memory below.)
+            for (uint32_t round = 0; (result == VK_ERROR_OUT_OF_DEVICE_MEMORY || result == VK_ERROR_OUT_OF_HOST_MEMORY) &&
+                     ReclaimTextureMemory(0, round); round++)
+                result = vkCreateImage(s_dev, &ici, nullptr, &img.image);
             if (fallible && result != VK_SUCCESS)
                 return {};
             Check(result, "vkCreateImage");
@@ -511,8 +534,9 @@ namespace gpu::renderer
             const VkMemoryRequirements& req = req2.memoryRequirements;
             uint32_t memoryType = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
             img.bytes = req.size;
-            if (!s_imagePool || dedicated.prefersDedicatedAllocation || dedicated.requiresDedicatedAllocation ||
-                req.size > s_blockSize / 2 || !BindToBlock(img, req, memoryType))
+            const bool pooled = s_imagePool && !dedicated.prefersDedicatedAllocation && !dedicated.requiresDedicatedAllocation &&
+                req.size <= s_blockSize / 2;
+            if (!pooled || !BindToBlock(img, req, memoryType))
             {
                 VkMemoryDedicatedAllocateInfo dai{ VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO, nullptr, img.image };
                 VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
@@ -520,9 +544,26 @@ namespace gpu::renderer
                 mai.allocationSize = req.size;
                 mai.memoryTypeIndex = memoryType;
                 auto allocationStart = std::chrono::steady_clock::now();
-                Check(vkAllocateMemory(s_dev, &mai, nullptr, &img.memory), "vkAllocateMemory(image)");
+                VkResult allocated = vkAllocateMemory(s_dev, &mai, nullptr, &img.memory);
                 s_imageTotals.allocations++;
                 s_imageTotals.allocationNs += SinceNs(allocationStart);
+                // Out of memory: the texture cache gives back what the frame
+                // being recorded hasn't drawn (the oldest first, then all of
+                // it, and the spare blocks), and the image is tried again, in
+                // a range the evicted textures left first. Only when nothing
+                // is left to give is it fatal, as every failure was before
+                // (the cache never gave anything back, so a long free roam
+                // ended here).
+                for (uint32_t round = 0; (allocated == VK_ERROR_OUT_OF_DEVICE_MEMORY || allocated == VK_ERROR_OUT_OF_HOST_MEMORY) &&
+                         ReclaimTextureMemory(req.size, round); round++)
+                {
+                    img.memory = VK_NULL_HANDLE;
+                    if (pooled && BindToBlock(img, req, memoryType))
+                        allocated = VK_SUCCESS;
+                    else
+                        allocated = vkAllocateMemory(s_dev, &mai, nullptr, &img.memory);
+                }
+                Check(allocated, "vkAllocateMemory(image)");
             }
             Check(vkBindImageMemory(s_dev, img.image, img.memory, img.offset), "vkBindImageMemory");
             VkImageViewCreateInfo vci{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
@@ -544,8 +585,9 @@ namespace gpu::renderer
             return img;
         }
 
-        // Nothing the GPU may still run can use it (see ApplyLiveSettings):
-        // its memory, or its range of a block, is free for reuse at once.
+        // Nothing the GPU may still run can use it (see ApplyLiveSettings and
+        // ReleaseRetiredTextures): its memory, or its range of a block, is
+        // free for reuse at once.
         void DestroyImage(Image& img)
         {
             if (img.view)
@@ -865,6 +907,7 @@ namespace gpu::renderer
             VkSubmitInfo si{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
             si.commandBufferCount = 1;
             si.pCommandBuffers = &s_cmd;
+            VkResult submitted;
             {
                 auto t0 = std::chrono::steady_clock::now();
                 std::unique_lock lock(*s_vk->queueMutex);
@@ -881,12 +924,15 @@ namespace gpu::renderer
                 else
                     video::WaitForeground(lock);
                 auto t1 = std::chrono::steady_clock::now();
-                Check(vkQueueSubmit(s_vk->queue, 1, &si, sub.fence), "vkQueueSubmit");
+                submitted = vkQueueSubmit(s_vk->queue, 1, &si, sub.fence);
                 auto t2 = std::chrono::steady_clock::now();
                 s_queueLockUs += std::chrono::duration<double, std::micro>(tl - t0).count();
                 s_queueSubmitUs += std::chrono::duration<double, std::micro>(t2 - t1).count();
                 s_hitch.submitMs += std::chrono::duration<double, std::milli>((t2 - t0) - (t1 - tl)).count();
             }
+            // Out of the queue lock: on a lost device this thread waits in
+            // video::DeviceLost for the main thread, which takes it.
+            Check(submitted, "vkQueueSubmit (the renderer)");
             {
                 std::lock_guard lock(s_submitMutex);
                 sub.inFlight = true;
@@ -965,6 +1011,23 @@ namespace gpu::renderer
                 (unsigned long long)raw, count, ms, lost ? std::format(" ({} segments lost)", lost).c_str() : "");
         }
 
+        // NFSMW_TEST_DEVICE_LOST=<s>: <s> seconds after the completion
+        // thread first looks at a fence, the fence reads as lost
+        // (VK_ERROR_DEVICE_LOST), to try video::DeviceLost's way out (the
+        // log line, the crash report, the message, the exit) on any GPU: a
+        // real GPU timeout is hard to cause on purpose.
+        bool TestDeviceLost()
+        {
+            static const double after = [] {
+                const char* v = std::getenv("NFSMW_TEST_DEVICE_LOST");
+                return v ? std::atof(v) : -1.0;
+            }();
+            if (after < 0)
+                return false;
+            static const auto start = std::chrono::steady_clock::now();
+            return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() >= after;
+        }
+
         void CompletionThread()
         {
 #ifdef __APPLE__
@@ -987,7 +1050,14 @@ namespace gpu::renderer
                 size_t done = 0;
                 while (true)
                 {
-                    bool finished = vkGetFenceStatus(s_dev, sub.fence) == VK_SUCCESS;
+                    // A lost device never comes back: every status and wait
+                    // says VK_ERROR_DEVICE_LOST at once from then on, and
+                    // v0.1.4 spun here on it at 100% CPU while the command
+                    // processor waited for this slot forever (a silent hang).
+                    const VkResult status = TestDeviceLost() ? VK_ERROR_DEVICE_LOST : vkGetFenceStatus(s_dev, sub.fence);
+                    if (status == VK_ERROR_DEVICE_LOST)
+                        video::DeviceLost("vkGetFenceStatus (the renderer's completion thread)");
+                    bool finished = status == VK_SUCCESS;
                     bool watching = false;
                     {
                         std::lock_guard lock(s_submitMutex);
@@ -1007,6 +1077,17 @@ namespace gpu::renderer
                         VkResult r = vkWaitForFences(s_dev, 1, &sub.fence, VK_TRUE, 1'000'000);
                         if (r == VK_SUCCESS)
                             break;
+                        if (r == VK_ERROR_DEVICE_LOST)
+                            video::DeviceLost("vkWaitForFences (the renderer's completion thread)");
+                        if (r != VK_TIMEOUT)
+                        {
+                            // Anything else (out of memory) returns at once
+                            // too: logged, and not a busy loop on it.
+                            static int logged = 0;
+                            if (logged++ < 10)
+                                fprintf(stderr, "[renderer] vkWaitForFences (completion) returned %d\n", int(r));
+                            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                        }
                     }
                 }
                 auto now = std::chrono::steady_clock::now();
@@ -2982,9 +3063,23 @@ namespace gpu::renderer
             VkFormat vk;
             uint32_t bpbLog2;   // guest bytes per block
             uint32_t block;     // block width/height in texels
-            uint32_t convert;   // 0 copy; 1 565, 2 1555, 3 4444 -> RGBA8; 4 24_8 -> R32F
+            // 0 copy; 1 565, 2 1555, 3 4444 -> RGBA8; 4 24_8 -> R32F;
+            // 5 10_11_11, 6 11_11_10 -> RGBA16 (blue also in alpha);
+            // 7 DXT3A -> BC2 (its blocks as the alpha half, white colour)
+            uint32_t convert;
         };
 
+        // `f`: texformat::SampledAs(the fetch constant's format), so the
+        // formats that hold another's data (50-56, 8) load as that one.
+        // k_10_11_11 and k_11_11_10 are unsigned normalized 11/11/10 and
+        // 10/11/11-bit components, red in the low bits (as the vertex
+        // formats of those names: shader_translator.cpp); Xenia loads them
+        // into RGBA16 too. k_DXT3A is DXT3's alpha block alone (4 bits a
+        // texel) and k_DXT5A DXT5's, which BC4 is. Still placeholders:
+        // k_1_REVERSE, k_1 and k_8_B (Xenia has no load for them either);
+        // k_6_5_5, the YUV, EDRAM, EXPAND, MPEG and INTERLACED formats, the
+        // plain 32-bit integer ones, k_32_AS_8*, k_32_32_32_FLOAT, k_CTX1
+        // and k_DXT3A_AS_1_1_1_1 (each a load of its own).
         bool GetTextureFormat(uint32_t f, TextureFormatInfo& out)
         {
             switch (f)
@@ -2996,6 +3091,8 @@ namespace gpu::renderer
             case 7: out = { VK_FORMAT_A2B10G10R10_UNORM_PACK32, 2, 1, 0 }; return true;
             case 10: out = { VK_FORMAT_R8G8_UNORM, 1, 1, 0 }; return true;
             case 15: out = { VK_FORMAT_R8G8B8A8_UNORM, 1, 1, 3 }; return true;
+            case 16: out = { VK_FORMAT_R16G16B16A16_UNORM, 2, 1, 5 }; return true;
+            case 17: out = { VK_FORMAT_R16G16B16A16_UNORM, 2, 1, 6 }; return true;
             case 18: out = { VK_FORMAT_BC1_RGBA_UNORM_BLOCK, 3, 4, 0 }; return true;
             case 19: out = { VK_FORMAT_BC2_UNORM_BLOCK, 4, 4, 0 }; return true;
             case 20: out = { VK_FORMAT_BC3_UNORM_BLOCK, 4, 4, 0 }; return true;
@@ -3010,8 +3107,18 @@ namespace gpu::renderer
             case 37: out = { VK_FORMAT_R32G32_SFLOAT, 3, 1, 0 }; return true;
             case 38: out = { VK_FORMAT_R32G32B32A32_SFLOAT, 4, 1, 0 }; return true;
             case 49: out = { VK_FORMAT_BC5_UNORM_BLOCK, 4, 4, 0 }; return true;
+            case 58: out = { VK_FORMAT_BC2_UNORM_BLOCK, 3, 4, 7 }; return true;
+            case 59: out = { VK_FORMAT_BC4_UNORM_BLOCK, 3, 4, 0 }; return true;
             default: return false;
             }
+        }
+
+        // A loaded block's bytes (log2): the guest's when copied; a
+        // conversion's 32-bit texel, but for 5 and 6 (64-bit texels) and 7
+        // (a 128-bit BC2 block).
+        uint32_t LoadedBpbLog2(const TextureFormatInfo& fi)
+        {
+            return fi.convert == 0 ? fi.bpbLog2 : fi.convert == 7 ? 4 : fi.convert >= 5 ? 3 : 2;
         }
 
         // Stored as resolves write it: one 32-bit word a texel, unconverted
@@ -3319,12 +3426,38 @@ uint element(uint bx, uint by)
 }
 
 uint expand(uint v, uint bits) { uint m = (1u << bits) - 1u; return (v * 255u + m / 2u) / m; }
+uint expand16(uint v, uint bits) { uint m = (1u << bits) - 1u; return (v * 65535u + m / 2u) / m; }
 
 void main()
 {
     uint gx = gl_GlobalInvocationID.x, gy = gl_GlobalInvocationID.y;
     if (gy >= p.height) return;
     uint row = p.dstWord + gy * p.dstRowWords;
+    // Conversions wider than a word (never stored directly): 5 10_11_11 and
+    // 6 11_11_10 -> RGBA16 (red in the low bits; blue also in alpha, the
+    // last component repeated as the texture unit does); 7 a DXT3A block ->
+    // a BC2 block, its 4-bit alphas as BC2's alpha half and a white colour
+    // block (both endpoints 0xFFFF, every index 0).
+    if (p.convert >= 5u)
+    {
+        if (gx >= p.width) return;
+        uint a = addr(gx, gy);
+        if (p.convert == 7u)
+        {
+            STORE(gx * 4u, word(a));
+            STORE(gx * 4u + 1u, word(a + 4u));
+            STORE(gx * 4u + 2u, 0xFFFFFFFFu);
+            STORE(gx * 4u + 3u, 0u);
+            return;
+        }
+        uint w = word(a);
+        uint r, g, b;
+        if (p.convert == 5u) { r = expand16(w & 0x7FFu, 11u); g = expand16((w >> 11) & 0x7FFu, 11u); b = expand16(w >> 22, 10u); }
+        else { r = expand16(w & 0x3FFu, 10u); g = expand16((w >> 10) & 0x7FFu, 11u); b = expand16(w >> 21, 11u); }
+        STORE(gx * 2u, r | (g << 16));
+        STORE(gx * 2u + 1u, b | (b << 16));
+        return;
+    }
     if (p.convert != 0u)
     {
         if (gx >= p.width) return;
@@ -3442,10 +3575,23 @@ void main()
             // frame it was last checked in.
             std::vector<uint64_t> verifyHashes;
             uint64_t verifyFrame = 0;
+            // s_frame at its latest use: a lookup (a draw binding it), or a
+            // resolve storing into it. The cache evicts the oldest
+            // (TrimTextureCache), never one used since the last swap.
+            uint64_t lastUsed = 0;
         };
         void LoadScaledTexture(Texture& t, uint32_t base, uint32_t pitchBlocks, uint32_t endian);
         bool ScaledTextureValid(uint32_t base, uint32_t size);
         std::unordered_map<uint64_t, std::unique_ptr<Texture>> s_textures;
+        // Textures the cache evicted, out of every lookup table already,
+        // each with the submission after which nothing can use it: destroyed
+        // once that one has completed (ReleaseRetiredTextures).
+        struct RetiredTexture
+        {
+            std::unique_ptr<Texture> texture;
+            uint64_t submission;
+        };
+        std::vector<RetiredTexture> s_retiredTextures;
         // Direct 1x 2D textures by guest address (the latest made there), for
         // resolves that store into them too (DestroyTexture drops its entry).
         std::unordered_map<uint32_t, Texture*> s_directByBase;
@@ -3686,13 +3832,26 @@ void main()
             auto& slot = s_samplers[key];
             if (slot)
                 return slot;
+            // The mirror-once modes as Xenia maps them (vulkan_texture_cache.cc,
+            // NormalizeClampMode): Vulkan mirrors once only to the edge, so
+            // the halfway and border variants take that too, where the
+            // device has it (VK_KHR_sampler_mirror_clamp_to_edge, enabled by
+            // the presenter). Without it they clamp unmirrored, to the edge
+            // or the border, as before. Clamp to halfway (half edge texel,
+            // half border; nothing in Direct3D 9 makes it) is clamp to edge,
+            // as in Xenia.
             auto address = [](xenos::ClampMode m) {
+                const bool mirrorOnce = s_vk && s_vk->mirrorClampToEdge;
                 switch (m)
                 {
                 case xenos::ClampMode::kRepeat: return VK_SAMPLER_ADDRESS_MODE_REPEAT;
                 case xenos::ClampMode::kMirroredRepeat: return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
-                case xenos::ClampMode::kClampToBorder:
-                case xenos::ClampMode::kMirrorClampToBorder: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+                case xenos::ClampMode::kClampToBorder: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+                case xenos::ClampMode::kMirrorClampToEdge:
+                case xenos::ClampMode::kMirrorClampToHalfway:
+                    return mirrorOnce ? VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+                case xenos::ClampMode::kMirrorClampToBorder:
+                    return mirrorOnce ? VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
                 default: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
                 }
             };
@@ -3792,7 +3951,12 @@ void main()
             }
             uint32_t layers = cube ? 6 : 1;
             TextureFormatInfo fi;
-            uint32_t format = uint32_t(f.format);
+            // (An alias keys and loads as its base format: one texture for
+            // both at an address.)
+            uint32_t format = texformat::SampledAs(uint32_t(f.format));
+            // The view's swizzle: the fetch constant's, reading the
+            // components the host format lacks as the texture unit does.
+            const uint32_t swizzle = texformat::Compose(f.swizzle, texformat::HostSwizzle(format));
             if (!GetTextureFormat(format, fi))
             {
                 LogOnce(0x3000 + format, "texture format %u not implemented", format);
@@ -3902,6 +4066,7 @@ void main()
             {
                 slotRef = std::make_unique<Texture>();
                 Texture& t = *slotRef;
+                t.lastUsed = s_frame;  // (before its image: a failed allocation evicts only older ones)
                 t.format = fi.vk;
                 t.width = width;
                 t.height = height;
@@ -3924,7 +4089,7 @@ void main()
                 // A 1x texture the untile can store directly (see
                 // s_untileStorePipeline): 2D, or a cube (NFSMW_DIRECT_CUBE).
                 bool direct1x = !scaled && s_untileDirect && !volume && maxLevel == 0 && fi.block == 1 &&
-                    (fi.convert != 0 || fi.bpbLog2 == 2) && (cube ? s_directCube && layers == 6 && !f.stacked : layers == 1) &&
+                    LoadedBpbLog2(fi) == 2 && (cube ? s_directCube && layers == 6 && !f.stacked : layers == 1) &&
                     DirectFormat(fi.vk, cube);
                 if ((scaled && s_scaled.direct) || direct1x)
                 {
@@ -4002,6 +4167,7 @@ void main()
                         cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0, t.levels);
             }
             Texture& t = *slotRef;
+            t.lastUsed = s_frame;
             {
                 // No page written anywhere since the last check: still valid
                 // (a draw binds ~7,500 textures a frame; writes are rare).
@@ -4030,13 +4196,13 @@ void main()
                         LoadScaledTexture(t, base, pitchAligned, uint32_t(f.endianness));
                         t.uploaded = true;
                         writewatch::Watch(base, size);  // as the 1x path: a CPU write faults and retires it
-                        return TextureView(t, f.swizzle);
+                        return TextureView(t, swizzle);
                     }
                     s_hitch.textureBytes += size + mipSize;
                     EnsureShadow(base, size);
                     if (mipSize)
                         EnsureShadow(mipBase, mipSize);
-                    uint32_t outBpbLog2 = fi.convert == 0 ? fi.bpbLog2 : 2;
+                    uint32_t outBpbLog2 = LoadedBpbLog2(fi);
                     uint32_t rowWords, rowTexels;
                     if (fi.convert != 0 || fi.bpbLog2 >= 2)
                     {
@@ -4188,7 +4354,7 @@ void main()
             }
             if (out && !t.scaled)
                 out->texture = &t;
-            return TextureView(t, f.swizzle);
+            return TextureView(t, swizzle);
         }
 
         // Texture lookups kept per fetch slot and dimension. Dense scenes
@@ -4307,6 +4473,7 @@ void main()
             if (state == TextureEntryState::kValid)
             {
                 c.hits++;
+                e.texture->lastUsed = s_frame;
                 if (s_textureVerify)
                     VerifyTexture(*e.texture, epoch);
                 if (!c.verify)
@@ -5413,6 +5580,7 @@ void main()
                     }
                     if (fused)
                     {
+                        fused->lastUsed = s_frame;  // (this recording now stores into it: see Texture::lastUsed)
                         rc.texWrite = 1;
                         rc.texEndian = fused->endian;
                         rc.texConvert = fused->convert;
@@ -6023,21 +6191,38 @@ void main()
         VkPipelineLayout s_frontLayout = VK_NULL_HANDLE;
         VkDescriptorSetLayout s_frontSetLayout = VK_NULL_HANDLE;
         // The front buffer as presented: 1x, and at host resolution when the
-        // scaled resolve memory has it (two images: no stall when the game
-        // switches between them, e.g. around movies).
-        Image s_front, s_frontScaled;
-        uint32_t s_frontWidth = 0, s_frontHeight = 0, s_frontScaledWidth = 0, s_frontScaledHeight = 0;
+        // scaled resolve memory has it (two rings: no stall when the game
+        // switches between them, e.g. around movies). Each is a ring of
+        // images of one size, and a swap writes one the presenter doesn't
+        // hold (gpu/front_ring.h, video::ClaimFrontImage): one image written
+        // at every swap was written again, now and then, before the
+        // presenter had queued its read of the frame before.
+        struct FrontRing
+        {
+            std::array<Image, gpu::kMaxFrontImages> images;
+            uint32_t width = 0, height = 0;
+        };
+        FrontRing s_front, s_frontScaled;
+        // NFSMW_FRONT_IMAGES=<1..3>: the images a ring has (default 2; 1 is
+        // v0.1.4's single image, to compare: the presenter logs the frames
+        // it loses then).
+        const int s_frontImages = [] {
+            const char* v = std::getenv("NFSMW_FRONT_IMAGES");
+            return v ? std::clamp(std::atoi(v), 1, gpu::kMaxFrontImages) : gpu::kFrontImages;
+        }();
 
-        // A front image the presenter may still show or be reading: taken
-        // back from it, then destroyed once the queue is idle.
-        void DestroyFrontImage(Image& front, uint32_t& width, uint32_t& height)
+        // A ring of front images the presenter may still show or be reading:
+        // taken back from it, then destroyed once the queue is idle.
+        void DestroyFrontImages(FrontRing& ring)
         {
             Flush();
-            if (front.image)
-                video::ReleaseFrontImage(front.image);
+            for (const Image& front : ring.images)
+                if (front.image)
+                    video::ReleaseFrontImage(front.image);
             video::WaitGpuIdle();
-            DestroyImage(front);
-            width = height = 0;
+            for (Image& front : ring.images)
+                DestroyImage(front);
+            ring.width = ring.height = 0;
         }
 
         void CreateUntilePipeline()
@@ -6587,12 +6772,18 @@ void main()
         gpu::RenderScale s_autoWant;
         uint32_t s_autoSeen = 0;
 
-        void DestroyTexture(Texture& t)
+        // Resolves no longer find `t` to store into (if they did).
+        void ForgetDirectTexture(const Texture& t)
         {
             if (auto it = s_directByBase.find(t.guestStart); it != s_directByBase.end() && it->second == &t)
                 s_directByBase.erase(it);
             if (auto it = s_directByStart.find(t.guestStart); it != s_directByStart.end() && it->second == &t)
                 s_directByStart.erase(it);
+        }
+
+        void DestroyTexture(Texture& t)
+        {
+            ForgetDirectTexture(t);
             for (auto& [swizzle, view] : t.views)
                 vkDestroyImageView(s_dev, view, nullptr);
             t.views.clear();
@@ -6624,6 +6815,248 @@ void main()
                 dropped++;
             }
             return dropped;
+        }
+
+        // ---------------------------------------------------------------
+        // Texture cache limits (gpu/texture_budget.h has the policy and
+        // why). Checked at every 30th swap (TrimTextureCache), and when an
+        // image allocation fails (ReclaimTextureMemory). An evicted texture
+        // leaves every table that hands textures out at once (the cache, the
+        // lookups kept per fetch slot, the direct textures resolves store
+        // into), so nothing recorded after it can use it, and is destroyed
+        // once the last submission that could have used it has completed:
+        // no wait for the GPU at a check. The next draw that samples one
+        // loads it again from guest memory, as a new texture.
+        // NFSMW_TEXTURE_BUDGET_MB (default: half the largest device-local
+        // heap, 512 MB to 2 GB; 1 GB at most on iOS; 0: no cap),
+        // NFSMW_TEXTURE_MAX (8192 textures; 0: no cap) and
+        // NFSMW_TEXTURE_EVICT_AGE (600 swaps) set the limits;
+        // NFSMW_TEXTURE_EVICT=0 never evicts at a swap (A/B: the cache as
+        // up to v0.1.4, but for a failed allocation). The [perf] line counts
+        // what was evicted.
+        struct TextureEvictions
+        {
+            uint64_t textures = 0, bytes = 0, reclaims = 0, batches = 0;
+        };
+        TextureEvictions s_textureEvictions;
+
+        const texbudget::Limits& TextureLimits()
+        {
+            static const texbudget::Limits limits = [] {
+                texbudget::Limits l;
+                uint64_t heap = 0;
+                for (uint32_t h = 0; h < s_memProps.memoryHeapCount; h++)
+                    if (s_memProps.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+                        heap = std::max<uint64_t>(heap, s_memProps.memoryHeaps[h].size);
+#if defined(__APPLE__) && TARGET_OS_IOS
+                l.bytes = texbudget::DefaultBytes(heap, texbudget::kDefaultCeilingIos);
+#else
+                l.bytes = texbudget::DefaultBytes(heap);
+#endif
+                l.count = texbudget::kDefaultCount;
+                if (const char* v = std::getenv("NFSMW_TEXTURE_BUDGET_MB"))
+                    l.bytes = uint64_t(std::max(0ll, std::atoll(v))) * texbudget::kMB;
+                if (const char* v = std::getenv("NFSMW_TEXTURE_MAX"))
+                    l.count = uint32_t(std::clamp(std::atoll(v), 0ll, 0x7FFFFFFFll));
+                if (const char* v = std::getenv("NFSMW_TEXTURE_EVICT_AGE"))
+                    l.minAge = uint64_t(std::max(1ll, std::atoll(v)));
+                fprintf(stderr, "[renderer] texture cache: %llu MB and %u textures at most (0: no cap; largest device-local heap %llu MB); "
+                    "over either or the device's memory budget, textures unused for %llu swaps are evicted\n",
+                    (unsigned long long)(l.bytes / texbudget::kMB), l.count, (unsigned long long)(heap / texbudget::kMB),
+                    (unsigned long long)l.minAge);
+                return l;
+            }();
+            return limits;
+        }
+
+        // The device-local heaps' use and budget as the driver counts them
+        // (VK_EXT_memory_budget); 0 and 0 without it.
+        void DeviceMemoryBudget(uint64_t& used, uint64_t& budget)
+        {
+            used = budget = 0;
+            if (!s_vk || !s_memoryBudget)
+                return;
+            VkPhysicalDeviceMemoryBudgetPropertiesEXT b{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT };
+            VkPhysicalDeviceMemoryProperties2 props{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &b };
+            vkGetPhysicalDeviceMemoryProperties2(s_vk->physical, &props);
+            for (uint32_t h = 0; h < props.memoryProperties.memoryHeapCount; h++)
+                if (props.memoryProperties.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+                {
+                    used += b.heapUsage[h];
+                    budget += b.heapBudget[h];
+                }
+        }
+
+        // Every submission up to this one has completed (they complete in
+        // order).
+        uint64_t CompletedSubmission()
+        {
+            std::lock_guard lock(s_submitMutex);
+            return s_inFlight.empty() ? s_submissionCounter - 1 : s_submissions[s_inFlight.front()].number - 1;
+        }
+
+        // Destroys the evicted textures whose last possible use has completed;
+        // returns their bytes.
+        uint64_t ReleaseRetiredTextures()
+        {
+            if (s_retiredTextures.empty())
+                return 0;
+            const uint64_t done = CompletedSubmission();
+            uint64_t bytes = 0;
+            std::erase_if(s_retiredTextures, [&](RetiredTexture& r) {
+                if (r.submission > done)
+                    return false;
+                bytes += r.texture->image.bytes;
+                DestroyTexture(*r.texture);
+                return true;
+            });
+            return bytes;
+        }
+
+        // The cache's textures: their keys and, for texbudget::Pick, sizes
+        // and last uses, in the same order; and their totals.
+        void GatherTextures(std::vector<uint64_t>& keys, std::vector<texbudget::Candidate>& candidates, texbudget::Usage& usage)
+        {
+            keys.reserve(s_textures.size());
+            candidates.reserve(s_textures.size());
+            for (const auto& [key, t] : s_textures)
+            {
+                keys.push_back(key);
+                candidates.push_back({ t->image.bytes, t->lastUsed });
+                usage.bytes += t->image.bytes;
+            }
+            usage.count = uint32_t(s_textures.size());
+        }
+
+        // Moves the textures Pick chose (`picks`, into `keys`) out of the
+        // cache, to be destroyed once submission `lastUse` has completed:
+        // none can be used by anything recorded after it. Returns their bytes.
+        uint64_t EvictTextures(const std::vector<uint64_t>& keys, const std::vector<size_t>& picks, uint64_t lastUse)
+        {
+            std::unordered_set<const Texture*> gone;
+            uint64_t bytes = 0;
+            for (size_t i : picks)
+            {
+                auto it = s_textures.find(keys[i]);
+                if (it == s_textures.end())
+                    continue;
+                ForgetDirectTexture(*it->second);
+                bytes += it->second->image.bytes;
+                gone.insert(it->second.get());
+                s_retiredTextures.push_back({ std::move(it->second), lastUse });
+                s_textures.erase(it);
+            }
+            // The lookups kept per fetch slot that hold one (only an entry of
+            // the current generation is ever read, and those point at live
+            // textures: the cache's, or these until now).
+            TextureCache& c = *s_textureCache;
+            auto forget = [&](TextureCacheEntry& e) {
+                if (e.generation == c.generation && gone.count(e.texture))
+                    e.generation = 0;
+            };
+            for (auto& slots : c.slots)
+                for (TextureCacheEntry& e : slots)
+                    forget(e);
+            for (TextureCacheEntry& e : c.recent)
+                forget(e);
+            s_textureEvictions.textures += gone.size();
+            s_textureEvictions.bytes += bytes;
+            return bytes;
+        }
+
+        // OnSwap, s_frame just moved on: destroys what earlier evictions
+        // left once the GPU is done with it, and at every 30th swap checks
+        // the cache against its limits, evicting the textures unused longest
+        // (none drawn in the last minAge swaps) when over one.
+        void TrimTextureCache()
+        {
+            ReleaseRetiredTextures();
+            static const bool off = [] { const char* v = std::getenv("NFSMW_TEXTURE_EVICT"); return v && v[0] == '0'; }();
+            if (off || s_frame % 30 != 0 || s_textures.empty())
+                return;
+            const texbudget::Limits& limits = TextureLimits();
+            std::vector<uint64_t> keys;
+            std::vector<texbudget::Candidate> candidates;
+            texbudget::Usage usage;
+            GatherTextures(keys, candidates, usage);
+            DeviceMemoryBudget(usage.deviceUsed, usage.deviceBudget);
+            const texbudget::Excess excess = texbudget::Over(limits, usage);
+            const std::vector<size_t> picks = texbudget::Pick(candidates, s_frame, limits.minAge, excess);
+            if (picks.empty())
+                return;  // (nothing over, or nothing old enough: the scene's textures stay)
+            // Each use so far is in the submission being recorded, if any,
+            // or one before it.
+            const uint64_t bytes = EvictTextures(keys, picks, s_recording ? s_submissionCounter : s_submissionCounter - 1);
+            s_textureEvictions.batches++;
+            if (s_textureEvictions.batches <= 20 || s_textureEvictions.batches % 50 == 0)
+            {
+                std::string why;
+                if (excess.overBytes)
+                    why += std::format(", its {} MB cap", limits.bytes / texbudget::kMB);
+                if (excess.overCount)
+                    why += std::format(", its {} textures cap", limits.count);
+                if (excess.overDevice)
+                    why += std::format(", the device's memory budget ({} of {} MB in use)", usage.deviceUsed / texbudget::kMB,
+                        usage.deviceBudget / texbudget::kMB);
+                fprintf(stderr, "[renderer] texture cache: %zu textures (%.0f MB) unused for %llu+ swaps evicted, over%s; %.0f MB in %zu "
+                    "kept (eviction %llu)\n", picks.size(), double(bytes) / 1048576.0, (unsigned long long)limits.minAge,
+                    why.empty() ? "" : why.c_str() + 1, double(usage.bytes - bytes) / 1048576.0, s_textures.size(),
+                    (unsigned long long)s_textureEvictions.batches);
+            }
+        }
+
+        bool ReclaimTextureMemory(VkDeviceSize need, uint32_t round)
+        {
+            if (round > 1)
+                return false;
+            if (round == 0)
+                s_textureEvictions.reclaims++;
+            // Round 0: the oldest, twice what was asked for or a quarter of
+            // the cache; round 1: everything Pick may take. Never a texture
+            // used since the last swap: the one being made and every one the
+            // draw being recorded binds (lastUsed is s_frame for those).
+            std::vector<uint64_t> keys;
+            std::vector<texbudget::Candidate> candidates;
+            texbudget::Usage usage;
+            GatherTextures(keys, candidates, usage);
+            texbudget::Excess excess;
+            excess.bytes = round == 0 ? std::max<uint64_t>(need * 2, usage.bytes / 4) : usage.bytes;
+            excess.count = round == 0 ? 0 : usage.count;
+            const std::vector<size_t> picks = texbudget::Pick(candidates, s_frame, 1, excess);
+            // The recording (s_submissionCounter) holds no use of these:
+            // their uses are all submitted (the swap submits its frame's
+            // work, PresentFrontBuffer, before s_frame moves on). So once
+            // everything in flight has completed nothing uses them, and that
+            // wait drains the queue without submitting the recording, safe
+            // wherever an image is made (a pass being set up, say).
+            const uint64_t evicted = EvictTextures(keys, picks, s_submissionCounter - 1);
+            if (!s_retiredTextures.empty())
+            {
+                CpWaitTimer wait(CP_WAIT_FLUSH);
+                std::unique_lock lock(s_submitMutex);
+                s_submitCv.wait(lock, [] { return s_inFlight.empty(); });
+            }
+            const uint64_t freed = ReleaseRetiredTextures();
+            // Then the empty blocks (the spares, and any the textures just
+            // emptied) go back to the device now, not after kSpareKeep.
+            std::vector<VkDeviceMemory> spares;
+            {
+                std::lock_guard lock(s_spareMutex);
+                for (std::vector<Spare>& list : s_spares)
+                {
+                    for (const Spare& spare : list)
+                        spares.push_back(spare.memory);
+                    list.clear();
+                }
+                s_imageTotals.blocksFreed += spares.size();
+            }
+            for (VkDeviceMemory memory : spares)
+                vkFreeMemory(s_dev, memory, nullptr);
+            fprintf(stderr, "[renderer] out of memory for an image (%.1f MB; 0: making it, round %u): %zu textures evicted (%.0f MB), %.0f MB of "
+                "textures and %zu spare image blocks freed; %.0f MB in %zu textures kept\n", double(need) / 1048576.0, round, picks.size(),
+                double(evicted) / 1048576.0, double(freed) / 1048576.0, spares.size(), double(usage.bytes - evicted) / 1048576.0,
+                s_textures.size());
+            return freed > 0 || !spares.empty();
         }
 
         void ApplyRenderScale(const gpu::RenderScale& scale, const std::string& how)
@@ -7382,7 +7815,20 @@ void main()
             key.depthControl = adoptedDepth ? 0u : depthControl.value;  // adopted: no depth or stencil test or write
         }
         auto clipCntl = Reg<reg::PA_CL_CLIP_CNTL>();
-        bool depthBias = polygonal && (modeCntl.poly_offset_front_enable || modeCntl.poly_offset_para_enable);
+        // Polygon offset (gpu/poly_offset.h): the face's that is on and
+        // drawn, the front's first, as Xenia chooses (Vulkan has one per
+        // draw); until v0.1.4 always the front registers, also for a pass
+        // culling front faces and offsetting the back ones.
+        const gpu::PolyOffset polyOffset = gpu::PreferredPolyOffset({ .polygonal = polygonal,
+            .frontEnable = modeCntl.poly_offset_front_enable != 0,
+            .backEnable = modeCntl.poly_offset_back_enable != 0,
+            .cullFront = modeCntl.cull_front != 0,
+            .cullBack = modeCntl.cull_back != 0,
+            .frontScale = RegF(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_SCALE),
+            .frontOffset = RegF(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_OFFSET),
+            .backScale = RegF(XE_GPU_REG_PA_SU_POLY_OFFSET_BACK_SCALE),
+            .backOffset = RegF(XE_GPU_REG_PA_SU_POLY_OFFSET_BACK_OFFSET) });
+        const bool depthBias = polyOffset.enable;
         uint32_t cull = 0;
         if (polygonal && initiator.prim_type != xenos::PrimitiveType::kRectangleList)
             cull = (modeCntl.cull_front ? VK_CULL_MODE_FRONT_BIT : 0) | (modeCntl.cull_back ? VK_CULL_MODE_BACK_BIT : 0);
@@ -7832,8 +8278,8 @@ void main()
         // stretched in y alone it would be distorted by up to 1/sv. The rest
         // of the front end is clipped to the band (below).
         // Edge bars (gpu/edge_bars.h): the copies of a police vid-cam side
-        // bar or the intro's black frame that fill the screen past the 16:9
-        // band, drawn right after it.
+        // bar, the intro's black frame or a menu's inset overlay that fill
+        // the screen past the 16:9 band, drawn right after it.
         gpu::bars::Plan barPlan;
         if (const float s = game::AspectScaleX(), sv = game::AspectScaleY(); s < 1.0f || sv < 1.0f)
         {
@@ -8134,7 +8580,12 @@ void main()
                     // black frame centred, short of the band's edges) is
                     // drawn again after itself, stretched over the frame and
                     // scissored to (its half of) what lies outside the band:
-                    // nothing inside the band changes.
+                    // nothing inside the band changes. So is a menu's
+                    // translucent backdrop or vignette of the black frame's
+                    // shape (gpu::bars::PlanOverlay: any colour, alpha and
+                    // texture, alpha-blended; GitHub issue #19, the world
+                    // undimmed above and below the blacklist's and the
+                    // showcase car's screens on 16:10).
                     // NFSMW_BAR_FILL=0 turns it off (an A/B switch).
                     static const bool barFill = [] { const char* v = std::getenv("NFSMW_BAR_FILL"); return !(v && v[0] == '0'); }();
                     const uint32_t blend0 = s_regs[XE_GPU_REG_RB_BLENDCONTROL0] & 0x1FFF1FFF;
@@ -8178,6 +8629,10 @@ void main()
                         // behind it showed (gpu/edge_bars.h).
                         if (barPlan.fill == gpu::bars::Fill::None)
                             barPlan = gpu::bars::PlanBackdrop(draw, read);
+                        // A menu's inset overlay (any colour, so last: an
+                        // opaque black one is a black frame above).
+                        if (barPlan.fill == gpu::bars::Fill::None)
+                            barPlan = gpu::bars::PlanOverlay(draw, read);
                     }
                     if (barPlan.fill != gpu::bars::Fill::None)
                     {
@@ -8187,10 +8642,11 @@ void main()
                         const uint32_t kind = uint32_t(barPlan.fill);
                         const bool blackout = barPlan.fill == gpu::bars::Fill::Blackout;
                         const bool backdrop = barPlan.fill == gpu::bars::Fill::Backdrop;
+                        const bool overlay = barPlan.fill == gpu::bars::Fill::Overlay;
                         const gpu::bars::Box& box = barPlan.box;
                         const uint64_t key = (0x36ull << 56) | (uint64_t(kind) << 40) | (uint64_t(barPlan.rectCount) << 36) |
                             (uint64_t(std::lround(s * 4096.0f)) << 18) | uint64_t(std::lround(sv * 4096.0f));
-                        static uint64_t loggedKey[5] = { ~0ull, ~0ull, ~0ull, ~0ull, ~0ull };
+                        static uint64_t loggedKey[6] = { ~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull };
                         if (loggedKey[kind] != key)
                         {
                             loggedKey[kind] = key;
@@ -8199,26 +8655,29 @@ void main()
                                 snprintf(fills, sizeof(fills), "fills %u rectangle(s) past the 16:9 band, first [%d,%d)x[%d,%d) (host px)",
                                     barPlan.rectCount, barPlan.rects[0].x0, barPlan.rects[0].x1, barPlan.rects[0].y0, barPlan.rects[0].y1);
                             else
-                                snprintf(fills, sizeof(fills), "%s", blackout || backdrop ? "fills nothing" : "reaches the screen edge: nothing to fill");
+                                snprintf(fills, sizeof(fills), "%s", blackout || backdrop || overlay ? "fills nothing" : "reaches the screen edge: nothing to fill");
                             LogOnce(key,
                                 "edge bars: frame %llu vs_%016llx ps_%016llx: %s (clip x %.3f..%.3f y %.3f..%.3f, colour %08X; view scale x %.4f y %.4f) %s",
                                 (unsigned long long)s_frame, (unsigned long long)s_vs->hash, (unsigned long long)s_ps->hash,
                                 backdrop ? "a full-band backdrop (black past the band)" : blackout ? "a black frame"
+                                    : overlay ? "an inset overlay (a menu's backdrop or vignette)"
                                     : kind == uint32_t(gpu::bars::Fill::RightBar) ? "the right vid-cam bar" : "the left vid-cam bar",
                                 box.x0, box.x1, box.y0, box.y1, barPlan.argb, s, sv, fills);
                         }
                         // NFSMW_LOG_FRONTEND=1: the first frame of each
-                        // run of frames with a match, bars and black frames
-                        // apart (one run per vid-cam scene and per cut; any
-                        // other is a draw this should not take).
-                        static uint64_t lastBarFrame[3] = { ~0ull - 1, ~0ull - 1, ~0ull - 1 };
-                        uint64_t& last = lastBarFrame[backdrop ? 2 : blackout ? 1 : 0];
+                        // run of frames with a match, bars, black frames,
+                        // backdrops and overlays apart (one run per vid-cam
+                        // scene, per cut and per menu screen; any other is a
+                        // draw this should not take).
+                        static uint64_t lastBarFrame[4] = { ~0ull - 1, ~0ull - 1, ~0ull - 1, ~0ull - 1 };
+                        uint64_t& last = lastBarFrame[overlay ? 3 : backdrop ? 2 : blackout ? 1 : 0];
                         if (logFrontEnd && s_frame != last && s_frame != last + 1)
                         {
                             xenos::xe_gpu_texture_fetch_t t0;
                             memcpy(&t0, &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], sizeof(t0));
                             fprintf(stderr, "[frontend] edge bars: matching from frame %llu: %s x %.3f..%.3f y %.3f..%.3f colour %08X blend %08X t0 %08X %ux%u, %u rect(s)\n",
-                                (unsigned long long)s_frame, backdrop ? "backdrop" : blackout ? "black frame" : kind == uint32_t(gpu::bars::Fill::RightBar) ? "right bar" : "left bar",
+                                (unsigned long long)s_frame, backdrop ? "backdrop" : blackout ? "black frame" : overlay ? "inset overlay"
+                                    : kind == uint32_t(gpu::bars::Fill::RightBar) ? "right bar" : "left bar",
                                 box.x0, box.x1, box.y0, box.y1, barPlan.argb, blend0, (uint32_t(t0.base_address) << 12) & 0x1FFFFFFFu,
                                 uint32_t(t0.size_2d.width) + 1, uint32_t(t0.size_2d.height) + 1, barPlan.rectCount);
                         }
@@ -8275,7 +8734,8 @@ void main()
                             continue;
                         const std::string action = barPlan.rectCount
                             ? std::string(barPlan.fill == gpu::bars::Fill::Backdrop ? "backdrop fill"
-                                    : barPlan.fill == gpu::bars::Fill::Blackout ? "black frame fill" : "bar fill")
+                                    : barPlan.fill == gpu::bars::Fill::Blackout ? "black frame fill"
+                                    : barPlan.fill == gpu::bars::Fill::Overlay ? "overlay fill" : "bar fill")
                             : clipped ? std::format("clipped to rows {}..{}", scissor.offset.y, scissor.offset.y + int32_t(scissor.extent.height))
                             : kCover != 1.0f ? std::format("cover x{:.3f}", kCover)
                             : (kX != 1.0f || kY != 1.0f) ? std::format("widened x{:.3f} y{:.3f}", kX, kY)
@@ -8372,7 +8832,8 @@ void main()
                     line += std::format(" {}:{:08X}", n, (s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + n * 6 + 1] & 0x1FFFF000u));
             if (barPlan.rectCount)
                 line += std::format(" +edge {} fill x{}", barPlan.fill == gpu::bars::Fill::Backdrop ? "backdrop"
-                    : barPlan.fill == gpu::bars::Fill::Blackout ? "black frame" : "bar", barPlan.rectCount);
+                    : barPlan.fill == gpu::bars::Fill::Blackout ? "black frame" : barPlan.fill == gpu::bars::Fill::Overlay ? "overlay" : "bar",
+                    barPlan.rectCount);
             static std::string last;
             static uint32_t repeats = 0;
             if (line == last)
@@ -8410,6 +8871,7 @@ void main()
             VkRect2D scissor{};
             uint32_t stencil[6] = {};
             float blend[4] = {}, bias[3] = {};
+            bool unormBias = false;  // the bias set in unorm24's steps (FORCE_UNORM)
             uint32_t setOffset = ~0u;
             VkPipelineLayout textureLayout = VK_NULL_HANDLE;
             uint32_t textureCount = ~0u;
@@ -8470,17 +8932,52 @@ void main()
             vkCmdSetBlendConstants(s_cmd, blendConstants);
             memcpy(bound.blend, blendConstants, sizeof(blendConstants));
         }
+        // The face's polygon offset (chosen with the pipeline above): the
+        // constant in unorm24's steps (the register holds depth units).
         float bias[3] = { 0.0f, 0.0f, 0.0f };
         if (depthBias)
         {
-            bias[0] = RegF(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_OFFSET) * float(1 << 24);
+            bias[0] = polyOffset.offset * gpu::kUnorm24Steps;
             // The slope factor is per host pixel: scaled with the resolution (Xenia).
-            bias[2] = RegF(XE_GPU_REG_PA_SU_POLY_OFFSET_FRONT_SCALE) / 16.0f * std::max(scaleX, scaleY);
+            bias[2] = polyOffset.scale / 16.0f * std::max(scaleX, scaleY);
         }
-        if (fresh || memcmp(bound.bias, bias, sizeof(bias)) != 0)
+        // The host depth is float32 for both guest formats, and Vulkan's
+        // constant bias on a float depth buffer is in steps of 2^(e - 23),
+        // e the exponent of the primitive's largest depth: 2^24 steps are
+        // the register's depth only for depths 0.5..1, half of it below 0.5,
+        // a quarter below 0.25. A D24S8 target (unorm24: one step 2^-24 over
+        // the whole range, on the console too) has its bias given in
+        // unorm24's steps where the device can (VK_EXT_depth_bias_control,
+        // FORCE_UNORM: presenter), so a shadow caster near the light gets
+        // all of it; a D24FS8 one keeps the float steps, already its own
+        // (gpu/poly_offset.h).
+#ifdef VK_EXT_depth_bias_control
+        const bool unormBias = gpu::BiasInUnorm24Steps(depthBias, depth != nullptr,
+            depth ? xenos::DepthRenderTargetFormat(depth->format) : xenos::DepthRenderTargetFormat::kD24S8, s_vk->cmdSetDepthBias2 != nullptr);
+#else
+        const bool unormBias = false;
+#endif
+        if (fresh || memcmp(bound.bias, bias, sizeof(bias)) != 0 || bound.unormBias != unormBias)
         {
-            vkCmdSetDepthBias(s_cmd, bias[0], bias[1], bias[2]);
+#ifdef VK_EXT_depth_bias_control
+            if (unormBias)
+            {
+                VkDepthBiasRepresentationInfoEXT representation{ VK_STRUCTURE_TYPE_DEPTH_BIAS_REPRESENTATION_INFO_EXT };
+                representation.depthBiasRepresentation = VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORCE_UNORM_EXT;
+                representation.depthBiasExact = s_vk->depthBiasExact ? VK_TRUE : VK_FALSE;
+                VkDepthBiasInfoEXT info{ VK_STRUCTURE_TYPE_DEPTH_BIAS_INFO_EXT, &representation };
+                info.depthBiasConstantFactor = bias[0];
+                info.depthBiasClamp = bias[1];
+                info.depthBiasSlopeFactor = bias[2];
+                s_vk->cmdSetDepthBias2(s_cmd, &info);
+            }
+            else
+#endif
+                // (The format's steps: as vkCmdSetDepthBias2EXT with no
+                // representation, so it also undoes FORCE_UNORM.)
+                vkCmdSetDepthBias(s_cmd, bias[0], bias[1], bias[2]);
             memcpy(bound.bias, bias, sizeof(bias));
+            bound.unormBias = unormBias;
         }
 
         uint32_t dynamicOffset = uint32_t(constantsOffset);
@@ -8851,21 +9348,23 @@ void main()
         bool scaled = pc.tiled && !showTexture[0] && s_scaled.enabled && s_scaled.scale.Exact(width, height) &&
             ScaledRangeValid(pc.base, frontBytes);
         uint32_t outW = scaled ? s_scaled.scale.x.Size(width) : width, outH = scaled ? s_scaled.scale.y.Size(height) : height;
-        Image& front = scaled ? s_frontScaled : s_front;
-        uint32_t& frontW = scaled ? s_frontScaledWidth : s_frontWidth;
-        uint32_t& frontH = scaled ? s_frontScaledHeight : s_frontHeight;
-        if (outW != frontW || outH != frontH)
+        FrontRing& ring = scaled ? s_frontScaled : s_front;
+        if (outW != ring.width || outH != ring.height)
         {
-            // A new size: wait for any use of the old image before replacing it.
-            DestroyFrontImage(front, frontW, frontH);
-            front = CreateImage(VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM, { outW, outH, 1 }, 1,
-                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,  // sampled: presenter post-processing
-                VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT);
-            Begin();
-            ToGeneral(front.image, VK_IMAGE_ASPECT_COLOR_BIT, 1);
-            frontW = outW;
-            frontH = outH;
-            fprintf(stderr, "[renderer] front image %ux%u (%s)\n", outW, outH, scaled ? "host resolution" : "1x");
+            // A new size: wait for any use of the old images before replacing them.
+            DestroyFrontImages(ring);
+            for (int i = 0; i < s_frontImages; i++)
+            {
+                Image& image = ring.images[i];
+                image = CreateImage(VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM, { outW, outH, 1 }, 1,
+                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,  // sampled: presenter post-processing
+                    VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT);
+                Begin();
+                ToGeneral(image.image, VK_IMAGE_ASPECT_COLOR_BIT, 1);
+            }
+            ring.width = outW;
+            ring.height = outH;
+            fprintf(stderr, "[renderer] front images %ux%u (%s), %d of them\n", outW, outH, scaled ? "host resolution" : "1x", s_frontImages);
         }
         if (scaled)
         {
@@ -8884,6 +9383,15 @@ void main()
         EndPass();
         Begin();
         FullBarrier();  // after earlier work, including the presenter's last read
+        // The image this swap writes: not the one the presenter took last,
+        // whose read it may queue only after waiting for the display (up to a
+        // refresh), nor (while another is free) the frame waiting for it,
+        // which stays takeable until here. The presenter can't take the
+        // image chosen until SubmitFrontImage hands it over, after the write.
+        std::array<VkImage, gpu::kMaxFrontImages> handles{};
+        for (int i = 0; i < s_frontImages; i++)
+            handles[i] = ring.images[i].image;
+        Image& front = ring.images[video::ClaimFrontImage(handles.data(), s_frontImages)];
         VkDescriptorImageInfo ii{ VK_NULL_HANDLE, front.view, VK_IMAGE_LAYOUT_GENERAL };
         VkDescriptorBufferInfo pool = DummyStorage(s_scaled.pool);
         VkDescriptorBufferInfo table = DummyStorage(s_scaled.table);
@@ -8902,10 +9410,10 @@ void main()
         FullBarrier();
         SubmitRecorded(7);  // the presenter's blit comes later in queue order
         video::SubmitFrontImage(front.image, outW, outH, width, height);
-        // Back at 1x (a live change): the host-resolution image is no longer
-        // needed. The presenter has this frame to show instead.
-        if (!scaled && s_frontScaled.image && s_renderScale.IsOne())
-            DestroyFrontImage(s_frontScaled, s_frontScaledWidth, s_frontScaledHeight);
+        // Back at 1x (a live change): the host-resolution images are no
+        // longer needed. The presenter has this frame to show instead.
+        if (!scaled && s_frontScaled.width && s_renderScale.IsOne())
+            DestroyFrontImages(s_frontScaled);
         if (g_eagerWrites)
         {
             // With fences published early nothing else keeps the GPU from
@@ -9002,6 +9510,8 @@ void main()
             writewatch::SetWriterFrame(frame);
         }
         s_frame = frame;
+        if (s_vk)
+            TrimTextureCache();
         if (s_zpdOn)
             ZpdOnSwap(frame);
         if (s_logShadowMap)
@@ -9321,8 +9831,18 @@ void main()
             m.textures += t->image.bytes;
             m.textureCount++;
         }
+        for (const RetiredTexture& r : s_retiredTextures)  // (evicted, held until the GPU is done with them)
+        {
+            m.textures += r.texture->image.bytes;
+            m.textureCount++;
+        }
+        m.textureEvictions = s_textureEvictions.textures;
+        m.textureEvictedBytes = s_textureEvictions.bytes;
+        m.textureReclaims = s_textureEvictions.reclaims;
         m.scaled = s_scaled.poolBytes + s_scaled.tableBytes + s_scaled.scratchBytes;
-        m.front = s_front.bytes + s_frontScaled.bytes;
+        for (const FrontRing* ring : { &s_front, &s_frontScaled })
+            for (const Image& image : ring->images)
+                m.front += image.bytes;
         auto own = [&m](const Image& image) {
             if (image.memory && !image.block)
             {
@@ -9334,7 +9854,12 @@ void main()
             own(rt->image);
         for (const auto& [key, t] : s_textures)
             own(t->image);
-        for (const Image* image : { &s_front, &s_frontScaled, &s_dummy[0], &s_dummy[1], &s_dummy[2], &s_dummyStorage })
+        for (const RetiredTexture& r : s_retiredTextures)
+            own(r.texture->image);
+        for (const FrontRing* ring : { &s_front, &s_frontScaled })
+            for (const Image& image : ring->images)
+                own(image);
+        for (const Image* image : { &s_dummy[0], &s_dummy[1], &s_dummy[2], &s_dummyStorage })
             own(*image);
         for (const auto& block : s_blocks)
         {
@@ -9358,18 +9883,7 @@ void main()
         m.allocationNs = s_imageTotals.allocationNs;
         m.fromSpare = s_imageTotals.fromSpare;
         m.blocksHere = s_imageTotals.blocksHere;
-        if (s_vk && s_memoryBudget)
-        {
-            VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT };
-            VkPhysicalDeviceMemoryProperties2 props{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &budget };
-            vkGetPhysicalDeviceMemoryProperties2(s_vk->physical, &props);
-            for (uint32_t h = 0; h < props.memoryProperties.memoryHeapCount; h++)
-                if (props.memoryProperties.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
-                {
-                    m.deviceUsed += budget.heapUsage[h];
-                    m.deviceBudget += budget.heapBudget[h];
-                }
-        }
+        DeviceMemoryBudget(m.deviceUsed, m.deviceBudget);
         return m;
     }
 

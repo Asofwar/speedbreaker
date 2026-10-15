@@ -32,6 +32,42 @@ namespace video
         }
     }
 
+    SurfaceOutcome ClassifySurfaceResult(int32_t vkResult)
+    {
+        SurfaceOutcome o;
+        switch (vkResult)
+        {
+        case kVkSuccess:
+            o.image = true;
+            break;
+        case kVkSuboptimal:
+            // An image all the same (this frame is drawn and presented); the
+            // swapchain is built again before a later one.
+            o.image = true;
+            o.report = true;
+            o.result = SurfaceResult::Suboptimal;
+            break;
+        // Exclusive fullscreen lost: VK_EXT_full_screen_exclusive (Windows
+        // only) isn't asked for, so it shouldn't come; if a driver says it
+        // anyway, the swapchain can't be presented to, as when out of date.
+        case kVkErrorOutOfDate:
+        case kVkErrorFullScreenLost:
+            o.report = true;
+            o.result = SurfaceResult::OutOfDate;
+            break;
+        case kVkErrorSurfaceLost:
+            o.surfaceLost = true;
+            break;
+        case kVkErrorDeviceLost:
+            o.deviceLost = true;
+            break;
+        default:
+            o.other = true;
+            break;
+        }
+        return o;
+    }
+
     ExtentChoice ChooseExtent(Extent surface, Orientation interface, bool landscapeOnly, bool refusePortrait)
     {
         // Unknown counts as landscape: the app shows in nothing else.

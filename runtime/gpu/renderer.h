@@ -106,6 +106,10 @@ namespace gpu::renderer
     // of vkAllocateMemory calls on this thread for images and blocks and
     // their time, of blocks taken from the spares, blocks allocated here
     // for want of one, blocks freed, and blocks the memory thread made.
+    //   The texture cache's limits (gpu/texture_budget.h): totals so far of
+    // textures evicted and their bytes, and of image allocations that
+    // failed for want of memory and asked the cache for room. (Evicted
+    // textures still count in `textures` until the GPU is done with them.)
     struct MemoryStats
     {
         uint64_t targets, textures, scaled, front, deviceUsed, deviceBudget;
@@ -113,6 +117,7 @@ namespace gpu::renderer
         uint64_t blockBytes, rangeBytes, spareBytes, ownBytes;
         uint32_t blocks, ranges, spares, own;
         uint64_t images, imageNs, allocations, allocationNs, fromSpare, blocksHere, blocksFreed, spareBlocks, spareNs;
+        uint64_t textureEvictions, textureEvictedBytes, textureReclaims;
     };
     MemoryStats GetMemoryStats();
     // Per-frame averages over the last 30 swaps, for the performance overlay

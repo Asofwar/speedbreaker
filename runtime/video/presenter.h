@@ -28,8 +28,33 @@ namespace video
     // resolution (internal resolution scaling; 0: the image's own).
     void SubmitFrontImage(VkImage image, uint32_t width, uint32_t height, uint32_t aspectWidth = 0, uint32_t aspectHeight = 0);
 
+    // Any thread (the renderer), before it records a write of one of its
+    // front images: the index of the one of `images` (a ring, `count` of
+    // them) to write (gpu/front_ring.h). Not the presenter's (it may not
+    // have queued its read of that frame yet, or draws it again) while
+    // another is free; when only the waiting frame's is, that frame is taken
+    // back here (dropped: counted and logged). Until the renderer hands the
+    // image over with SubmitFrontImage the presenter can't take it, so its
+    // write, queued before that, is never read in place of another frame.
+    int ClaimFrontImage(const VkImage* images, int count);
+
     // Wait until the queue is idle (resource replacement).
     void WaitGpuIdle();
+
+    // Any thread: a Vulkan call (`what` names it and its caller) returned
+    // VK_ERROR_DEVICE_LOST. The GPU or its driver gave up on the game's work
+    // (a GPU timeout or reset, a driver fault; on MoltenVK any Metal command
+    // buffer error) and nothing can be drawn or waited for on it again: every
+    // fence wait returns at once from then on, and v0.1.4's completion thread
+    // spun on that at 100% CPU while the game hung without a word. Now the
+    // first thread to see it logs it and writes a crash report
+    // (report::WriteCrashReport, as a crash does, which the next launch
+    // mentions); the main thread tells the player in a message box (none in
+    // SteamOS Game Mode, where nothing could show it) and the game exits
+    // (code 4). Never returns. Call it with no lock held that the main thread
+    // may take: a thread other than the main one waits here until the main
+    // thread has exited the game (10 s at most; then it exits itself).
+    [[noreturn]] void DeviceLost(const char* what);
 
     // Since launch, for the [perf] line: game frames replaced here before
     // they were shown (dropped), refreshes a game frame stayed on screen past
@@ -97,6 +122,20 @@ namespace video
         // renderer resets them in its command buffers).
         bool occlusionCounting = false;
         PFN_vkResetQueryPool resetQueryPool = nullptr;
+        // VK_KHR_sampler_mirror_clamp_to_edge is enabled (where the device
+        // has it): the renderer's samplers mirror once, as Xenos's mirror
+        // clamp modes do (gpu/renderer.cpp, GetSampler).
+        bool mirrorClampToEdge = false;
+#ifdef VK_EXT_depth_bias_control
+        // VK_EXT_depth_bias_control is enabled with its FORCE_UNORM
+        // representation (where the device has it; not MoltenVK): the
+        // renderer gives a D24S8 target's depth bias in unorm24 steps on the
+        // float32 depth buffer through this (gpu/renderer.cpp, the polygon
+        // offset). nullptr: vkCmdSetDepthBias, the format's steps, as before.
+        // depthBiasExact: each step exactly 2^-24 (not up to twice that).
+        PFN_vkCmdSetDepthBias2EXT cmdSetDepthBias2 = nullptr;
+        bool depthBiasExact = false;
+#endif
     };
 
     // nullptr when running headless.
