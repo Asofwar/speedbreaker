@@ -20,6 +20,7 @@
 #include "zpd_report.h"
 #include <kernel/write_watch.h>
 #include <debug/timeline.h>
+#include <debug/bench.h>
 #include <report/report.h>
 #include <unordered_set>
 
@@ -531,6 +532,10 @@ namespace gpu
                     renderer::HitchReport(frame, frameMs, vblanks - lastVblanks);
                     lastVblanks = vblanks;
                     lastSwap = swapNow;
+                    // The timedemo's recorder (a replay only; one cached check
+                    // otherwise): this swap's row, from the same swap time and
+                    // the counters HitchReport has just brought up to date.
+                    bench::OnSwap(frame, swapNow, s_draws.load(std::memory_order_relaxed));
                 }
                 if (frame % 30 == 0)
                 {
@@ -560,6 +565,7 @@ namespace gpu
                     // the renderer's executing time, the whole GPU frame.
                     auto scaled = renderer::GetScaledStats();
                     auto memory = renderer::GetMemoryStats();
+                    bench::NoteDeviceMemory(memory.deviceUsed);  // the timedemo report's peak
                     auto post = video::GetPostTiming();
                     static renderer::ScaledStats lastScaled{};
                     static renderer::MemoryStats lastMemory{};
