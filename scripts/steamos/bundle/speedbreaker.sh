@@ -37,24 +37,51 @@ BIN="$HERE/lib/SpeedBreaker"
 PORTABLE=0
 [ -f "$HERE/portable.txt" ] && PORTABLE=1
 
-# The log: here, or in the data folder if this one isn't writable (or /tmp,
-# the last place a log can go; in portable mode, straight there). On a
-# terminal it's shown as well (`speedbreaker.sh --install ...`).
+# private_log_dir: the last place a log can go, this user's alone: a folder in
+# $XDG_RUNTIME_DIR (the user's own, mode 0700: SteamOS and most desktops set
+# it), else a new folder from mktemp (each run its own, so no
+# previous-run.log there). Never a fixed name in a shared /tmp: another
+# user's last-run.log there can't be replaced, and a link planted under that
+# name would have the log written over any file of this user's.
+# tests/launcher_start_test.sh runs it.
+private_log_dir() {
+    local dir
+    if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -d "$XDG_RUNTIME_DIR" ] && [ -O "$XDG_RUNTIME_DIR" ] && [ -w "$XDG_RUNTIME_DIR" ]; then
+        dir="$XDG_RUNTIME_DIR/speedbreaker"
+        if { [ -d "$dir" ] || mkdir -m 700 "$dir" 2>/dev/null; } && [ ! -L "$dir" ] && [ -O "$dir" ] && [ -w "$dir" ]; then
+            echo "$dir"
+            return 0
+        fi
+    fi
+    mktemp -d "${TMPDIR:-/tmp}/speedbreaker.XXXXXX" 2>/dev/null
+}
+
+# The log: here, or in the data folder if this one isn't writable (or the
+# private folder above, the last place a log can go; in portable mode,
+# straight there). On a terminal it's shown as well (`speedbreaker.sh
+# --install ...`). With nowhere to write it, the output stays where Steam
+# (or the terminal) has it.
 LOG_DIR="$HERE"
 if [ ! -w "$LOG_DIR" ]; then
     if [ "$PORTABLE" = 1 ]; then
-        LOG_DIR="${TMPDIR:-/tmp}"
+        LOG_DIR="$(private_log_dir)"
     else
-        LOG_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/speedbreaker"
+        # Only an absolute $XDG_DATA_HOME counts, as in the game (user/paths.h).
+        case "${XDG_DATA_HOME:-}" in
+            /*) LOG_DIR="$XDG_DATA_HOME/speedbreaker" ;;
+            *) LOG_DIR="$HOME/.local/share/speedbreaker" ;;
+        esac
         mkdir -p "$LOG_DIR" 2>/dev/null
-        [ -w "$LOG_DIR" ] || LOG_DIR="${TMPDIR:-/tmp}"
+        [ -w "$LOG_DIR" ] || LOG_DIR="$(private_log_dir)"
     fi
 fi
-[ -f "$LOG_DIR/last-run.log" ] && mv -f "$LOG_DIR/last-run.log" "$LOG_DIR/previous-run.log"
-if [ -t 2 ]; then
-    exec > >(tee "$LOG_DIR/last-run.log") 2>&1
-else
-    exec > "$LOG_DIR/last-run.log" 2>&1
+if [ -n "$LOG_DIR" ]; then
+    [ -f "$LOG_DIR/last-run.log" ] && mv -f "$LOG_DIR/last-run.log" "$LOG_DIR/previous-run.log"
+    if [ -t 2 ]; then
+        exec > >(tee "$LOG_DIR/last-run.log") 2>&1
+    else
+        exec > "$LOG_DIR/last-run.log" 2>&1
+    fi
 fi
 
 say() { echo "[launcher] $*"; }
@@ -83,39 +110,134 @@ fi
 say "system: $(. /etc/os-release 2>/dev/null; echo "${NAME:-unknown} ${VERSION_ID:-}${BUILD_ID:+ build $BUILD_ID}${VARIANT_ID:+ ($VARIANT_ID)}"), kernel $(uname -r)," \
     "CPU$(grep -m1 '^model name' /proc/cpuinfo | cut -d: -f2-), $(nproc) threads, $(awk '/^MemTotal/ { printf "%.1f GB", $2 / 1048576 }' /proc/meminfo)"
 
-# The game is compiled for x86-64-v3 (AVX2, FMA, BMI2, MOVBE: Intel Haswell,
-# AMD Zen and later; every Steam Deck). On an older CPU it would die at its
-# first such instruction with SIGILL, which says nothing to a player.
-# (The arm64 build, the Steam Frame's, needs nothing beyond ARMv8.)
-flags=" $(grep -m1 '^flags' /proc/cpuinfo | cut -d: -f2-) "
-missing=""
-if [ "$(uname -m)" = x86_64 ]; then
-    for f in avx2 fma bmi2 movbe; do
-        case "$flags" in *" $f "*) ;; *) missing="$missing $f" ;; esac
-    done
-fi
-if [ -n "$missing" ]; then
-    say "this CPU lacks$missing: the game needs an x86-64-v3 CPU (Intel Haswell / AMD Zen or later)"
-    exit 1
-fi
-# The loader's library path splits at ':' and ';' and expands $ORIGIN, $LIB
-# and $PLATFORM, so in a folder named "Need for Speed: Most Wanted" the game
-# wouldn't find its libraries ("libglslang.so.16: cannot open shared object
-# file"). Say so instead.
-case "$HERE" in
-    *[:\;\$]*) say "the folder's path has a ':', ';' or '\$' ($HERE): move it or rename that folder"; exit 1 ;;
-esac
-
-# Newer wins, separately for the C and the C++ runtime.
 case "$(uname -m)" in
     aarch64) LOADER_NAME=ld-linux-aarch64.so.1 HOST_LOADER=/lib/ld-linux-aarch64.so.1 ;;
     *) LOADER_NAME=ld-linux-x86-64.so.2 HOST_LOADER=/lib64/ld-linux-x86-64.so.2 ;;
 esac
 BUNDLED_LOADER="$HERE/lib/glibc/$LOADER_NAME"
+
+# The functions below decide how the game starts; tests/launcher_start_test.sh
+# runs them on made-up loaders, libraries and folders (each from "name() {"
+# to its "}", or one line).
+
+# cpu_v3_missing <cpuinfo> <loader...>: nothing (and success) on an x86-64-v3
+# CPU, else what it lacks (and failure). The game is compiled for x86-64-v3
+# (AVX, AVX2, BMI1, BMI2, F16C, FMA, LZCNT, MOVBE, and x86-64-v2's SSE4.2,
+# POPCNT, CMPXCHG16B...: Intel Haswell, AMD Zen and later; every Steam Deck);
+# on an older CPU it would die at its first such instruction with SIGILL,
+# which says nothing to a player. The C library's loader knows exactly
+# ("x86-64-v3 (supported, searched)" in `ld.so --help`, glibc 2.33 and
+# later: the CPU and the kernel asked as the game's code needs them), so the
+# first loader here that answers decides; without one, /proc/cpuinfo's flags
+# for the whole level (abm is LZCNT there, pni SSE3). Nothing to read at all:
+# no refusal (at worst the SIGILL, as before this check).
+cpu_v3_missing() {
+    local cpuinfo="$1" loader said="" flags f missing=""
+    shift
+    for loader in "$@"; do
+        [ -x "$loader" ] || continue
+        said="$("$loader" --help 2>/dev/null | sed -n 's/^[[:space:]]*x86-64-v3\(.*\)$/v3\1/p' | head -1)"
+        case "$said" in
+            "v3 (supported"*) return 0 ;;
+            v3*) break ;;  # it says no: name what's missing below
+        esac
+    done
+    flags="$(grep -m1 '^flags' "$cpuinfo" 2>/dev/null | cut -d: -f2-)"
+    if [ -z "$flags" ]; then
+        [ -n "$said" ] || return 0
+        echo "x86-64-v3 (its C library says so)"
+        return 1
+    fi
+    for f in avx avx2 bmi1 bmi2 f16c fma abm movbe xsave cx16 lahf_lm popcnt pni ssse3 sse4_1 sse4_2; do
+        case " $flags " in *" $f "*) ;; *) missing="$missing $f" ;; esac
+    done
+    [ -n "$said" ] && [ -z "$missing" ] && missing=" x86-64-v3 (its C library says so)"
+    [ -n "$missing" ] || return 0
+    echo "${missing# }"
+    return 1
+}
+
+# Version numbers: a loader's glibc ("2.41"), a libstdc++'s newest GLIBCXX
+# ("GLIBCXX_3.4.34"), and the order of two.
 loader_version() { "$1" --version 2>/dev/null | sed -n '1s/.* version \([0-9][0-9.]*[0-9]\).*/\1/p'; }
 cxx_version() { grep -ao 'GLIBCXX_3\.4\.[0-9]*' "$1" 2>/dev/null | sort -uV | tail -1; }
 older() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" = "$1" ]; }  # $1 < $2
 
+# elf64_for <file> <e_machine>: a 64-bit little-endian ELF file for that CPU
+# (e_machine as its two bytes in hex: 3e00 x86-64, b700 arm64).
+elf64_for() {
+    local h
+    h="$(od -An -tx1 -N20 "$1" 2>/dev/null | tr -d ' \n')"
+    [ "${h:0:12}" = 7f454c460201 ] && [ "${h:36:4}" = "$2" ]
+}
+
+# host_cxx_lib [root]: the system's libstdc++.so.6 for this CPU, as its
+# loader finds it: ld.so.cache's entry for this ABI first (ldconfig -p),
+# then the usual folders, the 64-bit ones first. Each must be a 64-bit ELF
+# for this CPU: on Fedora and openSUSE (multilib) /usr/lib holds the 32-bit
+# library, whose version says nothing about the one the game would get.
+# shellcheck disable=SC2120  # its [root] is for tests/launcher_start_test.sh
+host_cxx_lib() {
+    local root="${1:-}" abi machine f
+    case "$(uname -m)" in
+        aarch64) abi=AArch64 machine=b700 ;;
+        *) abi=x86-64 machine=3e00 ;;
+    esac
+    while IFS= read -r f; do
+        if [ -n "$f" ] && elf64_for "$root$f" "$machine"; then
+            echo "$root$f"
+            return 0
+        fi
+    done < <({ ldconfig -p 2>/dev/null || /sbin/ldconfig -p 2>/dev/null; } |
+                 sed -n "s/^[[:space:]]*libstdc++\.so\.6 (libc6,${abi}[^)]*) => //p"
+             printf '%s\n' /usr/lib64/libstdc++.so.6 /lib64/libstdc++.so.6 /usr/lib/x86_64-linux-gnu/libstdc++.so.6 \
+                 /lib/x86_64-linux-gnu/libstdc++.so.6 /usr/lib/aarch64-linux-gnu/libstdc++.so.6 /usr/lib/libstdc++.so.6)
+    return 1
+}
+
+# use_bundled <the system's version> <the bundled one's> [1|0]: 1 to run the
+# bundled runtime, 0 the system's. Newer wins (none bundled, or one that
+# can't run, is never newer); a 1 or 0 given (NFSMW_BUNDLED_GLIBC,
+# NFSMW_BUNDLED_CXX) wins over that.
+use_bundled() {
+    case "${3:-}" in
+        1|0) echo "$3" ;;
+        *) if [ -n "$2" ] && { [ -z "$1" ] || older "$1" "$2"; }; then echo 1; else echo 0; fi ;;
+    esac
+}
+
+# open_lib_dir <folder>: LIB_DIR, the name the loader's --library-path gets
+# for <folder>. That option splits at ':' and ';' and expands $ORIGIN, $LIB
+# and $PLATFORM, so a folder named "Need for Speed: Most Wanted" would leave
+# the game without its libraries ("libglslang.so.16: cannot open shared
+# object file"). So the folder is opened on a descriptor of its own and
+# named through it, /proc/self/fd/<n>: the loader runs in this same process
+# (exec keeps the descriptor: bash doesn't mark it close-on-exec), and finds
+# lib/cxx and lib/glibc under it the same way. The game, and the programs it
+# starts (a file dialog), inherit that one descriptor of a folder, unused.
+# Without /proc, the folder's own path, which then must not hold those
+# characters (failure).
+open_lib_dir() {
+    LIB_DIR="$1"
+    if { exec {LIB_FD}<"$1"; } 2>/dev/null && [ -d "/proc/self/fd/$LIB_FD/" ]; then
+        LIB_DIR="/proc/self/fd/$LIB_FD"
+        return 0
+    fi
+    case "$1" in *[:\;\$]*) return 1 ;; esac
+    return 0
+}
+
+if [ "$(uname -m)" = x86_64 ] && ! missing="$(cpu_v3_missing /proc/cpuinfo "$BUNDLED_LOADER" "$HOST_LOADER")"; then
+    say "this CPU lacks $missing: the game needs an x86-64-v3 CPU (Intel Haswell / AMD Zen or later)"
+    exit 1
+fi
+# (The arm64 build, the Steam Frame's, needs nothing beyond ARMv8.)
+if ! open_lib_dir "$HERE/lib"; then
+    say "the folder's path has a ':', ';' or '\$' ($HERE), and without /proc the game can't find its libraries there: move it or rename that folder"
+    exit 1
+fi
+
+# Newer wins, separately for the C and the C++ runtime.
 host_glibc=""
 [ -x "$HOST_LOADER" ] && host_glibc="$(loader_version "$HOST_LOADER")"
 bundled_glibc="$(loader_version "$BUNDLED_LOADER")"
@@ -126,36 +248,25 @@ bundled_glibc="$(loader_version "$BUNDLED_LOADER")"
 if [ -e "$BUNDLED_LOADER" ] && [ -z "$bundled_glibc" ]; then
     say "can't run lib/glibc/$LOADER_NAME: is this folder on a card formatted for Windows (FAT32, exFAT, NTFS), or a drive mounted noexec? (README.md, 1. Unpack)"
 fi
-case "${NFSMW_BUNDLED_GLIBC:-}" in
-    1) use_glibc=1 ;;
-    0) use_glibc=0 ;;
-    *) if [ -n "$bundled_glibc" ] && { [ -z "$host_glibc" ] || older "$host_glibc" "$bundled_glibc"; }; then use_glibc=1; else use_glibc=0; fi ;;
-esac
+use_glibc="$(use_bundled "$host_glibc" "$bundled_glibc" "${NFSMW_BUNDLED_GLIBC:-}")"
 # No bundled C library (the arm64 bundle): the system's, whatever was asked.
 [ -e "$BUNDLED_LOADER" ] || use_glibc=0
 
 host_cxx=""
-for f in /usr/lib/libstdc++.so.6 /usr/lib64/libstdc++.so.6 /usr/lib/x86_64-linux-gnu/libstdc++.so.6 /lib/x86_64-linux-gnu/libstdc++.so.6 \
-    /usr/lib/aarch64-linux-gnu/libstdc++.so.6; do
-    if [ -e "$f" ]; then host_cxx="$(cxx_version "$f")"; break; fi
-done
+host_cxx_path="$(host_cxx_lib)" && host_cxx="$(cxx_version "$host_cxx_path")"
 bundled_cxx="$(cxx_version "$HERE/lib/cxx/libstdc++.so.6")"
-case "${NFSMW_BUNDLED_CXX:-}" in
-    1) use_cxx=1 ;;
-    0) use_cxx=0 ;;
-    *) if [ -n "$bundled_cxx" ] && { [ -z "$host_cxx" ] || older "$host_cxx" "$bundled_cxx"; }; then use_cxx=1; else use_cxx=0; fi ;;
-esac
+use_cxx="$(use_bundled "$host_cxx" "$bundled_cxx" "${NFSMW_BUNDLED_CXX:-}")"
 [ -e "$HERE/lib/cxx/libstdc++.so.6" ] || use_cxx=0
 
-LIBS="$HERE/lib"
-[ "$use_cxx" = 1 ] && LIBS="$LIBS:$HERE/lib/cxx"
+LIBS="$LIB_DIR"
+[ "$use_cxx" = 1 ] && LIBS="$LIBS:$LIB_DIR/cxx"
 LOADER="$HOST_LOADER"
 if [ "$use_glibc" = 1 ]; then
-    LIBS="$LIBS:$HERE/lib/glibc"
+    LIBS="$LIBS:$LIB_DIR/glibc"
     LOADER="$BUNDLED_LOADER"
 fi
 say "C library: $([ "$use_glibc" = 1 ] && echo bundled || echo "the system's") (system ${host_glibc:-none}, bundled ${bundled_glibc:-none});" \
-    "C++ library: $([ "$use_cxx" = 1 ] && echo bundled || echo "the system's") (system ${host_cxx:-none}, bundled ${bundled_cxx:-none})"
+    "C++ library: $([ "$use_cxx" = 1 ] && echo bundled || echo "the system's") (system ${host_cxx:-none}${host_cxx_path:+ in $host_cxx_path}, bundled ${bundled_cxx:-none})"
 
 # Laptops with two GPUs: an Intel or AMD one in the processor, beside an
 # NVIDIA graphics card. The game itself draws with the discrete GPU (its
@@ -199,6 +310,7 @@ nvidia_icd() {
 }
 
 # prime_offload [root]: the above.
+# shellcheck disable=SC2120  # its [root] is for tests/launcher_prime_test.sh
 prime_offload() {
     local root="${1:-}" d class vendor device driver kind version gpus="" nvidia=0 others=0 icd
     for d in "$root"/sys/bus/pci/devices/*; do

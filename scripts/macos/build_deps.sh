@@ -130,6 +130,7 @@ SOURCES=(
   "SDL3|3.4.16|https://github.com/libsdl-org/SDL/releases/download/release-3.4.16/SDL3-3.4.16.tar.gz|7322236cd12090c3eb40b9728be4d49c76f66ad17d04369584d4ecad5cf77c68|SDL3-3.4.16.tar.gz"
   "FFmpeg|7.1.1|https://ffmpeg.org/releases/ffmpeg-7.1.1.tar.xz|733984395e0dbbe5c046abda2dc49a5544e7e0e1e2366bba849222ae9e3a03b1|ffmpeg-7.1.1.tar.xz"
 )
+# shellcheck disable=SC2206  # split at '|' (its local IFS), on purpose
 field() { local IFS='|'; local a=($1); echo "${a[$2]}"; }
 source_of() { local s; for s in "${SOURCES[@]}"; do [ "$(field "$s" 0)" = "$1" ] && { echo "$s"; return; }; done; return 1; }
 
@@ -193,7 +194,7 @@ cmake_project() {
   local map="-ffile-prefix-map=$src=."
   local log="$LOGS/$name.log"
   echo "== $name" >&2
-  (cd "$src" && export SOURCE_DATE_EPOCH="$(cat "$src.epoch")" && cmake -S . -B build -G Ninja \
+  (cd "$src" && SOURCE_DATE_EPOCH="$(cat "$src.epoch")" && export SOURCE_DATE_EPOCH && cmake -S . -B build -G Ninja \
       -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_INSTALL_PREFIX="$PREFIX" -DCMAKE_INSTALL_LIBDIR=lib \
       -DCMAKE_FIND_FRAMEWORK=LAST -DBUILD_TESTING=OFF -Wno-dev \
@@ -323,9 +324,9 @@ bad=0
 for f in "$PREFIX"/lib/*.dylib "$PREFIX"/ffmpeg-xma/lib/*.a; do
   [ -L "$f" ] && continue
   m="$(minos "$f" | tr '\n' ' ' | sed 's/ $//')"
-  a="$(lipo -archs "$f" 2>/dev/null || echo '?')"
-  if [ "$m" != "$TARGET" ] || [ "$a" != arm64 ]; then
-    echo "build_deps.sh: $f is $a for macOS $m, not arm64 for $TARGET" >&2; bad=1
+  archs="$(lipo -archs "$f" 2>/dev/null || echo '?')"
+  if [ "$m" != "$TARGET" ] || [ "$archs" != arm64 ]; then
+    echo "build_deps.sh: $f is $archs for macOS $m, not arm64 for $TARGET" >&2; bad=1
   fi
 done
 [ $bad -eq 0 ] || exit 1
@@ -359,5 +360,6 @@ with open(os.path.join(prefix, 'share/speedbreaker-deps.json'), 'w') as f:
     f.write('\n')
 EOF
 echo "libraries for macOS $TARGET+ (arm64) in $PREFIX:"
+# shellcheck disable=SC2010  # library names: nothing ls could garble
 ls "$PREFIX/lib" | grep '\.dylib$' | tr '\n' ' '; echo
 echo "FFmpeg-XMA in $PREFIX/ffmpeg-xma; licenses in $PREFIX/share/licenses; record in $PREFIX/share/speedbreaker-deps.json"

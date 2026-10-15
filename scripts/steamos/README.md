@@ -19,7 +19,7 @@ Tested on SteamOS 3.8 (Steam Machine, RADV NAVI33, clang 22, SDL 3.4).
 
        distrobox enter nfsmw-build
        scripts/setup_tools.sh
-       tools/XenonRecomp/build/XenonRecomp/XenonRecomp config/nfsmw.toml tools/XenonRecomp/XenonUtils/ppc_context.h
+       scripts/recompile.sh
        cmake -S . -B build/main -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
        ninja -C build/main SpeedBreaker
 

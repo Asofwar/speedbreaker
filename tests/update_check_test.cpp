@@ -383,6 +383,34 @@ static void Outcomes()
     CHECK(SafePageUrl("https://github.com/SpeedBreakerProject/speedbreaker/releases/tag/v0.1.2") ==
               "https://github.com/SpeedBreakerProject/speedbreaker/releases/tag/v0.1.2",
         "the release's page is");
+    // Escapes of a dot, a slash, a backslash or '%' lead elsewhere once the
+    // browser (or the server) decodes them: releases/%2e%2e/%2e%2e/x is
+    // github.com/SpeedBreakerProject/x. Never used, nor a broken escape, a
+    // control character or a byte outside ASCII.
+    const std::string page = kPagePrefix;
+    for (const char* bad : { "%2e%2e/%2e%2e/x", "%2E%2E/%2E%2E/x", ".%2e/.%2e/x", "%2e./x", "tag%2f..%2f..%2fx", "tag%2F..%2F..%2Fx",
+             "tag%5c..%5c..%5cx", "%252e%252e/%252e%252e/x", "tag/v1%", "tag/v1%2", "tag/v1%zz", "tag/v1%2g", "tag/v1%00", "tag/v1%0a",
+             "tag/v1%7f", "tag/v1%C3%A9" })
+        CHECK(SafePageUrl(page + bad) == kReleasesPage, "'%s' isn't used", (page + bad).c_str());
+    CHECK(SafePageUrl(page + "tag/v1.0.0%2Bbuild.5") == page + "tag/v1.0.0%2Bbuild.5", "an escaped '+' (build metadata) is");
+    CHECK(SafePageUrl(page + "tag/v1.0.0+build.5") == page + "tag/v1.0.0+build.5", "so is a plain one");
+    r = Evaluate(Answer(200, R"({"tag_name":"v0.9.0","html_url":"https://github.com/SpeedBreakerProject/speedbreaker/releases/%2e%2e/%2e%2e/x"})"),
+        "0.1.1", now);
+    CHECK(r.outcome == Outcome::Available && r.url == kReleasesPage, "a forged answer's escaped dots: '%s'", r.url.c_str());
+
+    // NFSMW_UPDATE_URL's address (update/updater.h): https anywhere, plain
+    // http only to this machine.
+    for (const char* https : { "https://api.github.com/repos/x/y/releases/latest", "https://localhost:8443/latest", "https://example.com" })
+        CHECK(ClassifyOverrideUrl(https) == OverrideUrl::Https, "'%s': https", https);
+    for (const char* local : { "http://localhost:8080/latest", "http://LOCALHOST/x", "http://localhost", "http://127.0.0.1:8000/x",
+             "http://127.1.2.3/", "http://127.0.0.1?x", "http://[::1]:8080/x", "http://[::1]" })
+        CHECK(ClassifyOverrideUrl(local) == OverrideUrl::LocalHttp, "'%s': this machine's http", local);
+    for (const char* bad : { "http://example.com/latest", "http://127.0.0.1@example.com/", "http://localhost@example.com/",
+             "http://localhost.example.com/", "http://127.0.0.1.nip.io/", "http://128.0.0.1/", "http://127.0.0.256/", "http://127.1/",
+             "http://0x7f.0.0.1/", "http://2130706433/", "http://[::2]/", "http://[::1/", "http://[::1]x/", "http://localhost:/",
+             "http://localhost:80a/", "http:///x", "http://", "ftp://localhost/", "file:///etc/passwd", "https://", "https:///x",
+             "HTTP://localhost/", "/tmp/canned.txt", "" })
+        CHECK(ClassifyOverrideUrl(bad) == OverrideUrl::Refused, "'%s': refused", bad);
 
     // Rate limits: GitHub's 60 an hour.
     r = Evaluate(Answer(403, R"({"message":"API rate limit exceeded for 1.2.3.4."})",

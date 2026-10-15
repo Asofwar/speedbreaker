@@ -52,6 +52,7 @@ ninja -C "$BUILD" -j"$JOBS"
 # references by name); the rest as the linker needs them. SDL finds
 # vkGetInstanceProcAddr in the app itself with dlsym, so it must survive
 # dead stripping.
+# shellcheck disable=SC2054  # -Wl,-u,<symbol> is one linker option: its commas are its own
 LIBS=(
     -force_load "$BUILD/runtime/libSpeedBreaker.a"
     "$BUILD/recomp/libNfsmwRecompLib.a" "$BUILD/runtime/libXenonUtilsLite.a" "$BUILD/runtime/libo1heap.a"

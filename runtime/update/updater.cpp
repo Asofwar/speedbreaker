@@ -120,9 +120,19 @@ namespace update
                 if (target.starts_with("http://") || target.starts_with("https://"))
                 {
                     source = " from NFSMW_UPDATE_URL " + target;
-                    fetched = Fetch({ .url = target, .userAgent = UserAgent(),
-                        .headers = { { "Accept", "application/vnd.github+json" }, { "X-GitHub-Api-Version", "2022-11-28" } },
-                        .allowHttp = true });
+                    // https anywhere, plain http only to this machine (a test
+                    // server; update/check.h): a release build never sends the
+                    // check in the clear to another host because of a stray
+                    // variable.
+                    if (ClassifyOverrideUrl(target) == OverrideUrl::Refused)
+                    {
+                        fetched.transport = Transport::Failed;
+                        fetched.detail = "NFSMW_UPDATE_URL: https, or plain http only to this machine (localhost, 127.x.x.x, [::1])";
+                    }
+                    else
+                        fetched = Fetch({ .url = target, .userAgent = UserAgent(),
+                            .headers = { { "Accept", "application/vnd.github+json" }, { "X-GitHub-Api-Version", "2022-11-28" } },
+                            .allowHttp = true });
                 }
                 else
                 {

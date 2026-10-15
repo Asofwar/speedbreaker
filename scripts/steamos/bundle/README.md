@@ -38,9 +38,7 @@ should say OK.
 Keep the folder on the internal storage or on an SD card that SteamOS
 formatted (ext4): SteamOS doesn't mount a card formatted for Windows (FAT32,
 exFAT, NTFS) in Game Mode, and its files can lose the "executable" mark the
-program needs. No `:`, `;` or `$`
-in the names of the folders it's in (not "Need for Speed: Most Wanted"): the
-game can't start from there.
+program needs.
 
 To update later, unpack the newer download over the same folder (the same
 command, or Extract archive here, letting it overwrite). Your Steam shortcut

@@ -5,9 +5,16 @@
 #         -DCMAKE_CXX_COMPILER=/opt/homebrew/opt/llvm/bin/clang++
 #   ninja -C build/main -j6
 #
-# Needs ppc/ (XenonRecomp output from your own default.xex) and tools/
-# (scripts/setup_tools.sh). -DSB_TESTS=ON adds the unit tests (tests/; run
-# them with ctest from the build folder).
+# Needs ppc/ (XenonRecomp output from your own default.xex, made by
+# scripts/recompile.sh) and tools/ (scripts/setup_tools.sh). -DSB_TESTS=ON
+# adds the unit tests (tests/; run them with ctest from the build folder).
+# -DSB_TESTS_ONLY=ON configures nothing but the unit tests that need neither
+# ppc/ nor tools/, SDL3 or Vulkan: a fresh clone with only Clang and CMake
+# builds and runs them (CI):
+#
+#   cmake -S . -B build/tests -G Ninja -DSB_TESTS_ONLY=ON \
+#         -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+#   ninja -C build/tests && ctest --test-dir build/tests -LE timing
 cmake_minimum_required(VERSION 3.20)
 
 # macOS (not iOS, which scripts/ios/build.sh sets to 17.0): the oldest macOS
@@ -71,6 +78,27 @@ project(SpeedBreaker VERSION 0.1.4 LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# The compiler: Clang 18 or newer, as README.md asks, or Apple's clang from
+# Xcode 16 or newer (scripts/ios/build.sh builds the iOS libraries with
+# Xcode's own compiler; the Mac build uses Homebrew's LLVM). Checked before
+# anything is built: GCC, the default c++ on Fedora and Ubuntu, or an older
+# Clang would otherwise fail far into the build, deep in the generated code
+# or the runtime (clang's vector extensions, its flags, C++20 library parts),
+# with errors that never say the compiler is the cause. A build folder keeps
+# the compiler it was first configured with, so the message says to make a
+# new one.
+foreach(_sb_lang C CXX)
+    set(_sb_id "${CMAKE_${_sb_lang}_COMPILER_ID}")
+    set(_sb_version "${CMAKE_${_sb_lang}_COMPILER_VERSION}")
+    if(NOT ((_sb_id STREQUAL "Clang" AND _sb_version VERSION_GREATER_EQUAL 18)
+            OR (_sb_id STREQUAL "AppleClang" AND _sb_version VERSION_GREATER_EQUAL 16)))
+        message(FATAL_ERROR "SpeedBreaker needs Clang 18 or newer (or Apple's clang from Xcode 16 or newer), "
+            "but the ${_sb_lang} compiler is ${_sb_id} ${_sb_version} (${CMAKE_${_sb_lang}_COMPILER}). Configure a new "
+            "build folder with -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ (a clang 18 or newer; on a Mac, "
+            "Homebrew's: /opt/homebrew/opt/llvm/bin/clang and clang++). README.md, \"Building from source\".")
+    endif()
+endforeach()
+
 # Binaries name their sources from the repository root (assert messages,
 # debug information), never by the folders they were built in: a published
 # build carries no one's home folder (a build folder inside the checkout
@@ -90,11 +118,19 @@ if(APPLE AND NOT IOS)
     add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX,OBJC,OBJCXX>:-Werror=unguarded-availability-new>")
 endif()
 
-add_subdirectory(recomp)
-add_subdirectory(runtime)
-
-option(SB_TESTS "Build the unit tests (tests/)" OFF)
-if(SB_TESTS)
+option(SB_TESTS_ONLY "Configure only the unit tests that need no ppc/, tools/, SDL3 or Vulkan (CI)" OFF)
+if(SB_TESTS_ONLY)
+    # No game: recomp/ would stop without ppc/, runtime/ without SDL3,
+    # Vulkan, glslang and tools/. tests/ leaves out what needs them.
     enable_testing()
     add_subdirectory(tests)
+else()
+    add_subdirectory(recomp)
+    add_subdirectory(runtime)
+
+    option(SB_TESTS "Build the unit tests (tests/)" OFF)
+    if(SB_TESTS)
+        enable_testing()
+        add_subdirectory(tests)
+    endif()
 endif()

@@ -306,7 +306,9 @@ fi
     echo "Needs: $need_glibc and $need_cxx ($runtimes: glibc $have_glibc, $have_cxx)"
     echo "From the system: ${system[*]} (and what SDL loads at run time)"
 } > "$STAGE/bundle-info.txt"
-(cd "$STAGE" && find . -type f ! -name SHA256SUMS | sort | sed 's|^\./||' | xargs sha256sum > SHA256SUMS)
+# NUL-separated: a license file's name may hold a space (its package's own
+# names). The same lines as before: sorted, without the leading ./.
+(cd "$STAGE" && find . -type f ! -name SHA256SUMS -print0 | sort -z | sed -z 's|^\./||' | xargs -0 sha256sum > SHA256SUMS)
 
 # The host's side, when this runs in a distrobox: what the launcher will find.
 if [ -d /run/host/usr/lib ]; then

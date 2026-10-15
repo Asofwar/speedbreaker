@@ -180,9 +180,8 @@ should say OK. What changed in each release is in [CHANGELOG.md](CHANGELOG.md).
    mkdir -p ~/Games && tar -xf ~/Downloads/SpeedBreaker-steamos-x86_64.tar.xz -C ~/Games
    ```
 
-   Keep it on internal storage or on an SD card formatted by SteamOS, and don't use `:`, `;` or
-   `$` in the folder names. To update later, unpack the new download over the same folder
-   ([How to update](#how-to-update)).
+   Keep it on internal storage or on an SD card formatted by SteamOS. To update later, unpack
+   the new download over the same folder ([How to update](#how-to-update)).
 
 2. **Add it to Steam.** Steam > Games > *Add a Non-Steam Game to My Library* > Browse. Set the
    file type to *All Files* and pick `~/Games/SpeedBreaker/speedbreaker.sh`, the launcher (the
@@ -237,9 +236,8 @@ The Steam Frame has its own download. You set it up on the Frame's desktop: open
    mkdir -p ~/Games && tar -xf ~/Downloads/SpeedBreaker-steamos-arm64.tar.xz -C ~/Games
    ```
 
-   This makes `~/Games/SpeedBreaker`. Keep it on the Frame's internal storage, and don't use `:`,
-   `;` or `$` in the folder names. To update later, unpack the new download over the same folder
-   ([How to update](#how-to-update)).
+   This makes `~/Games/SpeedBreaker`. Keep it on the Frame's internal storage. To update later,
+   unpack the new download over the same folder ([How to update](#how-to-update)).
 
 2. **Add it to Steam.** In the file manager, open `~/Games/SpeedBreaker`, right-click
    `speedbreaker.sh` and choose *Add to Steam*. Or, in Konsole:
@@ -644,8 +642,9 @@ The supported executable is 3,936,256 bytes, with SHA-256
   ```
 
 - **Other Linux distributions:** your distribution's equivalents of the package list above
-  (Clang 18 or newer). Untested so far. The GPU needs Vulkan 1.2 and BC (DXT) texture support.
-- `gh`, logged in, is optional: it fetches Xenia's instruction tests.
+  (Clang 18 or newer: CMake stops with a message for another compiler, such as the GCC that is
+  the default `c++` on Fedora and Ubuntu). Untested so far. The GPU needs Vulkan 1.2 and BC
+  (DXT) texture support.
 
 #### 2. Toolchain, your game files, recompilation
 
@@ -660,10 +659,31 @@ tools/extract-xiso/build/extract-xiso -d game/files -x /path/to/your-backup.iso
 shasum -a 256 game/files/default.xex
 # must print aebdf3c14d1e4e4ed2c130d94bc1a0e97bd6d5bf39bdfdef33c3909c9cc4ba4c
 
-# Translate the game's code into C++ (writes ppc/).
+# Translate the game's code into C++ (writes ppc/, and ppc/.inputs: what it was made from).
+scripts/recompile.sh
+```
+
+`setup_tools.sh` pins every tool (XenonRecomp's base commit and patches, extract-xiso's commit,
+FFmpeg's version and SHA-256, Xenia's instruction tests by commit and SHA-256) and records what
+each was built from in `tools/.stamps/`: run it again after a pull, and it remakes only what
+changed (a new or changed patch remakes XenonRecomp's `nfsmw` branch). `SKIP_XENIA=1` leaves out
+Xenia's instruction tests, which only `tests/run_instr_tests.sh` needs.
+
+`recompile.sh` checks the executable's SHA-256 and that XenonRecomp is built from the current
+patches, writes only the files that changed (so the next build recompiles only those), removes
+files an earlier run made that this one doesn't, and records the inputs in `ppc/.inputs`. CMake
+compares that record with the checkout whenever it configures (and `ninja` configures again when
+`config/` or the patches change), and stops if `ppc/` is out of date: after a pull that changes
+them, run `setup_tools.sh` and `recompile.sh` again (`-DSB_ALLOW_STALE_PPC=ON` builds the old
+`ppc/` anyway, with a warning). By hand, the same translation is
+
+```sh
 mkdir -p ppc
 tools/XenonRecomp/build/XenonRecomp/XenonRecomp config/nfsmw.toml tools/XenonRecomp/XenonUtils/ppc_context.h
 ```
+
+but it leaves no `ppc/.inputs` (CMake then warns that it can't tell whether `ppc/` is current),
+and keeps any old file the run no longer makes.
 
 #### 3. Build
 
@@ -725,12 +745,26 @@ Run `build/main/runtime/SpeedBreaker` from the repository root. With the whole d
 #### Tests
 
 The unit tests build with `-DSB_TESTS=ON` added to the `cmake` line, and
-`ctest --test-dir build/main` runs them. `tests/run_instr_tests.sh` checks the instructions
-SpeedBreaker's patches add to XenonRecomp. It needs LLVM's `llvm-mc` and `llvm-objdump` and
-`ld.lld`: on a Mac, Homebrew's `llvm` and `lld`; elsewhere, your distribution's (on Arch, the
-`llvm` and `lld` packages; the container above has only `lld`). `LLVM=<bin dir>` and
-`LLD=<ld.lld>` pick others. So far it has been run on a Mac only. None of the tests needs game
-files; `write_watch_test` needs `ppc/`.
+`ctest --test-dir build/main` runs them. None of them needs game files; `write_watch_test` needs
+`ppc/` and `tools/XenonRecomp` (it is left out without them). The others build in a fresh clone
+with only Clang, CMake and Ninja, without `ppc/`, `tools/`, SDL3 or Vulkan, as CI builds them:
+
+```sh
+cmake -S . -B build/tests -G Ninja -DSB_TESTS_ONLY=ON -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+ninja -C build/tests && ctest --test-dir build/tests -LE timing
+```
+
+`-LE timing` leaves out the tests labelled `timing` (`vblank_timer_test`), which measure this
+machine's scheduling against fixed thresholds: meaningful on a quiet machine, not on a shared CI
+runner.
+
+`tests/run_instr_tests.sh` checks the instructions SpeedBreaker's patches add to XenonRecomp,
+with Xenia's instruction tests (fetched by `setup_tools.sh`; `SKIP_XENIA=1` runs only our own)
+and ours (`tests/instr`, from `tests/gen_instr_tests.py`). It exits non-zero when a test doesn't
+assemble, the test program doesn't build, or a check fails. It needs LLVM's `llvm-mc` and
+`llvm-objdump` and `ld.lld`: on a Mac, Homebrew's `llvm` and `lld`; elsewhere, your
+distribution's (on Arch, the `llvm` and `lld` packages; the container above has only `lld`).
+`LLVM=<bin dir>` and `LLD=<ld.lld>` pick others.
 
 ## Credits
 

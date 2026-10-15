@@ -3,7 +3,7 @@
 # 3D scene keeps rendering behind it), then average the [perf] lines logged
 # between BENCH_FROM and BENCH_TO seconds. Extra env vars pass through.
 #   scripts/bench.sh [label]
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 FROM=${BENCH_FROM:-175}
 TO=${BENCH_TO:-205}
 LOG=build/bench_${1:-run}.log

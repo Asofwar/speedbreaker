@@ -1,18 +1,30 @@
-# The unit tests as CMake targets (-DSB_TESTS=ON at the top level), built as
-# each file's header says to build it by hand: -O2 with assertions on, no
-# -march. Run them with ctest from the build folder. None needs game files;
-# write_watch_test needs ppc/ (ppc_config.h, generated from your own XEX).
+# The unit tests as CMake targets (-DSB_TESTS=ON at the top level, or
+# -DSB_TESTS_ONLY=ON for these alone), built as each file's header says to
+# build it by hand: -O2 with assertions on, no -march. Run them with ctest
+# from the build folder. None needs game files, SDL3 or Vulkan;
+# write_watch_test and kernel_dispatcher_test need ppc/ (ppc_config.h,
+# generated from your own XEX) and tools/XenonRecomp, and are left out
+# without them.
+#
+# A test is one line: sb_test(<name> [SOURCES <runtime .cpp ...>]
+# [ARGS <arguments>] [LABELS <labels>]) builds tests/<name>.cpp with them.
+# The label "timing" marks a test that measures this machine's scheduling
+# against fixed thresholds: meaningful on a quiet machine, flaky on a shared
+# CI runner, which leaves them out (ctest -LE timing).
 set(ROOT ${CMAKE_CURRENT_SOURCE_DIR}/..)
 set(RT ${ROOT}/runtime)
 find_package(Threads REQUIRED)
 
 function(sb_test name)
-    cmake_parse_arguments(T "" "" "SOURCES;ARGS" ${ARGN})
+    cmake_parse_arguments(T "" "" "SOURCES;ARGS;LABELS" ${ARGN})
     add_executable(${name} ${CMAKE_CURRENT_SOURCE_DIR}/${name}.cpp ${T_SOURCES})
     target_include_directories(${name} PRIVATE ${RT})
     target_link_libraries(${name} PRIVATE Threads::Threads)
     target_compile_options(${name} PRIVATE -O2 -UNDEBUG)
     add_test(NAME ${name} COMMAND ${name} ${T_ARGS})
+    if(T_LABELS)
+        set_tests_properties(${name} PROPERTIES LABELS "${T_LABELS}")
+    endif()
 endfunction()
 
 sb_test(block_ranges_test)
@@ -30,9 +42,36 @@ sb_test(depth_only_test ARGS ${RT}/gpu/renderer.cpp)
 # and the scaled resolve memory's layout (gpu/render_scale.h, header only);
 # renderer.cpp is read to check its scaled-memory shaders use it.
 sb_test(render_scale_test ARGS ${RT}/gpu/renderer.cpp)
-# The police vid-cam's side bars and the fill past the 16:9 band
+# The police vid-cam's side bars, the intro's black frames, the results
+# backdrop and menus' inset overlays, and the fill past the 16:9 band
 # (gpu/edge_bars.h, header only).
 sb_test(edge_bars_test)
+# Which of Xenos's two polygon offsets (front and back faces) a draw gets, and
+# when its depth bias is set in unorm24's steps (gpu/poly_offset.h, header
+# only); renderer.cpp is read to check Draw uses them.
+sb_test(gpu_poly_offset_test ARGS ${RT}/gpu/renderer.cpp)
+# The texture cache's limits (gpu/texture_budget.h, header only): when it
+# gives textures back and which, over a modelled long free roam (bounded, the
+# scene never evicted, no reloads); renderer.cpp is read to check every use
+# marks the texture and the swap trims the cache.
+sb_test(gpu_texture_budget_test ARGS ${RT}/gpu/renderer.cpp)
+# Texture formats that hold another's data (the *_AS_16_16_16_16 aliases,
+# k_8_A) and the components a host format lacks (gpu/texture_formats.h,
+# header only); renderer.cpp and shader_translator.cpp are read to check
+# LookupTexture and the untile's new loads use them.
+sb_test(gpu_texture_formats_test ARGS ${RT}/gpu/renderer.cpp ${RT}/gpu/shader_translator.cpp)
+# Which front image the renderer's next swap writes (gpu/front_ring.h,
+# header only): a model of the presenter and the renderer, which must show
+# every frame as itself or count it as dropped (v0.1.4's single image lost
+# a race to the presenter's read); renderer.cpp and presenter.cpp are read
+# to check they choose and hand over the image as the model does.
+sb_test(gpu_front_ring_test ARGS ${RT}/gpu/renderer.cpp ${RT}/video/presenter.cpp)
+# Every Vulkan wait, submit and present in the renderer and the presenter looks
+# at its result, and a lost device goes to video::DeviceLost (v0.1.4's
+# completion thread spun on one, and the presenter drew to an image index a
+# failed acquire never wrote); planted v0.1.4 lines must be caught.
+# renderer.cpp and presenter.cpp are read.
+sb_test(gpu_device_lost_test ARGS ${RT}/gpu/renderer.cpp ${RT}/video/presenter.cpp)
 # A saved pipeline cache from another GPU, driver or OS version, and the log
 # line that says so (gpu/pipeline_cache_header.h, header only).
 sb_test(pipeline_cache_header_test)
@@ -58,11 +97,16 @@ sb_test(display_tone_test ARGS ${RT}/video/presenter.cpp ${RT}/user/settings.cpp
 sb_test(refresh_fit_test SOURCES ${RT}/video/refresh_fit.cpp)
 # How late the guest vblank's thread wakes on this machine, alone and with
 # every core busy (video/vblank_timer.cpp; checked on macOS, where its
-# scheduling changed in v0.1.4).
-sb_test(vblank_timer_test SOURCES ${RT}/video/vblank_timer.cpp)
+# scheduling changed in v0.1.4). Its thresholds (1.5 ms in 99% of vblanks,
+# 0.5 ms at the median) hold on a quiet machine, not on a shared CI runner.
+sb_test(vblank_timer_test SOURCES ${RT}/video/vblank_timer.cpp LABELS timing)
 # When the Mac shows a new frame at a set time after its vblank, and the
 # watchdog that turns it off (video/present_schedule.h, header only).
 sb_test(present_schedule_test)
+# The audio render thread's cadence (apu/audio.h's RenderCadence, header
+# only) against a simulated output device: following its clock, and the
+# watchdog for a device that stops taking audio (GitHub issue #20).
+sb_test(audio_cadence_test)
 sb_test(frame_rate_policy_test SOURCES ${RT}/video/frame_rate_policy.cpp)
 # When the presenter builds its swapchain again and at what size (an iPhone's
 # view turned portrait by SDL, sizes seen while inactive, SUBOPTIMAL), and the
@@ -112,10 +156,27 @@ if(NOT WIN32)
         ${RT}/install/installer.cpp ${RT}/install/locate.cpp ${RT}/install/manifest.cpp ${RT}/install/result.cpp
         ${RT}/install/disc_source.cpp ${RT}/install/sha256.cpp
         ARGS ${CMAKE_BINARY_DIR}/portable_scratch)
+    # The game folder checks startup makes before any of the game runs
+    # (install/installer.h: CheckInstalledFiles, every file by stat in any case;
+    # CheckInstalledXex, the supported default.xex; GitHub issue #4), in a
+    # scratch folder.
+    sb_test(startup_game_files_test SOURCES ${RT}/install/placement.cpp ${RT}/install/installer.cpp ${RT}/install/locate.cpp
+        ${RT}/install/manifest.cpp ${RT}/install/result.cpp ${RT}/install/disc_source.cpp ${RT}/install/sha256.cpp
+        ${RT}/user/portable.cpp
+        ARGS ${CMAKE_BINARY_DIR}/startup_game_files_scratch)
     if(APPLE AND NOT IOS)
         target_link_libraries(install_folder_test PRIVATE "-framework CoreFoundation")  # placement.cpp's iCloud check
         target_link_libraries(portable_test PRIVATE "-framework CoreFoundation")
+        target_link_libraries(startup_game_files_test PRIVATE "-framework CoreFoundation")
     endif()
+    # Saves written atomically (kernel/vfs.h, header only): the temporary files'
+    # names, short writes, whole-file writes that keep the old file when they
+    # fail, the rewrites the file objects make of saves (vfs::Staging), and the
+    # clean-up of what crashed writes left, in a scratch folder. The XDG base
+    # folders (user/paths.h, header only): an empty or relative $XDG_DATA_HOME or
+    # $XDG_CACHE_HOME is ignored. POSIX only (mkdtemp, setrlimit, setenv).
+    sb_test(saves_atomic_test ARGS ${CMAKE_CURRENT_BINARY_DIR})
+    sb_test(saves_xdg_paths_test)
 endif()
 # The SteamOS launcher's hybrid-graphics part (NVIDIA PRIME render offload,
 # scripts/steamos/bundle/speedbreaker.sh) on made-up /sys, /proc and Vulkan
@@ -124,6 +185,16 @@ if(NOT WIN32)
     find_program(SB_BASH bash)
     if(SB_BASH)
         add_test(NAME launcher_prime_test COMMAND ${SB_BASH} ${CMAKE_CURRENT_SOURCE_DIR}/launcher_prime_test.sh
+            ${ROOT}/scripts/steamos/bundle/speedbreaker.sh)
+    endif()
+    # The launcher's start: the x86-64-v3 check (the loader's own answer, else
+    # every flag of the level), the system's libstdc++ on multilib systems,
+    # which C and C++ runtimes run the game, its library folder in a folder
+    # named with ':', ';' or '$' (through /proc/self/fd), the log's private
+    # last place; then the whole launcher on a made-up bundle. Linux only, as
+    # the launcher is (/proc, bash 4).
+    if(SB_BASH AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_test(NAME launcher_start_test COMMAND ${SB_BASH} ${CMAKE_CURRENT_SOURCE_DIR}/launcher_start_test.sh
             ${ROOT}/scripts/steamos/bundle/speedbreaker.sh)
     endif()
 endif()
@@ -140,6 +211,13 @@ sb_test(version_check_test)
 # Check for Updates' logic: versions, GitHub's JSON, curl's output and the
 # release notes (update/check.cpp, self-contained).
 sb_test(update_check_test SOURCES ${RT}/update/check.cpp)
+# Its transport on Linux and SteamOS (update/fetch_curl.cpp), with stand-in
+# curls through NFSMW_UPDATE_CURL: answers, curl's exit codes, the deadline
+# and the cap, and the arguments, environment and descriptors curl gets.
+# Linux only, as the transport is (about six seconds: two deadlines).
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    sb_test(update_fetch_test SOURCES ${RT}/update/fetch_curl.cpp ${RT}/update/check.cpp)
+endif()
 # Settings > Quit Game: where it is offered (not on iPhone or iPad) and its
 # confirmation (ui/quit_game.h, header only); the runtime's code around it
 # is read: the button and prompt gated, the focus on Cancel, B and Escape
@@ -151,10 +229,25 @@ sb_test(quit_game_test ARGS ${RT})
 # Performance Tuning labels, GitHub issue #8) as the guest dispatches them.
 sb_test(switch_tables_test ARGS ${ROOT}/config/switch_tables.toml ${ROOT}/config/nfsmw.toml)
 # The write watch around CPU write faults, on physical memory mapped as the
-# runtime maps it.
-sb_test(write_watch_test SOURCES ${RT}/kernel/write_watch.cpp ${RT}/cpu/guest_time.cpp)
-target_include_directories(write_watch_test PRIVATE ${RT}/kernel ${RT}/thirdparty/o1heap ${ROOT}/ppc
-    ${ROOT}/tools/XenonRecomp/XenonUtils ${ROOT}/tools/XenonRecomp/thirdparty/simde)
+# runtime maps it. Through stdafx.h it includes ppc/'s headers (generated
+# from your own XEX) and XenonRecomp's, so only where both are: never in a
+# fresh clone (SB_TESTS_ONLY, CI).
+if(EXISTS ${ROOT}/ppc/ppc_config.h AND EXISTS ${ROOT}/tools/XenonRecomp/XenonUtils)
+    sb_test(write_watch_test SOURCES ${RT}/kernel/write_watch.cpp ${RT}/cpu/guest_time.cpp)
+    target_include_directories(write_watch_test PRIVATE ${RT}/kernel ${RT}/thirdparty/o1heap ${ROOT}/ppc
+        ${ROOT}/tools/XenonRecomp/XenonUtils ${ROOT}/tools/XenonRecomp/thirdparty/simde)
+    # The kernel dispatcher (kernel/dispatcher.cpp, with kernel/xdm.cpp's
+    # reference counts) on stub guest memory: waits keep their objects when the
+    # handles are closed, sets and pulses release only the threads waiting then
+    # (a pulse never leaves the event signaled), guest-embedded KEVENT/KSEMAPHORE
+    # headers are written outside the dispatcher's lock, and a closed periodic
+    # timer stops. The same headers as write_watch_test.
+    sb_test(kernel_dispatcher_test SOURCES ${RT}/kernel/dispatcher.cpp ${RT}/kernel/xdm.cpp ${RT}/cpu/guest_time.cpp)
+    target_include_directories(kernel_dispatcher_test PRIVATE ${RT}/kernel ${RT}/thirdparty/o1heap ${ROOT}/ppc
+        ${ROOT}/tools/XenonRecomp/XenonUtils ${ROOT}/tools/XenonRecomp/thirdparty/simde)
+else()
+    message(STATUS "write_watch_test and kernel_dispatcher_test left out: they need ppc/ (scripts/recompile.sh) and tools/XenonRecomp (scripts/setup_tools.sh)")
+endif()
 # The guest vblank lock's closed-loop simulation (a tool more than a test).
 add_executable(vblank_lock_sim ${CMAKE_CURRENT_SOURCE_DIR}/vblank_lock_sim.cpp ${RT}/video/refresh_fit.cpp ${RT}/video/vblank_lock.cpp)
 target_include_directories(vblank_lock_sim PRIVATE ${RT})

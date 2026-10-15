@@ -1209,7 +1209,78 @@ namespace update
                 return kReleasesPage;
         if (url.find("/../") != std::string_view::npos || url.find("/./") != std::string_view::npos || url.ends_with("/.."))
             return kReleasesPage;
+        // A '%' only as an escape (two hex digits), and never one of a dot, a
+        // slash, a backslash or a '%' itself: the browser decodes %2e as a dot
+        // when it resolves the path (releases/%2e%2e/%2e%2e/x is
+        // github.com/SpeedBreakerProject/x, outside this project's releases),
+        // and a server may decode %2f and %5c into separators, or %25 into
+        // either of those, to the same effect. Nor of a control character or
+        // a byte outside ASCII. A release's page needs none of them (its tag
+        // is a version: letters, digits, '.', '-' and '+'), so only a forged
+        // answer has one.
+        auto hex = [](char c) {
+            return IsDigit(c) ? int(c - '0') : (Lower(c) >= 'a' && Lower(c) <= 'f') ? int(Lower(c) - 'a' + 10) : -1;
+        };
+        for (size_t i = url.find('%'); i != std::string_view::npos; i = url.find('%', i + 1))
+        {
+            if (i + 2 >= url.size() || hex(url[i + 1]) < 0 || hex(url[i + 2]) < 0)
+                return kReleasesPage;
+            const int byte = hex(url[i + 1]) * 16 + hex(url[i + 2]);
+            if (byte == '.' || byte == '/' || byte == '\\' || byte == '%' || byte < 0x20 || byte >= 0x7F)
+                return kReleasesPage;
+        }
         return std::string(url);
+    }
+
+    OverrideUrl ClassifyOverrideUrl(std::string_view url)
+    {
+        if (url.starts_with("https://"))
+            return url.size() > 8 && url[8] != '/' ? OverrideUrl::Https : OverrideUrl::Refused;
+        if (!url.starts_with("http://"))
+            return OverrideUrl::Refused;
+        // The authority (up to the path, query or fragment). No user part:
+        // "http://127.0.0.1@example.com/" goes to example.com.
+        std::string_view host = url.substr(7);
+        host = host.substr(0, host.find_first_of("/?#"));
+        if (host.find('@') != std::string_view::npos)
+            return OverrideUrl::Refused;
+        // Without its port (digits only).
+        if (host.starts_with('['))
+        {
+            const size_t close = host.find(']');
+            if (close == std::string_view::npos)
+                return OverrideUrl::Refused;
+            std::string_view port = host.substr(close + 1);
+            host = host.substr(0, close + 1);
+            if (!port.empty() && (!port.starts_with(':') || port.size() == 1 ||
+                                     !std::all_of(port.begin() + 1, port.end(), [](char c) { return IsDigit(c); })))
+                return OverrideUrl::Refused;
+            return host == "[::1]" ? OverrideUrl::LocalHttp : OverrideUrl::Refused;
+        }
+        if (const size_t colon = host.find(':'); colon != std::string_view::npos)
+        {
+            std::string_view port = host.substr(colon + 1);
+            if (port.empty() || !std::all_of(port.begin(), port.end(), [](char c) { return IsDigit(c); }))
+                return OverrideUrl::Refused;
+            host = host.substr(0, colon);
+        }
+        if (EqualNoCase(host, "localhost"))
+            return OverrideUrl::LocalHttp;
+        // 127.0.0.0/8, written as four decimal numbers of 0-255 (no other
+        // spelling: "127.1" or "0x7f.0.0.1" are left to the strict rule).
+        int parts = 0;
+        for (std::string_view rest = host; parts < 4; parts++)
+        {
+            const size_t dot = rest.find('.');
+            std::string_view part = rest.substr(0, dot);
+            if (part.empty() || part.size() > 3 || !std::all_of(part.begin(), part.end(), [](char c) { return IsDigit(c); }) ||
+                std::stoi(std::string(part)) > 255 || (parts == 0 && part != "127"))
+                return OverrideUrl::Refused;
+            if (dot == std::string_view::npos)
+                return parts == 3 ? OverrideUrl::LocalHttp : OverrideUrl::Refused;
+            rest = rest.substr(dot + 1);
+        }
+        return OverrideUrl::Refused;
     }
 
     Result Evaluate(const Fetched& fetched, std::string_view current, int64_t now)

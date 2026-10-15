@@ -40,7 +40,7 @@ for p in "$ROOT"/patches/ffmpeg/*.patch; do patch -s -p1 < "$p"; done
 make -j"$(sysctl -n hw.ncpu 2>/dev/null || nproc)" > "$WORK/make.log"
 make install DESTDIR="$WORK/stage" > "$WORK/install.log"
 # The default prefix (/usr/local) inside the stage, moved to its place.
-rm -rf "$PREFIX/include" "$PREFIX/lib"
+rm -rf "${PREFIX:?}/include" "${PREFIX:?}/lib"
 mv "$WORK/stage/usr/local/include" "$WORK/stage/usr/local/lib" "$PREFIX/"
 # The check: no folder of this machine in the libraries.
 for lib in "$PREFIX"/lib/libavcodec.a "$PREFIX"/lib/libavutil.a; do

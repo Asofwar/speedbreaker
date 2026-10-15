@@ -36,8 +36,7 @@ You get `~/Games/SpeedBreaker/`. To check the download first (optional):
 `cd ~/Downloads && sha256sum -c SpeedBreaker-steamos-arm64.tar.xz.sha256`
 should say OK.
 
-Keep the folder on the Frame's internal storage, and don't use `:`, `;` or
-`$` in the names of the folders it's in: the game can't start from there.
+Keep the folder on the Frame's internal storage.
 
 To update later, unpack the newer download over the same folder (the same
 command). Your Steam shortcut keeps working, and your saves, settings and the

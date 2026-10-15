@@ -137,6 +137,16 @@ namespace update
     // `current`: the running version; `now`: Unix seconds (a rate limit's reset).
     Result Evaluate(const Fetched& fetched, std::string_view current, int64_t now);
     // The page to open and show as a QR code: `url` if it is a page of this
-    // project's releases (plain characters, a sane length), else kReleasesPage.
+    // project's releases (plain characters, a sane length, no dot segments,
+    // no escaped dot, slash, backslash or '%'), else kReleasesPage.
     std::string SafePageUrl(std::string_view url);
+
+    // The test hook NFSMW_UPDATE_URL=<address> (update/updater.h) works in
+    // every build, so what it may point the check at is limited: https to
+    // any host (the certificate checked as for GitHub), plain http only to
+    // this machine (localhost, 127.x.x.x, [::1]: the local test server it is
+    // for), never with a user part. Refused: anything else, which is then
+    // never asked.
+    enum class OverrideUrl : uint8_t { Https, LocalHttp, Refused };
+    OverrideUrl ClassifyOverrideUrl(std::string_view url);
 }

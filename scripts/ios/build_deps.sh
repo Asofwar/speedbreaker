@@ -26,6 +26,7 @@ IOS_MIN=17.0
 JOBS=${JOBS:-$(sysctl -n hw.ncpu)}
 SDK=$(xcrun -sdk iphoneos --show-sdk-path) || { echo "build_deps.sh: no iOS SDK (install Xcode, or set DEVELOPER_DIR)" >&2; exit 1; }
 
+# shellcheck disable=SC2100  # a file name, not arithmetic
 SDL3=SDL3-3.4.16.tar.gz
 SDL3_URL=https://github.com/libsdl-org/SDL/releases/download/release-3.4.16/$SDL3
 SDL3_SHA256=7322236cd12090c3eb40b9728be4d49c76f66ad17d04369584d4ecad5cf77c68

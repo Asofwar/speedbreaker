@@ -1,0 +1,46 @@
+# Line endings: LF in every checkout, whatever the machine's Git settings. A
+# checkout with CRLF (Git for Windows' core.autocrlf=true, a WSL or Docker
+# build from a Windows clone) breaks the shell scripts ("/usr/bin/env:
+# 'bash\r': No such file or directory"), `git am` of patches/xenonrecomp/*.patch
+# (their context lines no longer match XenonRecomp's), the instruction tests'
+# assembly, and the TOML the recompiler reads. Every text file is stored with
+# LF already: this only keeps checkouts that way.
+* text=auto eol=lf
+
+# Text, always (never left to Git's guess).
+*.sh text eol=lf
+*.py text eol=lf
+*.s text eol=lf
+*.patch text eol=lf
+*.toml text eol=lf
+*.cmake text eol=lf
+CMakeLists.txt text eol=lf
+*.c text eol=lf
+*.h text eol=lf
+*.cpp text eol=lf
+*.inc text eol=lf
+*.mm text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.plist text eol=lf
+*.entitlements text eol=lf
+*.pbxproj text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
+
+# Binary: never converted, never diffed as text.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
+*.icns binary
+*.ttf binary
+*.otf binary
+
+# o1heap's two sources are stored as upstream ships them, with CRLF: left
+# exactly as they are (normalizing them would change every line).
+runtime/thirdparty/o1heap/o1heap.c -text
+runtime/thirdparty/o1heap/o1heap.h -text

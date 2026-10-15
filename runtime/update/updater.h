@@ -10,9 +10,12 @@
 //   NFSMW_TEST_VERSION=0.0.9    compare as this version instead of the
 //                               build's (the real v0.1.0 then shows as
 //                               available); the [build] line keeps the real one
-//   NFSMW_UPDATE_URL=<url>      ask this http(s) address instead of GitHub's
-//                               API (a local server: 403s, slow answers,
-//                               refused connections)
+//   NFSMW_UPDATE_URL=<url>      ask this https address, or a plain http one on
+//                               this machine only (localhost, 127.x.x.x,
+//                               [::1]: a local server for 403s, slow answers,
+//                               refused connections), instead of GitHub's
+//                               API; any other address is refused
+//                               (update/check.h, ClassifyOverrideUrl)
 //   NFSMW_UPDATE_URL=<file>     answer from this file, read whole, no network:
 //                               a raw HTTP answer ("HTTP/1.1 403 rate limit
 //                               exceeded", headers, a blank line, the body, as

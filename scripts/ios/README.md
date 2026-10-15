@@ -164,8 +164,8 @@ race, with the same code as the iOS app:
 ### 1. The game's code
 
 On the Mac, follow [Building from source](../../README.md#building-from-source) steps 1 and 2:
-`scripts/setup_tools.sh`, your disc's `default.xex` in `game/files`, and XenonRecomp, which
-writes `ppc/`. You don't need the Mac build itself (step 3).
+`scripts/setup_tools.sh`, your disc's `default.xex` in `game/files`, and `scripts/recompile.sh`,
+which runs XenonRecomp to write `ppc/`. You don't need the Mac build itself (step 3).
 
 ### 2. The iOS libraries
 
