@@ -13,9 +13,10 @@
 // left every voice empty for half of each burst: gameplay audio came out
 // chopped 50% (two frames on, two off), thin and "tinny". SDL's queue is
 // kept near two device buffers to absorb the device's pulls, and the
-// cadence gains or skips a frame to follow the device clock. NFSMW_MUTE=1
-// (or no audio device) keeps the same cadence with no output. The driver
-// handle and wrapped argument follow Xenia.
+// cadence gains or skips a frame to follow the device clock. A device that
+// stops taking audio doesn't stop the cadence (apu::RenderCadence, GitHub
+// issue #20). NFSMW_MUTE=1 (or no audio device) keeps the same cadence with
+// no output. The driver handle and wrapped argument follow Xenia.
 //
 // While the game is suspended (iOS: the app isn't the active one) the
 // cadence stands still with guest time and the main thread pauses the
@@ -33,6 +34,7 @@
 #endif
 #include <user/settings.h>
 #include <video/presenter.h>
+#include <video/vblank_timer.h>
 
 namespace
 {
@@ -51,7 +53,11 @@ namespace
     // a suspension can't slip between the check and the start.
     std::mutex s_streamMutex;
     SDL_AudioStream* s_stream = nullptr;
+    // apu::SuspendOutput's pause is in force (until apu::ResumeOutput): the
+    // stall watchdog then leaves the paused device alone.
+    std::atomic<bool> s_outputHeld{ false };
     constexpr int FRAME_BYTES = SAMPLES_PER_FRAME * CHANNELS * sizeof(float);
+    static_assert(FRAME_BYTES == apu::RenderCadence::kFrameBytes, "the cadence counts the queue in these frames");
     std::atomic<int> s_targetFrames{ 4 };  // SDL queue level to hold (frames of 256 samples)
     int s_deviceFrames = 0;                // the device's buffer at the stream's rate (FollowDevice)
 
@@ -97,11 +103,12 @@ namespace
             return;
         }
         {
-            // It opens paused. Opened while the game is suspended, it stays
-            // so until apu::ResumeOutput starts it.
+            // It opens paused. Opened while the game is suspended (or the
+            // output held by apu::SuspendOutput), it stays so until
+            // apu::ResumeOutput starts it.
             std::lock_guard lock(s_streamMutex);
             s_stream = stream;
-            if (!guesttime::Suspended())
+            if (!guesttime::Suspended() && !s_outputHeld)
                 SDL_ResumeAudioStreamDevice(s_stream);
         }
         FollowDevice(true);
@@ -129,6 +136,30 @@ namespace
         GuestThreadContext ctx(0);
         SetHostThreadName("nfsmw-audio");
         constexpr auto INTERVAL = nanoseconds(1000000000ull * SAMPLES_PER_FRAME / SAMPLE_RATE);
+        // macOS: real-time scheduling as well, as the vblank's thread has it
+        // (video/vblank_timer.h): there an ordinary thread's sleeps ran 3.2 ms
+        // late at the median and up to 9 ms, at the user-interactive class
+        // too, more than a tick. Asked for after the QoS class, which a
+        // real-time thread can't take. The constraint is one period: a tick
+        // is due by the next. The computation is half of it: unlike the
+        // vblank's handler (microseconds) a tick does real work, the game's
+        // mixer and the XMA passes it kicks (FFmpeg, several frames for a
+        // stream that starts), and half the constraint is also the least the
+        // kernel grants. The [audio] thread line each minute reports the
+        // ticks' work to check it against. NFSMW_AUDIO_TIMER=sleep keeps the
+        // ordinary thread (an A/B switch). iOS keeps the ordinary thread
+        // either way, as the vblank's does there.
+        const char* timerEnv = std::getenv("NFSMW_AUDIO_TIMER");
+        const bool ordinary = timerEnv && strcmp(timerEnv, "sleep") == 0;
+        const bool realtime = !ordinary && video::PrepareRealTimeThread(INTERVAL.count(), INTERVAL.count() / 2, INTERVAL.count());
+        const char* timerName = realtime ? "real-time" : ordinary ? "ordinary (NFSMW_AUDIO_TIMER=sleep)" : "ordinary";
+        video::VblankTiming timing;  // per tick: how late it woke, how long its work took
+        uint64_t ticks = 0;
+        apu::RenderCadence cadence;
+        // Logged for the first stalls only: a device that kept stalling would
+        // fill the log.
+        constexpr uint32_t LOGGED_STALLS = 10;
+        uint32_t stalls = 0;
         // The time suspended that `next` allows for. Both taken while running
         // (XAudio can start this thread in a suspension): `next` is a host
         // time at which `paused` held.
@@ -143,19 +174,23 @@ namespace
         while (s_running)
         {
             std::this_thread::sleep_until(next);
+            const auto woke = steady_clock::now();
             // No guest audio time passes while the game is suspended: render
             // nothing (the main thread has paused the device). After it the
             // cadence moves on by exactly the time suspended, keeping its
             // phase in guest time (the movies' clock follows the audio
             // played): no frame is owed, and the queue is still at its
-            // level, so there is no burst either.
+            // level, so there is no burst either. Nor is the paused device a
+            // stall: the ticks over the target start over.
             guesttime::WaitWhileSuspended();
             if (int64_t nowPaused = guesttime::PausedNs(); nowPaused != paused)
             {
                 next += nanoseconds(nowPaused - paused);
                 paused = nowPaused;
+                cadence.AfterSuspension();
                 continue;
             }
+            const int64_t late = duration_cast<nanoseconds>(woke - next).count();
             next += INTERVAL;
             auto now = steady_clock::now();
             if (next < now - milliseconds(100))
@@ -172,17 +207,51 @@ namespace
                     FollowDevice(false);
                 }
                 // Follow the device clock: one frame more or less when the
-                // queue drifts from its target.
-                int queued = SDL_GetAudioStreamQueued(s_stream) / FRAME_BYTES;
-                if (queued > s_targetFrames + 2)
-                    frames = 0;
-                else if (queued < s_targetFrames - 2)
-                    frames = 2;
+                // queue drifts from its target, and one a tick, dropping what
+                // the device doesn't take, while it takes nothing at all.
+                int queued = SDL_GetAudioStreamQueued(s_stream);
+                apu::RenderCadence::Step step = cadence.Next(queued, s_targetFrames);
+                if (step.event == apu::RenderCadence::Event::Stalled)
+                {
+                    // Nothing should leave the device paused while the game
+                    // runs (apu::ResumeOutput starts it unless suspended), but
+                    // one that was would look just like this. A pause asked
+                    // for (apu::SuspendOutput: the game suspended, or a lost
+                    // GPU's message on screen) stays.
+                    bool devicePaused = SDL_AudioStreamDevicePaused(s_stream);
+                    if (++stalls <= LOGGED_STALLS)
+                        fprintf(stderr, "[audio] the output took no audio for %.1f s (queued %.1f ms, target %.1f ms, device buffer %d samples%s): "
+                            "rendering goes on at 48 kHz, unheard, until it takes audio again%s\n",
+                            apu::RenderCadence::kStallTicks * apu::kFrameNs / 1e9, 1000.0 * std::max(queued, 0) / (CHANNELS * sizeof(float) * SAMPLE_RATE),
+                            1000.0 * s_targetFrames * SAMPLES_PER_FRAME / SAMPLE_RATE, s_deviceFrames, devicePaused ? ", device paused" : "",
+                            stalls == LOGGED_STALLS ? " (further stalls not logged)" : "");
+                    if (devicePaused && !s_outputHeld)
+                        apu::ResumeOutput();
+                }
+                else if (step.event == apu::RenderCadence::Event::Restored && stalls <= LOGGED_STALLS)
+                {
+                    fprintf(stderr, "[audio] the output takes audio again after %.1f s\n",
+                        double(apu::RenderCadence::kStallTicks + cadence.StalledTicks()) * apu::kFrameNs / 1e9);
+                }
+                if (step.clear)
+                    SDL_ClearAudioStream(s_stream);
+                frames = step.frames;
             }
             for (int i = 0; i < frames && !guesttime::Suspended(); i++)
             {
                 RenderFrame(ctx);
                 s_rendered.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (s_stream && cadence.Stalled())
+                cadence.Rendered(SDL_GetAudioStreamQueued(s_stream));
+            // Each minute: how late the last 3600 ticks (19 s) woke, and how
+            // long their work took, against the scheduling asked for above.
+            timing.Add(late, duration_cast<nanoseconds>(steady_clock::now() - now).count());
+            if (++ticks % (60 * SAMPLE_RATE / SAMPLES_PER_FRAME) == 0)
+            {
+                video::VblankTiming::Summary t = timing.Summarize();
+                fprintf(stderr, "[audio] thread %s: ticks late %.2f ms (median), %.2f ms (99%%), %.2f ms at most; work %.2f ms (99%%)\n",
+                    timerName, t.lateMedianNs / 1e6, t.late99Ns / 1e6, t.lateMaxNs / 1e6, t.handler99Ns / 1e6);
             }
         }
     }
@@ -193,6 +262,7 @@ namespace apu
     void SuspendOutput()
     {
         std::lock_guard lock(s_streamMutex);
+        s_outputHeld = true;
         if (s_stream)
             SDL_PauseAudioStreamDevice(s_stream);
     }
@@ -200,7 +270,10 @@ namespace apu
     void ResumeOutput()
     {
         std::lock_guard lock(s_streamMutex);
-        if (s_stream && !guesttime::Suspended())
+        if (guesttime::Suspended())
+            return;
+        s_outputHeld = false;
+        if (s_stream)
             SDL_ResumeAudioStreamDevice(s_stream);
     }
 

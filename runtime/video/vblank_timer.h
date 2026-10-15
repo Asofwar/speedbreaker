@@ -29,6 +29,14 @@ namespace video
 
     // NFSMW_VBLANK_TIMER=sleep: Ordinary; otherwise RealTime.
     VblankTimer ChosenVblankTimer();
+    // The calling thread, once, before its first sleep: on macOS the
+    // time-constraint policy for work that wakes every `periodNs`, needs up
+    // to `computationNs` of CPU and is due `constraintNs` after waking (the
+    // kernel raises a computation under half the constraint to that half).
+    // True: real-time scheduling was granted. Elsewhere (iOS too) false, and
+    // the thread stays as it is. The vblank's thread and audio's render
+    // thread (apu/audio.cpp) both ask for it.
+    bool PrepareRealTimeThread(int64_t periodNs, int64_t computationNs, int64_t constraintNs);
     // The calling thread, once, before its first sleep: its scheduling for
     // vblanks `periodNs` apart. True: real-time scheduling was granted.
     bool PrepareVblankThread(VblankTimer timer, int64_t periodNs);

@@ -8,7 +8,7 @@
 #ifdef __APPLE__
 #include <TargetConditionals.h>
 #endif
-// macOS only: iOS keeps the ordinary thread (its vblank timing hasn't been measured).
+// macOS only: iOS keeps ordinary threads (their timing there hasn't been measured).
 #if defined(__APPLE__) && !TARGET_OS_IOS
 #define SB_REALTIME_VBLANK 1
 #include <mach/mach.h>
@@ -49,6 +49,24 @@ namespace video
         return v && std::string_view(v) == "sleep" ? VblankTimer::Ordinary : VblankTimer::RealTime;
     }
 
+    bool PrepareRealTimeThread(int64_t periodNs, int64_t computationNs, int64_t constraintNs)
+    {
+#ifdef SB_REALTIME_VBLANK
+        thread_time_constraint_policy_data_t policy{};
+        policy.period = ToMach(periodNs);
+        policy.computation = ToMach(computationNs);
+        policy.constraint = ToMach(constraintNs);
+        policy.preemptible = 1;
+        return thread_policy_set(pthread_mach_thread_np(pthread_self()), THREAD_TIME_CONSTRAINT_POLICY,
+                   reinterpret_cast<thread_policy_t>(&policy), THREAD_TIME_CONSTRAINT_POLICY_COUNT) == KERN_SUCCESS;
+#else
+        (void)periodNs;
+        (void)computationNs;
+        (void)constraintNs;
+        return false;
+#endif
+    }
+
     bool PrepareVblankThread(VblankTimer timer, int64_t periodNs)
     {
 #ifdef SB_REALTIME_VBLANK
@@ -56,13 +74,7 @@ namespace video
             return false;
         // Woken at its time, ahead of the game's own threads: it runs the
         // guest's vblank handler (microseconds) and sleeps again.
-        thread_time_constraint_policy_data_t policy{};
-        policy.period = ToMach(periodNs);
-        policy.computation = ToMach(1'000'000);
-        policy.constraint = ToMach(2'000'000);
-        policy.preemptible = 1;
-        return thread_policy_set(pthread_mach_thread_np(pthread_self()), THREAD_TIME_CONSTRAINT_POLICY,
-                   reinterpret_cast<thread_policy_t>(&policy), THREAD_TIME_CONSTRAINT_POLICY_COUNT) == KERN_SUCCESS;
+        return PrepareRealTimeThread(periodNs, 1'000'000, 2'000'000);
 #else
         (void)timer;
         (void)periodNs;
