@@ -3,7 +3,8 @@
 // XAM user/profile exports for the single local, signed-in user 0.
 // Semantics follow Xenia (BSD): kernel/xam/xam_user.cc and user_profile.cc.
 // Title-specific profile settings (the blobs games keep their options in)
-// are stored and persisted to <user path>/profile_settings.bin.
+// are stored and persisted to <user path>/profile_settings.bin (with
+// NFSMW_SAVE_DIR set, that folder's: user/paths.h).
 #include <stdafx.h>
 #include <kernel/function.h>
 #include <kernel/overlapped.h>
@@ -98,9 +99,10 @@ namespace
     std::map<uint32_t, std::vector<uint8_t>> s_blobs;  // title-specific binary settings
     bool s_loaded = false;
 
+    // Beside the saves: in NFSMW_SAVE_DIR when that is set (user/paths.h).
     std::filesystem::path BlobPath()
     {
-        return GetUserPath() / "profile_settings.bin";
+        return GetSaveRootPath() / "profile_settings.bin";
     }
 
     // File: repeated { u32 id, u32 size, bytes } (host order).

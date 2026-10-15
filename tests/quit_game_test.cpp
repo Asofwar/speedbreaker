@@ -349,11 +349,13 @@ namespace
             renderer |= Has(main[i], "gpu::renderer::Shutdown()");
             video |= Has(main[i], "video::Shutdown()");
             flush |= Has(main[i], "report::FlushLog()");
-            exit0 |= Has(main[i], "std::_Exit(0)");
-            otherExit |= (Has(main[i], "_Exit(") || Has(main[i], "exit(")) && !Has(main[i], "std::_Exit(0)");
+            // 0, or a timedemo replay's benchmark status (debug/bench.h).
+            const bool exitLine = Has(main[i], "std::_Exit(0)") || Has(main[i], "std::_Exit(bench::Enabled() ? bench::ExitCode() : 0)");
+            exit0 |= exitLine;
+            otherExit |= (Has(main[i], "_Exit(") || Has(main[i], "exit(")) && !exitLine;
         }
         CHECK(save && renderer && video && flush, "after the loop: settings saved, renderer and video shut down, log flushed");
-        CHECK(exit0 && !otherExit, "exit code 0");
+        CHECK(exit0 && !otherExit, "exit code 0 (a timedemo benchmark's status when one ran)");
     }
 }
 

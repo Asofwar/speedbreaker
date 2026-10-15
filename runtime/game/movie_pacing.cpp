@@ -45,8 +45,10 @@
 // guard (default 10, at most 12). Each movie leaves a [movie] line: its
 // frames by vblanks shown, and those held.
 #include <stdafx.h>
+#include "timedemo.h"
 
 #include <cpu/guest_time.h>
+#include <debug/bench.h>
 #include <kernel/function.h>
 #include <video/presenter.h>
 #include <video/refresh_fit.h>
@@ -113,6 +115,28 @@ PPC_FUNC(sub_826E8CF8)
 
 PPC_FUNC(sub_825985A0)
 {
+    // A timedemo's uncapped replay (game/timedemo.h): every swap goes as
+    // soon as the GPU is done with it. With interval 0 the callback's count
+    // of vblanks to wait is never above 0, so it compares the beam position
+    // with the threshold: the runtime pins the beam at 100% (V_COUNTER 720
+    // of 720), at or under a threshold of 100%, and the callback releases
+    // the swap itself. The vsync thread only counts vblanks then. The movie
+    // hold below would put a vblank back, so it is skipped too.
+    //
+    // With the recorder on, only while it measures (debug/bench.h): before
+    // its window the replay is paced as the capture was, since movies and the
+    // race's intro run on real time and the game's next frames must meet
+    // them where the log has them (a whole replay uncapped can fall out of
+    // step where the intro hands over to the race).
+    if (timedemo::Replaying() && timedemo::Uncapped() && (!bench::Enabled() || bench::Measuring()))
+    {
+        static std::atomic<bool> s_said{ false };
+        if (!s_said.exchange(true, std::memory_order_relaxed))
+            fprintf(stderr, "[timedemo] uncapped: swaps released without vblank\n");
+        ctx.r3.u64 = timedemo::kUncappedSwap;
+        __imp__sub_825985A0(ctx, base);
+        return;
+    }
     uint32_t arg = ctx.r3.u32;
     __imp__sub_825985A0(ctx, base);
 

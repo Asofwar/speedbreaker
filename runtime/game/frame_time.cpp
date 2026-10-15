@@ -40,10 +40,22 @@
 // that leaves owed, so game time keeps up down to 10 fps. At Frame Rate 30
 // (video::GuestVblankDivider) a guest vblank comes every other refresh and is
 // given 2/60 s: two steps a frame, the game at its speed.
+//
+// A timedemo (game/timedemo.h) takes its own path. Its capture logs every
+// frame's time and its replay plays those back whatever r3 says, so whole
+// vblanks, which follow the host's display, would only make the capture
+// depend on the machine it was made on: a capture with a fixed step gives
+// each frame exactly 1/60 s instead (the quantiser hands out 60, 60, 59
+// 3600ths of a second, the 4000 Hz clock +67, +67, +66). The stepper's
+// rounding below isn't in the log, so it runs in capture and replay alike,
+// whatever NFSMW_GAME_TIME and the display: one step a frame from those
+// ticks, and the same steps from the same ticks in every run.
 #include <stdafx.h>
 #include "frame_time.h"
+#include "timedemo.h"
 #include "whole_vblanks.h"
 
+#include <debug/bench.h>
 #include <kernel/function.h>
 #include <video/presenter.h>
 #include <video/vblank_lock.h>
@@ -127,6 +139,21 @@ void GameFrameTime(PPCRegister& r3)
             video::LastGuestVblank();
         s_line = { measuredMs, double(since) / 1e3, vblanks, 0, -1, false, true };
     }
+    // A timedemo's frame (before the frame runs), the benchmark's, and a
+    // capture's fixed step (see the top).
+    if (timedemo::Active())
+    {
+        timedemo::OnMainFrame();
+        bench::OnMainFrame();
+        if (timedemo::FixedStep())
+        {
+            r3.u64 = timedemo::kFixedFrame;
+            s_snapped.fetch_add(1, std::memory_order_relaxed);
+            s_line.snapped = true;
+            s_line.given = 1;
+            return;
+        }
+    }
     if (!s_enabled)
         return;
     double refreshMs = video::GuestVblank().PeriodNs() / 1e6;
@@ -150,7 +177,8 @@ void GameFrameTime(PPCRegister& r3)
 // the elapsed time in steps (f9 the remainder it joins).
 void WorldStepTime(PPCRegister& f10)
 {
-    if (!s_enabled || !NearSixty(video::GuestVblank().PeriodNs() / 1e6))
+    // A timedemo rounds whatever the display and NFSMW_GAME_TIME (see the top).
+    if (!timedemo::Active() && (!s_enabled || !NearSixty(video::GuestVblank().PeriodNs() / 1e6)))
         return;
     double k = std::round(f10.f64);
     if (k >= 1 && k <= 6 && std::abs(f10.f64 - k) <= 0.05)

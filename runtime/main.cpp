@@ -21,6 +21,8 @@
 #include <hid/input.h>
 #include <cpu/guest_thread.h>
 #include <cpu/host_cpu.h>
+#include <debug/bench.h>
+#include <game/timedemo.h>
 #include <install/install_cli.h>
 #include <install/installer.h>
 #include <install/locate.h>
@@ -503,9 +505,12 @@ int main(int argc, char** argv)
                 // instead of the previous one. The guest still runs here and
                 // may need the GPU for it, so before the renderer stops.
                 vfs::WaitForStagedFiles(std::chrono::seconds(2));
+                // A timedemo's capture: its log's tail and its .json, while
+                // the game's main loop still runs to write it out.
+                timedemo::FinishCapture();
                 gpu::renderer::Shutdown();
                 report::FlushLog();
-                std::_Exit(0);
+                std::_Exit(bench::Enabled() ? bench::ExitCode() : 0);
             }).detach();
 
     std::filesystem::path xexPath;
@@ -638,6 +643,11 @@ int main(int argc, char** argv)
     module::Initialize(file, uint32_t(image.base), image.size, uint32_t(image.entry_point));
     WireImports(file);
 
+    // A timedemo (game/timedemo.h): its mode in the log, and a capture's save
+    // snapshot, before the game can read the save (a replay without its log
+    // ends here).
+    timedemo::Start(sha);
+
     GuestMainParams params{ uint32_t(image.entry_point), DEFAULT_GUEST_STACK };
     if (auto* stack = static_cast<const be<uint32_t>*>(getOptHeaderPtr(file.data(), XEX_HEADER_DEFAULT_STACK_SIZE)))
         params.stackSize = std::max<uint32_t>(*stack, DEFAULT_GUEST_STACK);
@@ -693,10 +703,14 @@ int main(int argc, char** argv)
         settings::Save();
     // As above for the launcher's exit: a save being written finishes first.
     vfs::WaitForStagedFiles(std::chrono::seconds(2));
+    // And a timedemo's capture (its quit may be NFSMW_TIMEDEMO_CAPTURE_SECONDS').
+    timedemo::FinishCapture();
     gpu::renderer::Shutdown();
     video::Shutdown();
     // The session log's last lines are still in its pipe: let them out
     // before _Exit takes the thread that copies them.
     report::FlushLog();
-    std::_Exit(0);
+    // 0, or a timedemo replay's benchmark status for the script that ran it
+    // (debug/bench.h: 2 setup, log ended or timeout, 3 diverged, 4 interrupted).
+    std::_Exit(bench::Enabled() ? bench::ExitCode() : 0);
 }

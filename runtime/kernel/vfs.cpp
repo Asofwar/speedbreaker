@@ -3,6 +3,7 @@
 #include "vfs.h"
 #include "xam.h"
 
+#include <game/timedemo.h>
 #include <user/paths.h>
 
 namespace vfs
@@ -100,6 +101,17 @@ namespace vfs
 
     std::optional<Resolved> Resolve(std::string_view guestPath, bool mustExist)
     {
+        // A timedemo (game/timedemo.h): the game's own Joylog file,
+        // d:\CaptureJoylog.jlg or d:\ReplayJoylog.jlg, is the timedemo's log.
+        // The disc is read-only, so a capture would fail to open and switch
+        // itself off. No content root: the game appends to it in place
+        // (opened again for each write-out, at its end), never staged.
+        if (timedemo::Active())
+        {
+            bool readOnly = true;
+            if (auto joylog = timedemo::RedirectJoylog(guestPath, readOnly))
+                return Resolved{ *joylog, readOnly };
+        }
         auto root = Root(guestPath);
         if (!root)
         {

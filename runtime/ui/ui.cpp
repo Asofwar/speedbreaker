@@ -3,6 +3,7 @@
 #include "ui.h"
 #include "cursor_idle.h"
 
+#include <game/timedemo.h>
 #include <kernel/xam.h>
 #include <report/report.h>
 #include <user/settings.h>
@@ -1038,8 +1039,10 @@ namespace ui
         // The game as it is now, before it pauses: a bug report's screenshot.
         report::NoteMenuOpened();
         // As the 360's Guide does: the game pauses (a race doesn't carry on
-        // under the menu).
-        XamNotifySystemUi(true);
+        // under the menu). Not in a timedemo's replay, whose log has no
+        // pause here (game/timedemo.h: the run is marked interrupted).
+        if (!timedemo::OnSystemUi(true))
+            XamNotifySystemUi(true);
     }
 
     void CloseSettings()
@@ -1051,7 +1054,8 @@ namespace ui
         ForgetUpdateDialog();
         ForgetQuitPrompt();
         report::NoteMenuClosed();
-        XamNotifySystemUi(false);
+        if (!timedemo::OnSystemUi(false))
+            XamNotifySystemUi(false);
         if (settings::Dirty() && !settings::Save())
             Toast(settings::LastError());
     }

@@ -2,6 +2,7 @@
 #include <stdafx.h>
 #include "input.h"
 #include <cpu/guest_time.h>
+#include <game/timedemo.h>
 #include <kernel/function.h>
 #include <ui/ui.h>
 #include <user/settings.h>
@@ -91,9 +92,19 @@ namespace
     }
 
     // A scripted input: buttons (or analog: RT/LT triggers, LL/LR/LU/LD left
-    // stick) held over [time, time + duration).
-    struct ScriptTap { double time; uint16_t buttons; int16_t lx, ly; double duration = 0.15; uint8_t lt = 0, rt = 0; };
+    // stick) held over [time, time + duration), in seconds since launch, or
+    // since a race loaded (`race`); a `menuOnly` one only until then.
+    struct ScriptTap
+    {
+        double time;
+        uint16_t buttons;
+        int16_t lx, ly;
+        double duration = 0.15;
+        uint8_t lt = 0, rt = 0;
+        bool race = false, menuOnly = false;
+    };
     std::vector<ScriptTap> s_script;
+    constexpr uint32_t kRaceFlow = 6;  // GameFlowState once a race has loaded (game/timedemo.h)
     // Guest ns at launch: the script and the virtual pad run on guest time,
     // so a press due while the game is suspended comes after it instead of
     // being lost.
@@ -162,10 +173,18 @@ namespace
             if (colon == std::string::npos)
                 continue;
             // "sec:BUTTON", "from-to/step:BUTTON" (a tap every `step` s) or
-            // "from~to:BUTTON" (held).
+            // "from~to:BUTTON" (held). A leading "m" keeps the item to the
+            // menus (it stops once a race has loaded: menu taps that go on
+            // until the game gets there, however long its menus take); a
+            // leading "r" counts its times from the race's load (GameFlowState
+            // 6, game/timedemo.h) instead of the launch: "m30-300/4:A,r5~r95:RT"
+            // drives a race that starts whenever the menus get to it.
             std::string when = item.substr(0, colon);
             std::string name = item.substr(colon + 1);
             ScriptTap proto{ 0, ButtonByName(name), 0, 0 };
+            for (; !when.empty() && (when[0] == 'm' || when[0] == 'r'); when.erase(0, 1))
+                (when[0] == 'm' ? proto.menuOnly : proto.race) = true;
+            std::erase(when, 'r');  // "r5~r95": the end's prefix too
             if (name == "RT") proto.rt = 255;
             else if (name == "LT") proto.lt = 255;
             else if (name == "LL") proto.lx = -32767;
@@ -215,8 +234,19 @@ namespace
         if (s_script.empty())
             return;
         double t = SecondsSinceLaunch();
+        // The race's clock starts at the first poll that finds a race loaded.
+        static std::atomic<double> raceStart{ -1.0 };
+        if (raceStart.load(std::memory_order_relaxed) < 0 && timedemo::FlowState() == kRaceFlow)
+            raceStart.store(t, std::memory_order_relaxed);
+        const double sinceRace = raceStart.load(std::memory_order_relaxed);
         for (const auto& tap : s_script)
-            if (t >= tap.time && t < tap.time + tap.duration)
+        {
+            if (tap.menuOnly && sinceRace >= 0)
+                continue;
+            if (tap.race && sinceRace < 0)
+                continue;
+            const double at = tap.race ? t - sinceRace : t;
+            if (at >= tap.time && at < tap.time + tap.duration)
             {
                 p.buttons |= tap.buttons;
                 p.leftTrigger = std::max(p.leftTrigger, tap.lt);
@@ -224,6 +254,7 @@ namespace
                 if (tap.lx) p.lx = tap.lx;
                 if (tap.ly) p.ly = tap.ly;
             }
+        }
     }
 
     const bool s_scriptParsed = (ParseScript(), true);

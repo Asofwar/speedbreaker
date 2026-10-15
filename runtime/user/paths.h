@@ -145,7 +145,27 @@ inline std::filesystem::path GetCachePath()
 // log once that is open.
 std::string MigrateUserFolders();
 
+// NFSMW_SAVE_DIR=<folder>: the game's saves (<folder>/save) and its profile
+// settings (<folder>/profile_settings.bin) there instead of in the user
+// folder. A timedemo's replay (game/timedemo.h) must start from the save its
+// capture had, and may autosave: each run gets a fresh copy, and the
+// player's own save is never read or written. Only an absolute path counts,
+// as with the XDG variables (XdgBaseDir); null otherwise.
+inline const char* SaveDirOverride()
+{
+    const char* value = std::getenv("NFSMW_SAVE_DIR");
+    return value && value[0] == '/' ? value : nullptr;
+}
+
+// The folder that holds save/ and profile_settings.bin.
+inline std::filesystem::path GetSaveRootPath()
+{
+    if (const char* dir = SaveDirOverride())
+        return dir;
+    return GetUserPath();
+}
+
 inline std::filesystem::path GetSavePath(bool)
 {
-    return GetUserPath() / "save";
+    return GetSaveRootPath() / "save";
 }

@@ -9,6 +9,7 @@
 #include <cpu/ppc_context.h>
 #include <cpu/guest_thread.h>
 #include <cpu/guest_time.h>
+#include <game/timedemo.h>
 #include "dispatcher.h"
 #include "function.h"
 #include "xex.h"
@@ -79,10 +80,16 @@ uint32_t XamShowDeviceSelectorUI
     XXOVERLAPPED* overlapped
 )
 {
-    // One storage device (the hard drive, id 1) is always "selected".
-    XamNotifyEnqueueEvent(9, true);
+    // One storage device (the hard drive, id 1) is always "selected". In a
+    // timedemo (game/timedemo.h) without the XN_SYS_UI pair, in capture and
+    // replay alike, as on a 360 with one device: they aren't in the log, and
+    // could reach the game's main loop on another frame in each run.
+    bool notify = !timedemo::HideGuestSystemUi();
+    if (notify)
+        XamNotifyEnqueueEvent(9, true);
     *deviceId = 1;
-    XamNotifyEnqueueEvent(9, false);
+    if (notify)
+        XamNotifyEnqueueEvent(9, false);
     if (overlapped)
     {
         CompleteOverlapped(overlapped, 0);
