@@ -43,7 +43,9 @@ namespace install
     // Install's marker for the current manifest version: it is the one the
     // installer owns, and an old marker means the manifest changed since, so
     // reinstall. The first two were set up by hand and are trusted without a
-    // marker. nullopt: nothing usable, so run the installer.
+    // marker (startup then checks every file of them by stat before the game
+    // runs: CheckInstalledFiles). nullopt: nothing usable, so run the
+    // installer.
     // Before looking at the third, finishes a reinstall a crash interrupted
     // (RecoverInterruptedInstall).
     // Cheap: a few stat calls and one small read; no hashing.

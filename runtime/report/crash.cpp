@@ -13,10 +13,18 @@
 //
 // Names for code addresses: macOS's dladdr reads the executable's whole
 // symbol table. On Linux dladdr sees only exported symbols, which an
-// executable has none of, so a thread reads the ELF .symtab of
-// /proc/self/exe at startup (functions with sizes and names, ~5 MB) and the
-// handler looks addresses up there. A stripped build falls back to
-// PPCFuncMappings, which names the recompiled functions.
+// executable has none of, so a thread reads the ELF .symtab of the running
+// program at startup (functions with sizes and names, ~5 MB) and the
+// handler looks addresses up there. That is the file the C library's loader
+// mapped this code from, not always /proc/self/exe: the SteamOS launcher
+// starts the game through the bundled loader, which /proc/self/exe then is.
+// A stripped build falls back to PPCFuncMappings, which names the recompiled
+// functions.
+//
+// The handler runs on a stack of its own on Linux (UseCrashStack): a thread
+// whose stack overflowed has no room left on it, and the kernel would end
+// the process without a word (no report, the log's last lines lost in its
+// pipe).
 #include <stdafx.h>
 #include "report.h"
 #include "internal.h"
@@ -33,6 +41,13 @@
 #ifdef __linux__
 #include <elf.h>
 #include <link.h>
+#include <sys/auxv.h>
+#include <sys/mman.h>
+// (The ELF header the build finds first may lack it: the kernel's value,
+// linux/auxvec.h.)
+#ifndef AT_EXECFN
+#define AT_EXECFN 31
+#endif
 #endif
 
 namespace report
@@ -73,11 +88,19 @@ namespace report
         const char* s_elfNames = nullptr;
         std::atomic<bool> s_elfReady{ false };
 
-        void LoadElfSymbols()
+        // Reads the function symbols of the ELF file at `path` into the
+        // table, at their addresses in this process (link-time addresses
+        // plus `bias`, a PIE's load address), if they are the running
+        // program's: the table must name the function at `anchor`
+        // (LoadElfSymbols) there. Any other file (the loader, another build
+        // put at the path since the game started) would name every frame
+        // wrongly, which is worse than the fallback's names. False, and
+        // nothing kept, otherwise or without a .symtab.
+        bool ReadElfFunctions(const char* path, uintptr_t bias, uintptr_t anchor)
         {
-            int fd = open("/proc/self/exe", O_RDONLY | O_CLOEXEC);
+            int fd = open(path, O_RDONLY | O_CLOEXEC);
             if (fd < 0)
-                return;
+                return false;
             auto readAt = [fd](void* to, size_t size, uint64_t offset) {
                 return pread(fd, to, size, off_t(offset)) == ssize_t(size);
             };
@@ -85,6 +108,7 @@ namespace report
             std::vector<Elf64_Shdr> sections;
             std::vector<Elf64_Sym> symbols;
             char* names = nullptr;
+            bool loaded = false;
             bool ok = readAt(&header, sizeof(header), 0) && memcmp(header.e_ident, ELFMAG, SELFMAG) == 0 &&
                 header.e_ident[EI_CLASS] == ELFCLASS64 && header.e_shentsize == sizeof(Elf64_Shdr) && header.e_shnum > 0;
             if (ok)
@@ -105,13 +129,6 @@ namespace report
                 if (!readAt(symbols.data(), symbols.size() * sizeof(Elf64_Sym), symtab->sh_offset) ||
                     !readAt(names, strtab.sh_size, strtab.sh_offset))
                     symbols.clear();
-                // Symbol values are link-time addresses: add the load bias
-                // (a PIE's load address).
-                uintptr_t bias = 0;
-                dl_iterate_phdr([](dl_phdr_info* info, size_t, void* out) {
-                    *static_cast<uintptr_t*>(out) = info->dlpi_addr;
-                    return 1;  // the first object is the executable
-                }, &bias);
                 std::vector<ElfFunction> functions;
                 functions.reserve(symbols.size());
                 for (const Elf64_Sym& sym : symbols)
@@ -120,7 +137,9 @@ namespace report
                         functions.push_back({ bias + uintptr_t(sym.st_value), uint32_t(std::min<uint64_t>(sym.st_size, UINT32_MAX)),
                             sym.st_name });
                 std::sort(functions.begin(), functions.end(), [](const ElfFunction& a, const ElfFunction& b) { return a.start < b.start; });
-                if (!functions.empty())
+                auto here = std::upper_bound(functions.begin(), functions.end(), anchor,
+                    [](uintptr_t pc, const ElfFunction& f) { return pc < f.start; });
+                if (here != functions.begin() && (here - 1)->start == anchor && strstr(names + (here - 1)->name, "LoadElfSymbols"))
                 {
                     auto* table = new ElfFunction[functions.size()];
                     std::copy(functions.begin(), functions.end(), table);
@@ -129,10 +148,66 @@ namespace report
                     s_elfNames = names;
                     s_elfReady.store(true, std::memory_order_release);
                     names = nullptr;
+                    loaded = true;
                 }
             }
             delete[] names;
             close(fd);
+            return loaded;
+        }
+
+        void LoadElfSymbols()
+        {
+            // The load bias of the object this code is in: the game's
+            // executable, whatever started it.
+            const uintptr_t self = reinterpret_cast<uintptr_t>(&LoadElfSymbols);
+            struct Program
+            {
+                uintptr_t code;
+                uintptr_t bias = 0;
+                std::string name;
+                bool found = false;
+            } program{ self };
+            dl_iterate_phdr([](dl_phdr_info* info, size_t, void* out) {
+                auto* p = static_cast<Program*>(out);
+                for (size_t i = 0; i < info->dlpi_phnum; i++)
+                {
+                    const ElfW(Phdr)& segment = info->dlpi_phdr[i];
+                    uintptr_t start = info->dlpi_addr + segment.p_vaddr;
+                    if (segment.p_type != PT_LOAD || p->code < start || p->code - start >= segment.p_memsz)
+                        continue;
+                    p->bias = info->dlpi_addr;
+                    p->name = info->dlpi_name ? info->dlpi_name : "";
+                    p->found = true;
+                    return 1;
+                }
+                return 0;
+            }, &program);
+            if (!program.found)
+                return;
+            // Its file. Started by the kernel: /proc/self/exe. Started
+            // through the C library's loader (ld-linux --argv0 "$BIN" "$BIN",
+            // as scripts/steamos/bundle/speedbreaker.sh does), /proc/self/exe
+            // is the loader (whose symbols with the game's bias named the
+            // game's addresses after the loader's functions), and the game is
+            // the file the loader opened: AT_EXECFN, which glibc's loader
+            // sets to it, or argv[0] (dladdr's name for the main program),
+            // which the launcher passes as the same path. The first whose
+            // symbols are this program's wins (ReadElfFunctions checks).
+            std::vector<std::string> candidates;
+            if (!program.name.empty())
+                candidates.push_back(program.name);
+            candidates.push_back("/proc/self/exe");
+            if (const char* execfn = reinterpret_cast<const char*>(getauxval(AT_EXECFN)); execfn && *execfn)
+                candidates.push_back(execfn);
+            Dl_info info{};
+            if (dladdr(reinterpret_cast<const void*>(self), &info) && info.dli_fname && *info.dli_fname)
+                candidates.push_back(info.dli_fname);
+            for (const std::string& path : candidates)
+                if (ReadElfFunctions(path.c_str(), program.bias, self))
+                    return;
+            fprintf(stderr, "[crash] no symbol table of the running program found (a stripped build?): crash reports name "
+                "fewer functions\n");
         }
 
         const char* FindElf(uintptr_t pc, uintptr_t& start)
@@ -156,6 +231,32 @@ namespace report
             start = f.start;
             return s_elfNames + f.name;
         }
+
+        // A thread's stack for the crash handler (UseCrashStack). Its size:
+        // the kernel's signal frame (the vector registers: up to ~11 KB with
+        // AMX), the write watch's fault path, and a report's backtrace()
+        // (libgcc's unwinder, a few KB), dladdr, and a first lazy symbol
+        // binding (which saves the vector registers again), with plenty to
+        // spare: only the pages a fault touches are ever made real. A guard
+        // page below it, so running out of it faults rather than writes
+        // into whatever lies there.
+        constexpr size_t kCrashStackSize = 256 * 1024;
+        struct CrashStack
+        {
+            void* memory = nullptr;  // the guard page, then the stack
+            size_t size = 0;
+            ~CrashStack()
+            {
+                if (memory == nullptr)
+                    return;
+                // The thread is ending: no signal can still be using it.
+                stack_t off{};
+                off.ss_flags = SS_DISABLE;
+                sigaltstack(&off, nullptr);
+                munmap(memory, size);
+            }
+        };
+        thread_local CrashStack t_crashStack;
 #endif
 
         int s_reportFd = -1;
@@ -415,6 +516,7 @@ namespace report
         }
         if (s_reportFd < 0)
             fprintf(stderr, "[crash] can't prepare a crash report file in %s: %s\n", dir.c_str(), strerror(errno));
+        UseCrashStack();
 
         std::string header = std::format(
             "SpeedBreaker (NFS: Most Wanted, Xbox 360): crash report\n"
@@ -423,6 +525,39 @@ namespace report
             BuildString(), SessionName(), SessionName(), detail::TimeStamp());
         s_headerSize = std::min(header.size(), sizeof(s_header));
         memcpy(s_header, header.data(), s_headerSize);
+    }
+
+    void UseCrashStack()
+    {
+#ifdef __linux__
+        if (t_crashStack.memory != nullptr)
+            return;
+        // An alternate stack the thread has already (a library's) serves as
+        // well: it stays.
+        stack_t current{};
+        if (sigaltstack(nullptr, &current) == 0 && !(current.ss_flags & SS_DISABLE))
+            return;
+        const size_t page = size_t(sysconf(_SC_PAGESIZE));
+        const size_t size = page + kCrashStackSize;
+        void* memory = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
+        if (memory == MAP_FAILED)
+        {
+            fprintf(stderr, "[crash] no crash handler stack for this thread: %s\n", strerror(errno));
+            return;
+        }
+        mprotect(memory, page, PROT_NONE);
+        stack_t stack{};
+        stack.ss_sp = static_cast<uint8_t*>(memory) + page;
+        stack.ss_size = kCrashStackSize;
+        if (sigaltstack(&stack, nullptr) != 0)
+        {
+            fprintf(stderr, "[crash] no crash handler stack for this thread: sigaltstack: %s\n", strerror(errno));
+            munmap(memory, size);
+            return;
+        }
+        t_crashStack.memory = memory;
+        t_crashStack.size = size;
+#endif
     }
 
     void WriteCrashReport(int sig, siginfo_t* info, void* context)

@@ -117,8 +117,10 @@ namespace ui
     void ShowWhatsNew(std::string_view version);
 
     // Main thread, before the game starts (main.cpp): a page saying why the
-    // game can't start (memory_status.h's StartupFailure), drawn until it is
-    // closed (Quit, B, Start, Esc; on iOS only by closing the app) or the
+    // game can't start (memory_status.h's StartupFailure; a game folder with
+    // files missing or another default.xex: installer.h's
+    // CheckInstalledFiles, CheckInstalledXex; no game thread), drawn until it
+    // is closed (Quit, B, Start, Esc; on iOS only by closing the app) or the
     // window closes. `runFrame` is video::RunFrame. Nothing without a UI.
     void RunStartupError(const std::string& title, const std::vector<std::string>& paragraphs, const std::string& details,
         const std::function<bool()>& runFrame);

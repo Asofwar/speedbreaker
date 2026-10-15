@@ -1,9 +1,12 @@
 // SpeedBreaker runtime. GPL-3.0-or-later (see COPYING). See ui.h.
 //
-// The page shown instead of the game when it can't start: today, when the
-// guest's 4 GB of address space couldn't be reserved (kernel/memory_status.h:
-// on iOS, an app signed without Extended Virtual Addressing). Before the
-// game, like the installer: nothing of the game runs behind it. On iOS it
+// The page shown instead of the game when it can't start: when the guest's
+// 4 GB of address space couldn't be reserved (kernel/memory_status.h: on
+// iOS, an app signed without Extended Virtual Addressing), when the game
+// folder lacks files or holds another default.xex (install/installer.h's
+// CheckInstalledFiles and CheckInstalledXex, from main.cpp), or when the
+// game's thread couldn't be started. Before the game, like the installer:
+// nothing of the game runs behind it. On iOS it
 // stays up (an app doesn't quit itself; the player swipes it away); elsewhere
 // OK, A, B, Start or Esc closes it, and the window's close button too.
 #include <stdafx.h>

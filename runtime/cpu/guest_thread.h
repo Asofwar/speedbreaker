@@ -47,6 +47,7 @@ struct GuestThreadHandle : Waitable
     bool finished = false;  // SpeedBreaker: guarded by dispatcher::Lock()
 #ifdef USE_PTHREAD
     pthread_t thread;
+    bool started = false;   // SpeedBreaker: pthread_create succeeded
 #else
     std::thread thread;
 #endif
@@ -63,6 +64,8 @@ struct GuestThreadHandle : Waitable
 struct GuestThread
 {
     static uint32_t Start(const GuestThreadParams& params);
+    // SpeedBreaker: nullptr when the host thread couldn't be created
+    // (logged; ExCreateThread then fails with STATUS_NO_MEMORY).
     static GuestThreadHandle* Start(const GuestThreadParams& params, uint32_t* threadId);
 
     static uint32_t GetCurrentThreadId();
@@ -77,5 +80,15 @@ struct GuestThread
 };
 
 // Names the calling host thread, for top -H, perf and debuggers (at most 15
-// characters are kept on Linux).
+// characters are kept on Linux), registers it for hang reports and gives it
+// its crash handler stack (report::UseCrashStack).
 void SetHostThreadName(const char* name);
+
+// SpeedBreaker: the guard below the stack of a host thread that runs guest
+// code (each guest call is a host call, so deep guest recursion is deep host
+// recursion), instead of one page. A function whose frame is larger than
+// the guard steps over it into whatever lies below without a fault (the
+// build doesn't probe large frames); the largest frames in the program are
+// 10-28 KB (the renderer's Draw, ffmpeg's tables; v0.1.4, x86-64), the
+// recompiled functions' far smaller.
+inline constexpr size_t kHostStackGuardSize = 64 * 1024;

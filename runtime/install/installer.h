@@ -61,6 +61,22 @@ namespace install
     // Files the manifest doesn't list ($SystemUpdate/, ...) are ignored.
     Result CheckSource(const DiscSource& source, const Manifest& manifest = GameManifest());
 
+    // A game folder at startup, by stat alone (no hashing of 7 GB): every
+    // manifest file there, found as the runtime opens it (each part of its
+    // path as spelled, else in any case), with the manifest's size.
+    // MissingFile/CorruptFile name the first bad file and count the rest, as
+    // CheckSource does; NotFound when the folder isn't there. For folders
+    // set up by hand (NFSMW_GAME_DIR, ./game/files), which FindGameInstall
+    // takes on default.xex's size alone; Install's own were hashed as copied.
+    Result CheckInstalledFiles(const std::filesystem::path& dir, const Manifest& manifest = GameManifest());
+
+    // The default.xex startup read from the game folder `dir` (its SHA-256
+    // in lower-case hex, its title ID: XexTitleId, its size): the supported
+    // one, or WrongGame/UnsupportedVersion with CheckGameVersion's messages,
+    // about that folder.
+    Result CheckInstalledXex(const std::filesystem::path& dir, std::string_view sha256, uint32_t titleId, uint64_t size,
+        const Manifest& manifest = GameManifest());
+
     // Copies the manifest's files from `source` into `destination`, which must
     // not exist, be empty (hidden files such as .DS_Store aside), or hold a
     // previous install. A previous install is replaced only after the new one

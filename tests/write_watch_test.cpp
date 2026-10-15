@@ -12,7 +12,8 @@
 // a 4 KB host, where a host page is a guest page, checks the old rule both
 // times); with it set, it runs once. Physical memory
 // is mapped as the runtime maps it (three windows of one shared object), and
-// SIGSEGV and SIGBUS go to HandleFault as main.cpp sends them. Under a second.
+// faults go to HandleFault as main.cpp sends them (SIGSEGV and SIGBUS; on
+// Linux only SIGSEGV with SEGV_ACCERR). Under a second.
 #include <stdafx.h>
 #include <kernel/write_watch.h>
 
@@ -60,7 +61,12 @@ static void FaultHandler(int sig, siginfo_t* info, void* context)
 #else
     (void)context;
 #endif
-    if (writewatch::HandleFault(info->si_addr, isWrite))
+#if defined(__linux__)
+    const bool watchable = sig == SIGSEGV && info->si_code == SEGV_ACCERR;
+#else
+    const bool watchable = true;
+#endif
+    if (watchable && writewatch::HandleFault(info->si_addr, isWrite))
         return;
     fprintf(stderr, "unexpected signal %d at %p\n", sig, info->si_addr);
     _exit(2);
@@ -666,6 +672,35 @@ static void UntileBehindRead(Quad h, uint64_t& submission)
     }
 }
 
+// 16) A fault the watch didn't make (on Linux, a page of physical memory the
+// kernel couldn't provide): the same access faulting again on the thread
+// with no page's protection changed since it was let retry is declined, so
+// the crash handler reports it instead of retrying it forever. Once is
+// normal (a racing thread opened the page first: nothing to do); another
+// access kind, or any protection change in between, is let retry again.
+// HandleFault is called as the handler would call it, without a fault.
+static void RepeatedFault(Quad h)
+{
+    printf("a fault the watch didn't make\n");
+    const void* at = Guest(h.j()) + 100;
+    CHECK(writewatch::HandleFault(at, true), "a first store fault on an open page was declined");
+    CHECK(!writewatch::HandleFault(at, true), "the same store faulting again, nothing changed, was let retry");
+    // Declined: the next fault there is a first again.
+    CHECK(writewatch::HandleFault(at, true), "a store fault after a declined one was declined");
+    // A load at the address a store was let retry at is another access (as
+    // a store after a load that left the page read-only).
+    CHECK(writewatch::HandleFault(at, false), "a load fault after a store fault at the same address was declined");
+    // A protection change elsewhere (a texture's watch) in between: the
+    // fault may be a new one of the watch's, so it is let retry.
+    uint64_t protects = Stats().protects;
+    writewatch::Watch(h.page + 0x8000, kGuestPage);
+    CHECK(Stats().protects > protects, "the watch changed no protection");
+    CHECK(writewatch::HandleFault(at, false), "a load fault after a protection change was declined");
+    CHECK(!writewatch::HandleFault(at, false), "the same load faulting again, nothing changed, was let retry");
+    // Outside physical memory: never the watch's.
+    CHECK(!writewatch::HandleFault(g_memory.base + 0x10000, true), "a fault outside physical memory was taken");
+}
+
 static int Run()
 {
     s_subpages = Stats().subpages;
@@ -695,6 +730,7 @@ static int Run()
     UntileGivesUp({ page += 0x10000 }, submission);
     UntileAndGpuWrite({ page += 0x10000 }, submission);
     UntileBehindRead({ page += 0x10000 }, submission);
+    RepeatedFault({ page += 0x10000 });
     s_gpuQuit.store(true);
     gpu.join();
     printf(g_failures ? "%d failure(s)\n" : "all passed\n", g_failures);

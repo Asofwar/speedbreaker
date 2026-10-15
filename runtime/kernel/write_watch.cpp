@@ -703,6 +703,12 @@ namespace writewatch
 
         thread_local uint32_t t_faultPhysical = 0;
         thread_local bool t_faultWrite = false;
+        // The last access HandleFault let this thread retry (its address and
+        // kind), and s_protects then: the same access faulting again with no
+        // protection changed since isn't the watch's (see HandleFault).
+        thread_local const void* t_retried = nullptr;
+        thread_local bool t_retriedWrite = false;
+        thread_local uint64_t t_retriedProtects = 0;
 
         // Wait (spinning; this runs in the fault handler) until the GPU is
         // done with guest page `sub` for this access (`untile`: with its
@@ -1010,10 +1016,35 @@ namespace writewatch
         // is done with this guest page. The command processor may guard it
         // again while we wait: check under the lock.
         bool markUntiles = false;  // a wait for another guest page's untile gave up
+        // Every return true below leaves the page allowing this access, and
+        // every protection change is counted in s_protects under the lock.
+        // So the same access faulting again on this thread with the count
+        // unchanged since it was let retry faulted for another reason (a
+        // page of physical memory the kernel couldn't provide, an mprotect
+        // that failed): retried, it would fault forever at full CPU. Declined
+        // instead, which makes it a crash report. (Once is normal: a racing
+        // thread may have opened the page first, leaving nothing to do.)
+        auto retry = [&] {
+            t_retried = host;
+            t_retriedWrite = write;
+            t_retriedProtects = s_protects.load(std::memory_order_relaxed);
+            return true;
+        };
         while (true)
         {
             WaitForGpu(sub, write);
             std::unique_lock lock(s_protectMutex);
+            if (host == t_retried && write == t_retriedWrite && s_protects.load(std::memory_order_relaxed) == t_retriedProtects)
+            {
+                t_retried = nullptr;
+                // (In the fault handler: no stdio.)
+                char line[160];
+                int n = snprintf(line, sizeof(line), "[guard] a %s fault at physical %08X came again with no protection "
+                    "changed since it was let retry: not the write watch's\n", write ? "write" : "read", uint32_t(physical));
+                if (n > 0)
+                    ::write(STDERR_FILENO, line, std::min(size_t(n), sizeof(line) - 1));
+                return false;
+            }
             if (!t_gpuThread && Hazard(sub, write) > s_completed.load())
                 continue;
             if (t_gpuThread)
@@ -1067,14 +1098,14 @@ namespace writewatch
             if (wanted <= allowed)
             {
                 SetProt(page, wanted);
-                return true;
+                return retry();
             }
             // Another guest page of this host page still has a GPU hazard:
             // open it for this access and protect it again soon.
             SetProt(page, allowed);
             s_rearm.push_back(page);
             s_opened++;
-            return true;
+            return retry();
         }
     }
 

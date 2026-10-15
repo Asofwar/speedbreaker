@@ -117,6 +117,9 @@ void SetHostThreadName(const char* name)
     (void)name;
 #endif
     report::RegisterThread(name);  // hang reports sample named threads
+    // Every thread named here can crash: a stack of its own for the crash
+    // handler, so one whose stack overflowed still gets a report.
+    report::UseCrashStack();
 }
 
 static void* GuestThreadFunc(void* arg)
@@ -154,12 +157,19 @@ GuestThreadHandle::GuestThreadHandle(const GuestThreadParams& params)
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, GetStackSize());
+    pthread_attr_setguardsize(&attr, kHostStackGuardSize);
     refs = 2;  // SpeedBreaker: the handle's reference + the thread's own
     const auto ret = pthread_create(&thread, &attr, GuestThreadFunc, this);
+    pthread_attr_destroy(&attr);
     if (ret != 0) {
-        fprintf(stderr, "pthread_create failed with error code 0x%X.\n", ret);
+        // SpeedBreaker: no thread will ever run or signal this handle; the
+        // creator (GuestThread::Start) destroys it and ExCreateThread fails,
+        // instead of handing the guest a thread anything waiting on hangs.
+        fprintf(stderr, "[thread] can't start guest thread %u (start %08X): pthread_create: %s\n", id, params.function,
+            strerror(ret));
         return;
     }
+    started = true;
     pthread_detach(thread);
 }
 #else
@@ -205,6 +215,14 @@ uint32_t GuestThread::Start(const GuestThreadParams& params)
 GuestThreadHandle* GuestThread::Start(const GuestThreadParams& params, uint32_t* threadId)
 {
     auto hThread = CreateKernelObject<GuestThreadHandle>(params);
+#ifdef USE_PTHREAD
+    // SpeedBreaker: the host thread didn't start (logged): no handle.
+    if (!hThread->started)
+    {
+        DestroyKernelObject(hThread);
+        return nullptr;
+    }
+#endif
 
     if (threadId != nullptr)
     {

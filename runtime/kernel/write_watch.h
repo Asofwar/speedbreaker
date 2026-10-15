@@ -109,7 +109,12 @@ namespace writewatch
     // first while the GPU still uses the page (not on GPU threads); with
     // NFSMW_WATCH_SUBPAGES, a store also waits for a texture's untile still
     // reading another guest page of its host page (see GpuRead; at most
-    // 100 ms, then that guest page is marked instead).
+    // 100 ms, then that guest page is marked instead). False outside
+    // physical memory, and for an access that faults again on the same
+    // thread with no page's protection changed since it was let retry: not
+    // a fault the watch made (the caller reports a crash instead of
+    // retrying it forever). main.cpp sends it on Linux only SIGSEGV with
+    // SEGV_ACCERR, the code a protection fault has there.
     bool HandleFault(const void* host, bool write = true);
 
     // GPU use guard. `submission` is the renderer's number for the command

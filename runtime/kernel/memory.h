@@ -23,6 +23,10 @@ struct Memory
     // purpose (testing the message on any machine).
     int failedStep = 0;
     int failedError = 0;
+    // The call that failed ("mmap", "shm_open (a file in /dev/shm)",
+    // "ftruncate", "vm_map", ...), for the log: these run before main, ahead
+    // of the session log, so only the terminal sees their own lines.
+    const char* failedCall = nullptr;
 
     bool IsInMemoryRange(const void* host) const noexcept
     {

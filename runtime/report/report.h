@@ -93,8 +93,20 @@ namespace report
     // --- Crash reports (crash.cpp) ---
 
     // Main thread, before the crash handler is installed: opens the report
-    // file and prepares everything the handler can't do safely itself.
+    // file and prepares everything the handler can't do safely itself
+    // (and UseCrashStack for the main thread).
     void PrepareCrashReports();
+    // The calling thread, early (SetHostThreadName calls it, so every named
+    // runtime thread and every guest thread has one): a stack of its own
+    // for the crash handler (sigaltstack; the handler is installed with
+    // SA_ONSTACK), freed when the thread ends. A thread whose own stack
+    // overflowed (deep recursion into its guard) still gets a crash report;
+    // without it the kernel ends the process without one. Again on the same
+    // thread: nothing. Linux only: on Apple platforms backtrace() follows
+    // frames only within the thread's own stack, so a handler on another
+    // would lose every report's stack (and the system's own crash reporter
+    // records an overflow there).
+    void UseCrashStack();
     // The crash handler (a signal handler; async-signal-safe): logs the
     // crash and writes the report. The caller exits afterwards.
     void WriteCrashReport(int sig, siginfo_t* info, void* context);

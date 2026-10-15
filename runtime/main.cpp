@@ -14,6 +14,7 @@
 #include "kernel/module.h"
 #include "kernel/write_watch.h"
 #include "kernel/dispatcher.h"
+#include "kernel/vfs.h"
 #include "cpu/guest_time.h"
 #include <video/presenter.h>
 #include <gpu/renderer.h>
@@ -21,6 +22,7 @@
 #include <cpu/guest_thread.h>
 #include <cpu/host_cpu.h>
 #include <install/install_cli.h>
+#include <install/installer.h>
 #include <install/locate.h>
 #include <install/placement.h>
 #include <install/sha256.h>
@@ -260,12 +262,80 @@ namespace
 #elif defined(__linux__) && defined(__aarch64__)
         writewatch::t_faultPc = reinterpret_cast<const void*>(static_cast<ucontext_t*>(context)->uc_mcontext.pc);
 #endif
-        if ((sig == SIGSEGV || sig == SIGBUS) && writewatch::HandleFault(info->si_addr, isWrite))
+        // Only a fault the write watch can have caused goes to it. On Linux
+        // that is an access the page's protection refused (SEGV_ACCERR); a
+        // SIGBUS there is memory the kernel couldn't provide (a page of the
+        // physical memory's file, which no retry brings), and the watch,
+        // finding nothing to undo, would have the access retried forever
+        // at full CPU instead of a crash report. Apple's kernel reports a
+        // protection fault as SIGBUS (an unmapped address as SIGSEGV).
+#if defined(__linux__)
+        const bool watchable = sig == SIGSEGV && info->si_code == SEGV_ACCERR;
+#else
+        const bool watchable = sig == SIGSEGV || sig == SIGBUS;
+#endif
+        if (watchable && writewatch::HandleFault(info->si_addr, isWrite))
             return;
         // A real crash: the log, and a crash report the next launch mentions
         // (report/crash.cpp; async-signal-safe).
         report::WriteCrashReport(sig, info, context);
         _exit(128 + sig);
+    }
+
+    // Why the game can't start, before any of it runs: the page
+    // ui::RunStartupError draws until it is closed, when there is a window,
+    // else the system's message box (none with NFSMW_HEADLESS=1: a test run
+    // has no one to close it). The caller has logged it.
+    void ShowStartupError(const std::string& title, const std::vector<std::string>& paragraphs, const std::string& details,
+        bool windowed)
+    {
+        if (windowed)
+        {
+            ui::RunStartupError(title, paragraphs, details, [] { return video::RunFrame(); });
+            return;
+        }
+        if (const char* h = std::getenv("NFSMW_HEADLESS"); h && h[0] == '1')
+            return;
+        std::string text;
+        for (const std::string& p : paragraphs)
+            text += p + "\n\n";
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, title.c_str(), (text + details).c_str(), nullptr);
+    }
+
+    // What the player can do about a game folder that can't be played,
+    // by where it came from (install::FindGameInstall).
+    std::string GameFolderAdvice(install::InstallOrigin origin, bool marker)
+    {
+        if (marker)
+            return "The installer checked every file when it installed the game, so this one has changed since (a "
+                   "failing drive or card?). Install the game again from your disc image: SpeedBreaker --install "
+                   "<image> (on SteamOS, speedbreaker.sh --install <image>; see the README).";
+        if (origin == install::InstallOrigin::Environment)
+            return "NFSMW_GAME_DIR points SpeedBreaker at this folder. Copy the whole extracted disc of the supported "
+                   "release into it again, or unset NFSMW_GAME_DIR to install the game from your disc image instead.";
+        return "SpeedBreaker plays the game from game/files in the folder it started in (on iOS, the app's Documents "
+               "folder). Copy the whole extracted disc of the supported release there again, or move that folder "
+               "away to install the game from your disc image instead.";
+    }
+
+    // The game folder can't be played (CheckInstalledFiles,
+    // CheckInstalledXex): logged, then said on screen. Returns main's exit
+    // code.
+    int RefuseGameFolder(const install::Result& why, const std::string& advice, const std::string& details, bool windowed)
+    {
+        fprintf(stderr, "[runtime] can't start: %s (%s)\n", why.message.c_str(), install::ErrorName(why.error));
+        fprintf(stderr, "[runtime]   %s\n", advice.c_str());
+        fprintf(stderr, "[runtime]   %s\n", details.c_str());
+        // (A developer can still run such a folder: a XEX named on the
+        // command line is never checked.)
+        fprintf(stderr, "[runtime]   (to run it anyway: SpeedBreaker <folder>/default.xex)\n");
+        ShowStartupError("SpeedBreaker can't start", { why.message, advice }, details, windowed);
+        if (settings::Dirty())
+            settings::Save();
+        if (windowed)
+            video::Shutdown();
+        report::FlushLog();
+        return 1;
     }
 }
 
@@ -328,23 +398,19 @@ int main(int argc, char** argv)
         // Apple Account's sideload) ends up here: say so on screen rather
         // than vanish. Before the game's code runs at all.
         memstatus::Message message = memstatus::StartupFailure(memory);
-        fprintf(stderr, "[runtime] could not reserve 4 GB of guest address space: %s\n", message.title.c_str());
+        // Which step failed: the 4 GB reservation, or mapping the physical
+        // memory into it (kernel/memory.cpp, which logged the call and why).
+        fprintf(stderr, "[runtime] could not %s (%s: %s): %s\n", memory.failure == memstatus::Failure::PhysicalMemory
+            ? "map the guest's 512 MB of physical memory" : "reserve 4 GB of guest address space",
+            g_memory.failedCall ? g_memory.failedCall : "?", memory.errorText.c_str(), message.title.c_str());
         for (const std::string& p : message.paragraphs)
             fprintf(stderr, "[runtime]   %s\n", p.c_str());
         settings::Load();
-        if (video::Initialize())
-        {
-            ui::RunStartupError(message.title, message.paragraphs, message.details, [] { return video::RunFrame(); });
+        // The page needs a window; without one, the system's message box.
+        bool windowed = video::Initialize();
+        ShowStartupError(message.title, message.paragraphs, message.details, windowed);
+        if (windowed)
             video::Shutdown();
-        }
-        else if (const char* h = std::getenv("NFSMW_HEADLESS"); !h || h[0] != '1')
-        {
-            // No window for the page: the system's own message box.
-            std::string text;
-            for (const std::string& p : message.paragraphs)
-                text += p + "\n\n";
-            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, message.title.c_str(), (text + message.details).c_str(), nullptr);
-        }
         report::FlushLog();
         return 1;
     }
@@ -357,7 +423,9 @@ int main(int argc, char** argv)
     report::PrepareCrashReports();
     struct sigaction sa{};
     sa.sa_sigaction = CrashHandler;
-    sa.sa_flags = SA_SIGINFO;
+    // SA_ONSTACK: on the thread's crash handler stack where it has one
+    // (report::UseCrashStack), so a stack overflow is reported too.
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
     for (int sig : { SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGFPE, SIGABRT })
         sigaction(sig, &sa, nullptr);
 
@@ -430,6 +498,11 @@ int main(int argc, char** argv)
                 fprintf(stderr, "[runtime] launcher (pid %d) is gone: exiting\n", int(lifeline));
                 if (settings::Dirty())
                     settings::Save();
+                // A save the game is in the middle of writing gets up to 2 s
+                // to finish (kernel/vfs.h): quitting then keeps the new save
+                // instead of the previous one. The guest still runs here and
+                // may need the GPU for it, so before the renderer stops.
+                vfs::WaitForStagedFiles(std::chrono::seconds(2));
                 gpu::renderer::Shutdown();
                 report::FlushLog();
                 std::_Exit(0);
@@ -437,7 +510,15 @@ int main(int argc, char** argv)
 
     std::filesystem::path xexPath;
     std::string gameOrigin;  // for the system summary
-    if (argc > 1)
+    // A XEX named on the command line is a developer's: its folder and its
+    // version are never refused (below). Otherwise: where the game folder
+    // came from (what to tell the player when it can't be played), and
+    // whether the installer hashed every file of it (its marker, or just
+    // now), which the startup checks below then trust.
+    const bool developmentXex = argc > 1;
+    install::InstallOrigin origin = install::InstallOrigin::User;
+    bool verified = false;
+    if (developmentXex)
     {
         // A specific XEX (development): its folder is the disc, unless
         // NFSMW_GAME_DIR says otherwise.
@@ -450,6 +531,8 @@ int main(int argc, char** argv)
     {
         SetGamePath(game->path);
         xexPath = game->xex;  // as spelled on disk
+        origin = game->origin;
+        verified = game->marker;
         gameOrigin = game->origin == install::InstallOrigin::Environment ? "NFSMW_GAME_DIR"
             : game->origin == install::InstallOrigin::Development ? "./game/files"
             : game->marker ? "installed by the game's installer" : "installed";
@@ -481,6 +564,7 @@ int main(int argc, char** argv)
         }
         SetGamePath(*installed);
         xexPath = FindXex(*installed);
+        verified = true;
         gameOrigin = "installed by the game's installer just now";
     }
     else
@@ -490,12 +574,51 @@ int main(int argc, char** argv)
         return 1;
     }
     fprintf(stderr, "[runtime] game files: %s\n", GetGamePath().string().c_str());
+    const install::Manifest& manifest = install::GameManifest();
+
+    // A game folder set up by hand (NFSMW_GAME_DIR, ./game/files) has had
+    // only its default.xex's size looked at: a copy that stopped part way
+    // started, then failed minutes in at the first file it lacks (a missing
+    // file or a short read is fatal to the game). Every file is checked by
+    // stat now, no hashing; the installer's own installs had every file
+    // hashed as it copied them, so not again. NFSMW_ALLOW_MODIFIED_FILES=1
+    // (modded game files, whose sizes differ on purpose) lets a folder with
+    // files of other sizes start, logged; a missing file still can't.
+    if (!developmentXex && !verified)
+        if (install::Result files = install::CheckInstalledFiles(GetGamePath(), manifest); !files.Ok())
+        {
+            const char* modified = std::getenv("NFSMW_ALLOW_MODIFIED_FILES");
+            if (files.error == install::Error::CorruptFile && modified && std::strcmp(modified, "1") == 0)
+                fprintf(stderr, "[runtime] %s Starting anyway (NFSMW_ALLOW_MODIFIED_FILES=1).\n", files.message.c_str());
+            else
+                return RefuseGameFolder(files, GameFolderAdvice(origin, verified),
+                    std::format("Details: {} ({}); manifest {}.", GetGamePath().string(), gameOrigin, manifest.version), windowed);
+        }
 
     std::vector<uint8_t> file = LoadFile(xexPath);
     if (file.empty())
     {
         fprintf(stderr, "[runtime] cannot read %s\n", xexPath.string().c_str());
         return 1;
+    }
+
+    // Which game files this is, for the system summary (logged below).
+    const std::string sha = install::ToHex(install::Sha256Of(file.data(), file.size()));
+    const bool supported = sha == manifest.Xex().sha256;
+    report::SetSystemItem("Game", std::format("{} ({}); default.xex {} bytes, SHA-256 {} ({}); manifest {}",
+        GetGamePath().string(), gameOrigin, file.size(), sha, supported ? "the supported version" : "NOT the supported version",
+        manifest.version));
+    // The recompiled code is one default.xex, byte for byte: with another
+    // (another region or revision, a damaged copy) the game runs code that
+    // doesn't match its data and fails at some point later. Said now
+    // instead, before any of it runs.
+    if (!developmentXex && !supported)
+    {
+        report::LogSystemSummary();
+        install::Result xex = install::CheckInstalledXex(GetGamePath(), sha, install::XexTitleId(file.data(), file.size()),
+            file.size(), manifest);
+        return RefuseGameFolder(xex, GameFolderAdvice(origin, verified), std::format("Details: {} ({}); default.xex {} bytes, "
+            "SHA-256 {}; manifest {}.", GetGamePath().string(), gameOrigin, file.size(), sha, manifest.version), windowed);
     }
 
     Image image = Xex2LoadImage(file.data(), file.size());
@@ -508,14 +631,7 @@ int main(int argc, char** argv)
     memcpy(g_memory.Translate(image.base), image.data.get(), image.size);
     fprintf(stderr, "[loader] image %08zX-%08zX, entry %08zX\n", image.base, image.base + image.size, image.entry_point);
 
-    // Which game files this is, then the whole system summary for the log.
-    {
-        std::string sha = install::ToHex(install::Sha256Of(file.data(), file.size()));
-        const install::Manifest& manifest = install::GameManifest();
-        report::SetSystemItem("Game", std::format("{} ({}); default.xex {} bytes, SHA-256 {} ({}); manifest {}",
-            GetGamePath().string(), gameOrigin, file.size(), sha, sha == manifest.Xex().sha256 ? "the supported version" : "NOT the supported version",
-            manifest.version));
-    }
+    // The whole system summary for the log.
     report::LogSystemSummary();
 
     g_userHeap.Init();
@@ -529,8 +645,22 @@ int main(int argc, char** argv)
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, HOST_STACK);
+    pthread_attr_setguardsize(&attr, kHostStackGuardSize);
     pthread_t thread;
-    pthread_create(&thread, &attr, GuestMain, &params);
+    const int created = pthread_create(&thread, &attr, GuestMain, &params);
+    pthread_attr_destroy(&attr);
+    if (created != 0)
+    {
+        // No game thread (its stack refused): said, rather than a window
+        // that stays black for good.
+        std::string why = std::format("The system refused to start the game's main thread ({}).", strerror(created));
+        fprintf(stderr, "[runtime] can't start: pthread_create: %s\n", strerror(created));
+        ShowStartupError("SpeedBreaker can't start", { why, "Close other programs and try again." }, "", windowed);
+        if (windowed)
+            video::Shutdown();
+        report::FlushLog();
+        return 1;
+    }
     report::StartWatchdog();  // hang reports (and the NFSMW_TEST_* switches)
 
 #ifdef __linux__
@@ -561,6 +691,8 @@ int main(int argc, char** argv)
     fprintf(stderr, "[runtime] window closed\n");
     if (settings::Dirty())
         settings::Save();
+    // As above for the launcher's exit: a save being written finishes first.
+    vfs::WaitForStagedFiles(std::chrono::seconds(2));
     gpu::renderer::Shutdown();
     video::Shutdown();
     // The session log's last lines are still in its pipe: let them out

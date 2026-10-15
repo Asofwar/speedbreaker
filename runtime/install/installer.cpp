@@ -15,6 +15,7 @@
 #include <cstring>
 #include <format>
 #include <fstream>
+#include <map>
 #include <set>
 
 #include <fcntl.h>
@@ -580,6 +581,36 @@ namespace install
                 RetirePrevious(layout, manifest);
             return {};
         }
+
+        // A default.xex that isn't the supported one (SHA-256 `found`):
+        // another game, or another version of this one. `what` starts the
+        // message ("This disc image", "The game folder <path>"); `size` is
+        // the file's, `file` its path as the source names it.
+        Result XexMismatch(const std::string& what, const std::string& found, uint32_t titleId, uint64_t size,
+            const std::string& file, const Manifest& manifest)
+        {
+            const ManifestFile& xex = manifest.Xex();
+            Result r;
+            if (titleId != manifest.titleId)
+            {
+                r = Fail(Error::WrongGame, titleId
+                    ? std::format("{} is not {}: it holds another game (title ID {:08X}; {} is {:08X}).", what,
+                        kGameName, titleId, kGameName, manifest.titleId)
+                    : std::format("{} is not {}: its default.xex is not an Xbox 360 game executable.", what, kGameName),
+                    file);
+                r.foundHash = found;
+                return r;
+            }
+            // Same title, different executable: another region or revision. The
+            // recompiled code matches one executable byte for byte, so nothing
+            // else can run, whatever else is on the disc.
+            r = Fail(Error::UnsupportedVersion, std::format("{} is {}, but not the version this build supports: its "
+                "default.xex has SHA-256 {}. Only {} is supported (default.xex {}){}.", what, kGameName, found,
+                kRelease, std::string(xex.sha256),
+                size == xex.size ? ", unless this one is a damaged dump" : ""), file);
+            r.foundHash = found;
+            return r;
+        }
     }
 
     Result CheckGameVersion(const DiscSource& source, const Manifest& manifest, XexIdentity* identity)
@@ -599,30 +630,92 @@ namespace install
         if (!r.Ok())
             return r;
 
-        const ManifestFile& xex = manifest.Xex();
         std::string found = ToHex(id.sha256);
-        if (found == xex.sha256)
+        if (found == manifest.Xex().sha256)
             return {};
+        return XexMismatch(What(source), found, id.titleId, id.file->size, id.file->path, manifest);
+    }
 
-        if (id.titleId != manifest.titleId)
+    Result CheckInstalledXex(const std::filesystem::path& dir, std::string_view sha256, uint32_t titleId, uint64_t size,
+        const Manifest& manifest)
+    {
+        if (sha256 == manifest.Xex().sha256)
+            return {};
+        return XexMismatch(std::format("The game folder {}", dir.string()), std::string(sha256), titleId, size,
+            (dir / "default.xex").string(), manifest);
+    }
+
+    Result CheckInstalledFiles(const std::filesystem::path& dir, const Manifest& manifest)
+    {
+        std::error_code ec;
+        if (!fs::is_directory(dir, ec))
+            return Fail(Error::NotFound, ec && ec != std::errc::no_such_file_or_directory
+                ? std::format("The game folder {} can't be read: {}.", dir.string(), ec.message())
+                : std::format("The game folder {} isn't there.", dir.string()), dir.string());
+
+        // A file as the runtime opens it (vfs::Resolve): each part of its
+        // path as the manifest spells it, else in any case (a tool that
+        // changed the names' case, on a case-sensitive file system). A
+        // folder is listed only for a name that isn't there as spelled, and
+        // only once.
+        std::map<fs::path, std::vector<std::string>> listings;
+        auto child = [&](const fs::path& parent, std::string_view name) -> std::optional<fs::path>
         {
-            r = Fail(Error::WrongGame, id.titleId
-                ? std::format("{} is not {}: it holds another game (title ID {:08X}; {} is {:08X}).", What(source),
-                    kGameName, id.titleId, kGameName, manifest.titleId)
-                : std::format("{} is not {}: its default.xex is not an Xbox 360 game executable.", What(source), kGameName),
-                id.file->path);
-            r.foundHash = found;
-            return r;
+            std::error_code childEc;
+            fs::path exact = parent / fs::path(name);
+            if (fs::exists(exact, childEc))
+                return exact;
+            auto [listing, fresh] = listings.try_emplace(parent);
+            if (fresh)
+                for (fs::directory_iterator it(parent, childEc), end; !childEc && it != end; it.increment(childEc))
+                    listing->second.push_back(it->path().filename().string());
+            for (const std::string& entry : listing->second)
+                if (PathEqualsIgnoreCase(entry, name))
+                    return parent / entry;
+            return std::nullopt;
+        };
+
+        // As CheckSource: the first missing file and the first of the wrong
+        // size are named, the rest counted.
+        const ManifestFile* missing = nullptr;
+        const ManifestFile* wrongSize = nullptr;
+        uint64_t wrongFound = 0;
+        size_t missingCount = 0, wrongCount = 0;
+        for (const ManifestFile& mf : manifest.files)
+        {
+            std::optional<fs::path> at = dir;
+            for (size_t start = 0; at && start < mf.path.size();)
+            {
+                size_t end = std::min(mf.path.find('/', start), mf.path.size());
+                at = child(*at, mf.path.substr(start, end - start));
+                start = end + 1;
+            }
+            std::error_code sizeEc;
+            uint64_t size = at ? fs::file_size(*at, sizeEc) : 0;  // (a folder by that name: an error, so missing)
+            if (!at || sizeEc)
+            {
+                missing = missing ? missing : &mf;
+                missingCount++;
+            }
+            else if (size != mf.size)
+            {
+                if (!wrongSize)
+                {
+                    wrongSize = &mf;
+                    wrongFound = size;
+                }
+                wrongCount++;
+            }
         }
-        // Same title, different executable: another region or revision. The
-        // recompiled code matches one executable byte for byte, so nothing
-        // else can run, whatever else is on the disc.
-        r = Fail(Error::UnsupportedVersion, std::format("{} is {}, but not the version this build supports: its "
-            "default.xex has SHA-256 {}. Only {} is supported (default.xex {}){}.", What(source), kGameName, found,
-            kRelease, std::string(xex.sha256),
-            id.file->size == xex.size ? ", unless this one is a damaged dump" : ""), id.file->path);
-        r.foundHash = found;
-        return r;
+        auto more = [](size_t n) { return n > 1 ? std::format(" (and {} more)", n - 1) : std::string(); };
+        if (missing)
+            return Fail(Error::MissingFile, std::format("The game folder {} is incomplete: {} is missing{}.", dir.string(),
+                std::string(missing->path), more(missingCount)), std::string(missing->path));
+        if (wrongSize)
+            return Fail(Error::CorruptFile, std::format("The game folder {} is damaged: {} is {} bytes, but should be {}{}.",
+                dir.string(), std::string(wrongSize->path), wrongFound, wrongSize->size, more(wrongCount)),
+                std::string(wrongSize->path));
+        return {};
     }
 
     Result CheckSource(const DiscSource& source, const Manifest& manifest)
