@@ -56,23 +56,36 @@ inline const char*& CacheFolderName()
     return name;
 }
 
+// An XDG base directory variable ($XDG_DATA_HOME, $XDG_CACHE_HOME), or null
+// when it is unset, empty or relative. The XDG Base Directory spec says a
+// relative path in them is invalid and must be ignored; taking it as it is
+// put saves and settings in whatever the current folder was at launch
+// (XDG_DATA_HOME= in a launch script or Steam's launch options), where the
+// next launch from another folder no longer found them.
+inline const char* XdgBaseDir(const char* name)
+{
+    const char* value = std::getenv(name);
+    return value && value[0] == '/' ? value : nullptr;
+}
+
 // Where the per-user folders go (outside portable mode: user/portable.h).
 //   macOS: ~/Library/Application Support, ~/Library/Caches
 //   iOS: the same in the app's container; $XDG_DATA_HOME and
 //        $XDG_CACHE_HOME when set (test runs: iOS sets HOME itself)
 //   Linux: $XDG_DATA_HOME or ~/.local/share, $XDG_CACHE_HOME or ~/.cache
+// (the XDG variables only when absolute: XdgBaseDir).
 inline std::filesystem::path UserDataBase()
 {
     const char* home = std::getenv("HOME");
     std::filesystem::path base = home ? home : ".";
 #ifdef __APPLE__
 #if TARGET_OS_IOS
-    if (const char* xdg = std::getenv("XDG_DATA_HOME"))
+    if (const char* xdg = XdgBaseDir("XDG_DATA_HOME"))
         return xdg;
 #endif
     return base / "Library/Application Support";
 #else
-    if (const char* xdg = std::getenv("XDG_DATA_HOME"))
+    if (const char* xdg = XdgBaseDir("XDG_DATA_HOME"))
         return xdg;
     return base / ".local/share";
 #endif
@@ -84,12 +97,12 @@ inline std::filesystem::path CacheBase()
     std::filesystem::path base = home ? home : ".";
 #ifdef __APPLE__
 #if TARGET_OS_IOS
-    if (const char* xdg = std::getenv("XDG_CACHE_HOME"))
+    if (const char* xdg = XdgBaseDir("XDG_CACHE_HOME"))
         return xdg;
 #endif
     return base / "Library/Caches";
 #else
-    if (const char* xdg = std::getenv("XDG_CACHE_HOME"))
+    if (const char* xdg = XdgBaseDir("XDG_CACHE_HOME"))
         return xdg;
     return base / ".cache";
 #endif

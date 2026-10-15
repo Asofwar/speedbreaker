@@ -86,9 +86,14 @@ namespace vfs
             if (IEquals(root, "hdd"))
                 return std::pair{ Resolved{ UserDir("hdd"), false }, rest };
 
-            std::string_view registered = XamGetRootPath(root);
+            // A copy: XamContentClose on another thread can unregister the
+            // root while this one is still using it.
+            std::string registered = XamGetRootPath(root);
             if (!registered.empty())
-                return std::pair{ Resolved{ std::filesystem::path(std::string(registered)), false }, rest };
+            {
+                std::filesystem::path host(registered);
+                return std::pair{ Resolved{ host, false, host }, rest };
+            }
             return std::nullopt;
         }
     }

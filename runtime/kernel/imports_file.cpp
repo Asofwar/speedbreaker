@@ -26,6 +26,7 @@ namespace
     constexpr uint32_t STATUS_OBJECT_NAME_COLLISION = 0xC0000035;
     constexpr uint32_t STATUS_FILE_IS_A_DIRECTORY = 0xC00000BA;
     constexpr uint32_t STATUS_NOT_A_DIRECTORY = 0xC0000103;
+    constexpr uint32_t STATUS_DISK_FULL = 0xC000007F;
 
     // Creation dispositions.
     enum : uint32_t { FILE_SUPERSEDE, FILE_OPEN, FILE_CREATE, FILE_OPEN_IF, FILE_OVERWRITE, FILE_OVERWRITE_IF };
@@ -54,10 +55,12 @@ namespace
         uint32_t attributes = 0;
     };
 
-    std::optional<HostAttributes> Stat(const std::filesystem::path& path, bool readOnly)
+    // An open file's attributes come from its descriptor (`fd`): a save being
+    // rewritten is its temporary file, not the old one still at its path.
+    std::optional<HostAttributes> Stat(const std::filesystem::path& path, bool readOnly, int fd = -1)
     {
         struct stat st;
-        if (stat(path.c_str(), &st) != 0)
+        if ((fd >= 0 ? fstat(fd, &st) : stat(path.c_str(), &st)) != 0)
             return std::nullopt;
         HostAttributes a;
         bool dir = S_ISDIR(st.st_mode);
@@ -77,6 +80,16 @@ namespace
     uint64_t AllocationSize(uint64_t size)
     {
         return (size + 0xFFF) & ~uint64_t(0xFFF);
+    }
+
+    // The attributes the guest sees at `path`: those of its rewrite in
+    // progress if it has one (vfs::StagedFile: a new save is not on the disk
+    // before its commit, and an old one still has its old size there).
+    std::optional<HostAttributes> GuestStat(const std::filesystem::path& path, bool readOnly)
+    {
+        std::lock_guard lock(vfs::Saves().Mutex());
+        auto staged = vfs::Saves().FindLocked(path);
+        return Stat(staged ? staged->temp : path, readOnly);
     }
 }
 
@@ -117,6 +130,10 @@ struct FileObject final : Waitable
     std::filesystem::path path;
     std::string guestPath;
     bool readOnly = false;
+    // Opened for writing. A handle on a save being rewritten has a read-write
+    // descriptor either way (a dup of the rewrite's), so this, not the
+    // descriptor, is what refuses writes through a handle opened for reading.
+    bool writable = false;
     bool isDirectory = false;
     bool synchronous = true;
     uint64_t position = 0;
@@ -124,18 +141,23 @@ struct FileObject final : Waitable
     std::vector<std::filesystem::path> entries;
     size_t nextEntry = 0;
     std::string pattern;
+    // The rewrite this handle reads and writes (a file in a content
+    // package: vfs::StagedFile), or null.
+    std::shared_ptr<vfs::StagedFile> staged;
 
     ~FileObject() override
     {
         if (fd >= 0)
             close(fd);
+        if (staged)
+            vfs::Saves().Release(*staged);  // the last handle commits it
     }
 
     bool IsSignaledLocked() const override { return true; }
 
     void FillNetworkOpenInformation(X_FILE_NETWORK_OPEN_INFORMATION* info) const
     {
-        auto a = Stat(path, readOnly).value_or(HostAttributes{});
+        auto a = Stat(path, readOnly, fd).value_or(HostAttributes{});
         info->creationTime = a.writeTime;
         info->lastAccessTime = a.writeTime;
         info->lastWriteTime = a.writeTime;
@@ -221,17 +243,31 @@ uint32_t NtCreateFile(be<uint32_t>* handleOut, uint32_t desiredAccess, XOBJECT_A
 
     bool wantsWrite = (desiredAccess & (GENERIC_WRITE_ | FILE_WRITE_DATA | FILE_APPEND_DATA)) != 0;
     bool mayCreate = disposition != FILE_OPEN && disposition != FILE_OVERWRITE;
-    auto resolved = vfs::Resolve(*guestPath, !mayCreate);
-    if (!resolved)
+    // Resolved as for creating even when the file must exist: a new save
+    // still being written isn't on the disk until its commit, and is found
+    // among the rewrites below. Whether it exists is checked after that.
+    auto resolved = vfs::Resolve(*guestPath, false);
+    // A file in a content package (a save): its rewrite in progress, if any,
+    // is the file the guest sees. The lock is held until this handle has
+    // joined or started the rewrite, so it can't be committed meanwhile.
+    vfs::Staging& saves = vfs::Saves();
+    std::unique_lock stagedLock(saves.Mutex(), std::defer_lock);
+    std::shared_ptr<vfs::StagedFile> staged;
+    if (resolved && !resolved->contentRoot.empty())
+    {
+        stagedLock.lock();
+        staged = saves.FindLocked(resolved->host);
+    }
+
+    std::error_code ec;
+    bool exists = resolved && (staged || std::filesystem::exists(resolved->host, ec));
+    if (!resolved || (!exists && !mayCreate))
     {
         fprintf(stderr, "[file] open \"%s\": not found\n", guestPath->c_str());
         Complete(iosb, STATUS_OBJECT_NAME_NOT_FOUND, FILE_DOES_NOT_EXIST);
         return STATUS_OBJECT_NAME_NOT_FOUND;
     }
-
-    std::error_code ec;
-    bool exists = std::filesystem::exists(resolved->host, ec);
-    bool isDir = exists && std::filesystem::is_directory(resolved->host, ec);
+    bool isDir = !staged && exists && std::filesystem::is_directory(resolved->host, ec);
     bool wantDir = (createOptions & FILE_DIRECTORY_FILE) != 0;
 
     auto fail = [&](uint32_t status, uint32_t info) {
@@ -270,6 +306,7 @@ uint32_t NtCreateFile(be<uint32_t>* handleOut, uint32_t desiredAccess, XOBJECT_A
     else
     {
         int flags = wantsWrite ? O_RDWR : O_RDONLY;
+        bool truncate = false;
         if (!exists)
         {
             flags |= O_CREAT;
@@ -278,13 +315,34 @@ uint32_t NtCreateFile(be<uint32_t>* handleOut, uint32_t desiredAccess, XOBJECT_A
         else if (disposition == FILE_SUPERSEDE || disposition == FILE_OVERWRITE || disposition == FILE_OVERWRITE_IF)
         {
             flags |= O_TRUNC | O_RDWR;
+            truncate = true;
             action = disposition == FILE_SUPERSEDE ? FILE_SUPERSEDED : FILE_OVERWRITTEN;
         }
-        file->fd = open(resolved->host.c_str(), flags, 0644);
-        if (file->fd < 0)
+        file->writable = (flags & O_RDWR) != 0;
+        if (stagedLock.owns_lock() && (staged || file->writable || !exists))
         {
-            DestroyKernelObject(file);
-            return fail(STATUS_ACCESS_DENIED, 0);
+            // A save: written through its rewrite (vfs::StagedFile), never in
+            // place. A handle that only reads an old save reads it directly.
+            int error = 0;
+            file->fd = saves.OpenLocked(staged, resolved->host, resolved->contentRoot, exists && !truncate, truncate,
+                error);
+            if (file->fd < 0)
+            {
+                fprintf(stderr, "[file] open \"%s\": can't write %s: %s\n", guestPath->c_str(),
+                    staged ? staged->temp.c_str() : resolved->host.c_str(), strerror(error));
+                DestroyKernelObject(file);
+                return fail(STATUS_ACCESS_DENIED, 0);
+            }
+            file->staged = staged;
+        }
+        else
+        {
+            file->fd = open(resolved->host.c_str(), flags, 0644);
+            if (file->fd < 0)
+            {
+                DestroyKernelObject(file);
+                return fail(STATUS_ACCESS_DENIED, 0);
+            }
         }
     }
 
@@ -372,7 +430,7 @@ uint32_t NtWriteFile(uint32_t fileHandle, uint32_t eventHandle, uint32_t apcRout
         Complete(iosb, STATUS_INVALID_HANDLE, 0);
         return STATUS_INVALID_HANDLE;
     }
-    if (file->readOnly)
+    if (file->readOnly || !file->writable)
     {
         Complete(iosb, STATUS_ACCESS_DENIED, 0);
         return STATUS_ACCESS_DENIED;
@@ -381,14 +439,48 @@ uint32_t NtWriteFile(uint32_t fileHandle, uint32_t eventHandle, uint32_t apcRout
 
     int64_t offset = byteOffset ? int64_t(*byteOffset) : -1;
     uint64_t pos = offset >= 0 ? uint64_t(offset) : file->position;
-    ssize_t n = pwrite(file->fd, buffer, length, off_t(pos));
-    if (n < 0)
+    // All of it: a single pwrite can store less (a signal, the disk filling
+    // up midway), and reporting the shortfall as success left the game
+    // believing a cut-short save was whole. A page of the buffer the GPU
+    // guard has made unreadable fails with EFAULT instead of faulting (see
+    // NtReadFile): the rest goes through a bounce buffer, whose copy faults
+    // and is handled like any CPU read.
+    const uint8_t* src = static_cast<const uint8_t*>(buffer);
+    uint32_t n = 0;
+    int error = 0;
+    while (n < length)
     {
-        Complete(iosb, STATUS_UNSUCCESSFUL, 0);
-        return STATUS_UNSUCCESSFUL;
+        ssize_t put = pwrite(file->fd, src + n, length - n, off_t(pos + n));
+        if (put < 0 && errno == EFAULT)
+        {
+            static thread_local std::vector<uint8_t> bounce;
+            bounce.assign(src + n, src + length);
+            do
+                put = pwrite(file->fd, bounce.data(), bounce.size(), off_t(pos + n));
+            while (put < 0 && errno == EINTR);
+        }
+        if (put < 0 && errno == EINTR)
+            continue;
+        if (put <= 0)
+        {
+            error = put == 0 ? ENOSPC : errno;
+            break;
+        }
+        n += uint32_t(put);
+    }
+    if (error)
+    {
+        fprintf(stderr, "[file] write of \"%s\" failed: %s (offset %llu, %u bytes)\n", file->guestPath.c_str(),
+            strerror(error), (unsigned long long)(pos + n), length - n);
+        // A save with a failed write is not put in place of the old one.
+        if (file->staged)
+            vfs::Saves().MarkFailed(*file->staged);
+        uint32_t status = error == ENOSPC || error == EDQUOT ? STATUS_DISK_FULL : STATUS_UNSUCCESSFUL;
+        Complete(iosb, status, 0);
+        return status;
     }
     file->position = pos + uint64_t(n);
-    Complete(iosb, STATUS_SUCCESS, uint32_t(n));
+    Complete(iosb, STATUS_SUCCESS, n);
     SignalEvent(eventHandle);
     return file->synchronous ? STATUS_SUCCESS : STATUS_PENDING;
 }
@@ -454,7 +546,7 @@ uint32_t NtQueryInformationFile(uint32_t fileHandle, XIO_STATUS_BLOCK* iosb, uin
         // AllocationSize, EndOfFile (8 each), NumberOfLinks (4), DeletePending, Directory.
         if (length < 22) return STATUS_INFO_LENGTH_MISMATCH;
         memset(info, 0, 24 <= length ? 24 : length);
-        auto a = Stat(file->path, file->readOnly).value_or(HostAttributes{});
+        auto a = Stat(file->path, file->readOnly, file->fd).value_or(HostAttributes{});
         reinterpret_cast<be<uint64_t>*>(info)[0] = AllocationSize(a.size);
         reinterpret_cast<be<uint64_t>*>(info)[1] = a.size;
         *reinterpret_cast<be<uint32_t>*>(info + 16) = 1;
@@ -497,10 +589,14 @@ uint32_t NtSetInformationFile(uint32_t fileHandle, XIO_STATUS_BLOCK* iosb, uint8
         break;
     case XFileEndOfFileInformation:
         if (length < 8) return STATUS_INFO_LENGTH_MISMATCH;
-        if (file->readOnly || file->fd < 0)
+        if (file->readOnly || !file->writable || file->fd < 0)
             status = STATUS_ACCESS_DENIED;
         else if (ftruncate(file->fd, off_t(uint64_t(*reinterpret_cast<be<uint64_t>*>(info)))) != 0)
+        {
             status = STATUS_UNSUCCESSFUL;
+            if (file->staged)
+                vfs::Saves().MarkFailed(*file->staged);  // as a failed write: the old save is kept
+        }
         written = 8;
         break;
     case XFileAllocationInformation:
@@ -529,10 +625,13 @@ uint32_t NtQueryFullAttributesFile(XOBJECT_ATTRIBUTES* attributes, X_FILE_NETWOR
     auto guestPath = ObjectPath(attributes);
     if (!guestPath)
         return STATUS_INVALID_HANDLE;
-    auto resolved = vfs::Resolve(*guestPath, true);
+    // As for creating: a new save still being written is found by GuestStat
+    // though it isn't on the disk yet (a path that isn't anywhere fails
+    // there).
+    auto resolved = vfs::Resolve(*guestPath, false);
     if (!resolved)
         return STATUS_NO_SUCH_FILE;
-    auto a = Stat(resolved->host, resolved->readOnly);
+    auto a = GuestStat(resolved->host, resolved->readOnly);
     if (!a)
         return STATUS_NO_SUCH_FILE;
     info->creationTime = a->writeTime;
@@ -571,8 +670,21 @@ uint32_t NtQueryDirectoryFile(uint32_t fileHandle, uint32_t eventHandle, uint32_
         dir->entries.clear();
         std::error_code ec;
         for (auto& e : std::filesystem::directory_iterator(dir->path, ec))
-            if (vfs::WildcardMatch(dir->pattern, e.path().filename().string()))
+        {
+            std::string name = e.path().filename().string();
+            // Saves' temporary files (vfs::StagedFile) aren't the guest's.
+            if (!vfs::IsStagingName(name) && vfs::WildcardMatch(dir->pattern, name))
                 dir->entries.push_back(e.path());
+        }
+        {
+            // New saves still being written, which are on the disk only as
+            // their temporary files until committed.
+            std::lock_guard lock(vfs::Saves().Mutex());
+            for (const auto& [target, staged] : vfs::Saves().FilesLocked())
+                if (target.parent_path() == dir->path && !std::filesystem::exists(target, ec) &&
+                    vfs::WildcardMatch(dir->pattern, target.filename().string()))
+                    dir->entries.push_back(target);
+        }
         std::sort(dir->entries.begin(), dir->entries.end());
         dir->nextEntry = 0;
     }
@@ -593,7 +705,7 @@ uint32_t NtQueryDirectoryFile(uint32_t fileHandle, uint32_t eventHandle, uint32_
     }
     dir->nextEntry++;
 
-    auto a = Stat(entry, dir->readOnly).value_or(HostAttributes{});
+    auto a = GuestStat(entry, dir->readOnly).value_or(HostAttributes{});
     info->nextEntryOffset = 0;
     info->fileIndex = uint32_t(dir->nextEntry);
     info->creationTime = a.writeTime;

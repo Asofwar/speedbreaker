@@ -52,7 +52,8 @@ namespace report
             // A localized desktop folder: XDG_DESKTOP_DIR="$HOME/Schreibtisch"
             // in user-dirs.dirs.
             const char* config = std::getenv("XDG_CONFIG_HOME");
-            std::ifstream dirs(std::filesystem::path(config && *config ? config : std::string(home) + "/.config") / "user-dirs.dirs");
+            // Only an absolute $XDG_CONFIG_HOME counts (the XDG spec; user/paths.h).
+            std::ifstream dirs(std::filesystem::path(config && config[0] == '/' ? config : std::string(home) + "/.config") / "user-dirs.dirs");
             for (std::string line; std::getline(dirs, line);)
                 if (line.starts_with("XDG_DESKTOP_DIR="))
                 {

@@ -3,6 +3,7 @@
 // exports are removed; input returns in Phase 6 on our own SDL3 layer.
 #include <stdafx.h>
 #include "xam.h"
+#include "vfs.h"
 #include "xdm.h"
 #include <cpu/guest_thread.h>
 #include <ranges>
@@ -52,68 +53,85 @@ struct XamEnumeratorBase : KernelObject
     }
 };
 
-template<typename TIterator = std::vector<XHOSTCONTENT_DATA>::iterator>
-struct XamEnumerator : XamEnumeratorBase
+// Content enumeration hands out a copy of the registry taken when the
+// enumerator is created. It used to keep iterators into the registry itself
+// (an unordered_map), which dangled as soon as a save created before the
+// enumerator was closed made the map rehash, and which another thread could
+// change under it. `fetch` items per XamEnumerate call.
+struct XamContentEnumerator : XamEnumeratorBase
 {
-    uint32_t fetch;
-    size_t size;
-    TIterator position;
-    TIterator begin;
-    TIterator end;
-
-    XamEnumerator() = default;
-    XamEnumerator(uint32_t fetch, size_t size, TIterator begin, TIterator end) : fetch(fetch), size(size), position(begin), begin(begin), end(end)
-    {
-
-    }
+    std::vector<XCONTENT_DATA> items;
+    size_t next = 0;
+    uint32_t fetch = 0;
 
     uint32_t Next(void* buffer) override
     {
-        if (position == end)
-        {
+        if (next == items.size())
             return -1;
-        }
-
-        if (buffer == nullptr)
-        {
-            for (size_t i = 0; i < fetch; i++)
-            {
-                if (position == end)
-                {
-                    return i == 0 ? -1 : i;
-                }
-
-                ++position;
-            }
-        }
-
-        for (size_t i = 0; i < fetch; i++)
-        {
-            if (position == end)
-            {
-                return i == 0 ? -1 : i;
-            }
-
-            memcpy(buffer, &*position, size);
-
-            ++position;
-            buffer = (void*)((size_t)buffer + size);
-        }
-
-        return fetch;
+        size_t count = std::min<size_t>(fetch, items.size() - next);
+        // No buffer: skip the items (the old enumerator then went on to copy
+        // them to the null buffer).
+        if (buffer)
+            memcpy(buffer, &items[next], count * sizeof(XCONTENT_DATA));
+        next += count;
+        return uint32_t(count);
     }
 };
 
+// The content packages known (saves found on the disk or created), by type,
+// and the roots (save:, ...) open on them. Guest threads create, enumerate,
+// open, delete and close content concurrently, and vfs::Resolve looks the
+// roots up on every file open: all of it under gContentMutex.
+std::mutex gContentMutex;
 std::array<xxHashMap<XHOSTCONTENT_DATA>, 3> gContentRegistry{};
-static void ScanSavedContent();
+static void ScanSavedContentLocked();
 std::unordered_set<XamListener*> gListeners{};
 // Listeners and their queues: guest threads, and the main thread (the
 // runtime's settings menu announces itself as system UI).
 std::mutex gListenersMutex;
 xxHashMap<std::string> gRootMap;
 
-std::string_view XamGetRootPath(const std::string_view& root)
+namespace
 {
+    constexpr uint32_t XAM_ERROR_INVALID_PARAMETER = 0x57;
+
+    // The registry of a content type (XCONTENTTYPE_SAVEDATA 1, DLC 2,
+    // PUBLISHER 3), or null for any other: the type comes from the guest,
+    // and a 0 or a 4 indexed past the array.
+    xxHashMap<XHOSTCONTENT_DATA>* ContentRegistry(uint32_t type)
+    {
+        return type >= 1 && type <= gContentRegistry.size() ? &gContentRegistry[type - 1] : nullptr;
+    }
+
+    // A package's file name, which has no terminating NUL when it fills all
+    // of szFileName.
+    std::string_view ContentName(const XCONTENT_DATA& data)
+    {
+        return std::string_view(data.szFileName, strnlen(data.szFileName, sizeof(data.szFileName)));
+    }
+
+    // Whether the guest's package name can name a package. An empty one made
+    // ContentRoot the save folder itself, so deleting that "package" deleted
+    // every save; "." and ".." name no package either. Separators and colons
+    // can't leave the save folder (ContentRoot turns them into '_'), so
+    // names with them keep working as they always have.
+    bool ValidContentName(std::string_view name)
+    {
+        return !name.empty() && name != "." && name != "..";
+    }
+
+    void RegisterContentLocked(const XCONTENT_DATA& data, const std::string_view& root)
+    {
+        auto* registry = ContentRegistry(data.dwContentType);
+        if (registry == nullptr)
+            return;
+        registry->emplace(StringHash(ContentName(data)), XHOSTCONTENT_DATA{ data }).first->second.szRoot = root;
+    }
+}
+
+std::string XamGetRootPath(const std::string_view& root)
+{
+    std::lock_guard lock(gContentMutex);
     const auto result = gRootMap.find(StringHash(root));
 
     if (result == gRootMap.end())
@@ -124,6 +142,7 @@ std::string_view XamGetRootPath(const std::string_view& root)
 
 void XamRootCreate(const std::string_view& root, const std::string_view& path)
 {
+    std::lock_guard lock(gContentMutex);
     gRootMap.emplace(StringHash(root), path);
 }
 
@@ -150,9 +169,8 @@ XCONTENT_DATA XamMakeContent(uint32_t type, const std::string_view& name)
 
 void XamRegisterContent(const XCONTENT_DATA& data, const std::string_view& root)
 {
-    const auto idx = data.dwContentType - 1;
-
-    gContentRegistry[idx].emplace(StringHash(data.szFileName), XHOSTCONTENT_DATA{ data }).first->second.szRoot = root;
+    std::lock_guard lock(gContentMutex);
+    RegisterContentLocked(data, root);
 }
 
 void XamRegisterContent(uint32_t type, const std::string_view name, const std::string_view& root)
@@ -287,10 +305,18 @@ uint32_t XamContentCreateEnumerator(uint32_t dwUserIndex, uint32_t DeviceID, uin
         return 0xFFFFFFFF;
     }
 
-    ScanSavedContent();
-    const auto& registry = gContentRegistry[dwContentType - 1];
-    const auto& values = registry | std::views::values;
-    auto* enumerator = CreateKernelObject<XamEnumerator<decltype(values.begin())>>(cItem, sizeof(_XCONTENT_DATA), values.begin(), values.end());
+    std::vector<XCONTENT_DATA> items;
+    {
+        std::lock_guard lock(gContentMutex);
+        ScanSavedContentLocked();
+        // Another content type has no packages: an empty enumeration.
+        if (const auto* registry = ContentRegistry(dwContentType))
+            for (const auto& content : *registry | std::views::values)
+                items.push_back(content);
+    }
+    auto* enumerator = CreateKernelObject<XamContentEnumerator>();
+    enumerator->items = std::move(items);
+    enumerator->fetch = cItem;
 
     if (pcbBuffer)
         *pcbBuffer = sizeof(_XCONTENT_DATA) * cItem;
@@ -337,7 +363,8 @@ static std::filesystem::path ContentRoot(const XCONTENT_DATA& data)
     return GetGamePath();
 }
 
-static void ScanSavedContent()
+// Under gContentMutex.
+static void ScanSavedContentLocked()
 {
     static bool scanned = false;
     if (scanned)
@@ -352,44 +379,46 @@ static void ScanSavedContent()
         std::ifstream f(entry.path(), std::ios::binary);
         if (!f.read(reinterpret_cast<char*>(&data), sizeof(data)) || data.dwContentType != XCONTENTTYPE_SAVEDATA)
             continue;
+        // (Not a name XamContentCreateEx refuses now: the guest couldn't
+        // open or delete it anyway.)
+        if (!ValidContentName(ContentName(data)))
+            continue;
         std::filesystem::path root = ContentRoot(data);
         if (!std::filesystem::is_directory(root, ec))
             continue;
-        XamRegisterContent(data, (const char*)root.u8string().c_str());
+        RegisterContentLocked(data, (const char*)root.u8string().c_str());
         fprintf(stderr, "[xam] found save \"%.*s\"\n", int(strnlen(data.szFileName, sizeof(data.szFileName))), data.szFileName);
     }
 }
 
-uint32_t XamContentCreateEx(uint32_t dwUserIndex, const char* szRootName, const XCONTENT_DATA* pContentData,
-    uint32_t dwContentFlags, be<uint32_t>* pdwDisposition, be<uint32_t>* pdwLicenseMask,
-    uint32_t dwFileCacheSize, uint64_t uliContentSize, PXXOVERLAPPED pOverlapped)
+// XamContentCreateEx's work, under gContentMutex: the check for the package
+// and its creation under one lock, so two threads creating the same package
+// can't both make it. The type and name are valid. Returns the result.
+static uint32_t CreateContentLocked(const char* szRootName, const XCONTENT_DATA* pContentData, uint32_t mode,
+    be<uint32_t>* pdwDisposition)
 {
-    ScanSavedContent();
-    auto& registry = gContentRegistry[pContentData->dwContentType - 1];
-    const auto existing = registry.find(StringHash(pContentData->szFileName));
+    ScanSavedContentLocked();
+    auto& registry = *ContentRegistry(pContentData->dwContentType);
+    const auto existing = registry.find(StringHash(ContentName(*pContentData)));
     const bool exists = existing != registry.end();
-    const auto mode = dwContentFlags & 0xF;  // CREATE_NEW 1, CREATE_ALWAYS 2, OPEN_EXISTING 3, OPEN_ALWAYS 4, TRUNCATE_EXISTING 5
-
-    if (pdwLicenseMask)
-        *pdwLicenseMask = 0xFFFFFFFF;
 
     if (exists && mode == 1)
-        return XamComplete(pOverlapped, XAM_ERROR_ALREADY_EXISTS);
+        return XAM_ERROR_ALREADY_EXISTS;
     if (!exists && (mode == OPEN_EXISTING || mode == 5))
     {
         if (pdwDisposition)
             *pdwDisposition = XCONTENT_NEW;
-        return XamComplete(pOverlapped, ERROR_PATH_NOT_FOUND);
+        return ERROR_PATH_NOT_FOUND;
     }
     if (mode < 1 || mode > 5)
-        return XamComplete(pOverlapped, ERROR_PATH_NOT_FOUND);
+        return ERROR_PATH_NOT_FOUND;
 
     if (exists)
     {
         if (pdwDisposition)
             *pdwDisposition = XCONTENT_EXISTING;
-        XamRootCreate(szRootName, existing->second.szRoot);
-        return XamComplete(pOverlapped, ERROR_SUCCESS);
+        gRootMap.emplace(StringHash(szRootName), existing->second.szRoot);
+        return ERROR_SUCCESS;
     }
 
     std::filesystem::path root = ContentRoot(*pContentData);
@@ -397,22 +426,69 @@ uint32_t XamContentCreateEx(uint32_t dwUserIndex, const char* szRootName, const 
     std::filesystem::create_directories(root, ec);
     if (pContentData->dwContentType == XCONTENTTYPE_SAVEDATA)
     {
+        // A save package that can't be made on the disk (full, read only)
+        // is an error the game reports, not a package that is gone after a
+        // restart. The .xcontent file is written atomically (kernel/vfs.h),
+        // so a crash leaves no cut-short one behind.
+        // (From a copy: the kernel can't fault in a guest page the GPU guard
+        // protects, it fails the write with EFAULT; a plain copy faults and
+        // is handled.)
         std::filesystem::path meta = root;
         meta += ".xcontent";
-        std::ofstream f(meta, std::ios::binary | std::ios::trunc);
-        f.write(reinterpret_cast<const char*>(pContentData), sizeof(XCONTENT_DATA));
+        const XCONTENT_DATA data = *pContentData;
+        std::string error = ec ? "can't create " + root.string() + ": " + ec.message()
+                               : vfs::WriteAtomically(meta, &data, sizeof(data));
+        if (!error.empty())
+        {
+            fprintf(stderr, "[xam] creating save \"%.*s\" failed: %s\n", int(ContentName(*pContentData).size()),
+                pContentData->szFileName, error.c_str());
+            return XAM_ERROR_FUNCTION_FAILED;
+        }
     }
     const std::string rootString = (const char*)root.u8string().c_str();
-    XamRegisterContent(*pContentData, rootString);
-    XamRootCreate(szRootName, rootString);
+    RegisterContentLocked(*pContentData, rootString);
+    gRootMap.emplace(StringHash(szRootName), rootString);
     if (pdwDisposition)
         *pdwDisposition = XCONTENT_NEW;
-    return XamComplete(pOverlapped, ERROR_SUCCESS);
+    return ERROR_SUCCESS;
+}
+
+uint32_t XamContentCreateEx(uint32_t dwUserIndex, const char* szRootName, const XCONTENT_DATA* pContentData,
+    uint32_t dwContentFlags, be<uint32_t>* pdwDisposition, be<uint32_t>* pdwLicenseMask,
+    uint32_t dwFileCacheSize, uint64_t uliContentSize, PXXOVERLAPPED pOverlapped)
+{
+    const auto mode = dwContentFlags & 0xF;  // CREATE_NEW 1, CREATE_ALWAYS 2, OPEN_EXISTING 3, OPEN_ALWAYS 4, TRUNCATE_EXISTING 5
+
+    if (pdwLicenseMask)
+        *pdwLicenseMask = 0xFFFFFFFF;
+
+    if (ContentRegistry(pContentData->dwContentType) == nullptr || !ValidContentName(ContentName(*pContentData)))
+        return XamComplete(pOverlapped, XAM_ERROR_INVALID_PARAMETER);
+
+    uint32_t result;
+    {
+        std::lock_guard lock(gContentMutex);
+        result = CreateContentLocked(szRootName, pContentData, mode, pdwDisposition);
+    }
+    return XamComplete(pOverlapped, result);
 }
 
 uint32_t XamContentClose(const char* szRootName, XXOVERLAPPED* pOverlapped)
 {
-    gRootMap.erase(StringHash(szRootName));
+    std::string root;
+    {
+        std::lock_guard lock(gContentMutex);
+        if (auto it = gRootMap.find(StringHash(szRootName)); it != gRootMap.end())
+        {
+            root = std::move(it->second);
+            gRootMap.erase(it);
+        }
+    }
+    // Files of the package the guest still has open are put in place now,
+    // since the guest is done with the package (outside gContentMutex: this
+    // flushes to the disk, which nothing else should wait for).
+    if (!root.empty())
+        vfs::CommitStagedFiles(root);
     return XamComplete(pOverlapped, ERROR_SUCCESS);
 }
 
@@ -470,13 +546,13 @@ uint32_t XamContentCreate(uint32_t userIndex, const char* rootName, const XCONTE
     return XamContentCreateEx(userIndex, rootName, data, flags, disposition, licenseMask, 0, 0, overlapped);
 }
 
-uint32_t XamContentDelete(uint32_t userIndex, const XCONTENT_DATA* data, XXOVERLAPPED* overlapped)
+// XamContentDelete's work, under gContentMutex. False: no such package.
+static bool DeleteContentLocked(xxHashMap<XHOSTCONTENT_DATA>& registry, const XCONTENT_DATA* data)
 {
-    ScanSavedContent();
-    auto& registry = gContentRegistry[data->dwContentType - 1];
-    auto it = registry.find(StringHash(data->szFileName));
+    ScanSavedContentLocked();
+    auto it = registry.find(StringHash(ContentName(*data)));
     if (it == registry.end())
-        return XamComplete(overlapped, XAM_ERROR_FILE_NOT_FOUND);
+        return false;
     std::error_code ec;
     std::filesystem::path root = ContentRoot(*data);
     if (data->dwContentType == XCONTENTTYPE_SAVEDATA)
@@ -488,12 +564,34 @@ uint32_t XamContentDelete(uint32_t userIndex, const XCONTENT_DATA* data, XXOVERL
         std::filesystem::remove(ThumbnailPath(*data), ec);
     }
     registry.erase(it);
+    return true;
+}
+
+uint32_t XamContentDelete(uint32_t userIndex, const XCONTENT_DATA* data, XXOVERLAPPED* overlapped)
+{
+    // An empty name's root is the save folder itself: remove_all deleted
+    // every save.
+    auto* registry = ContentRegistry(data->dwContentType);
+    if (registry == nullptr || !ValidContentName(ContentName(*data)))
+        return XamComplete(overlapped, XAM_ERROR_INVALID_PARAMETER);
+    bool found;
+    {
+        std::lock_guard lock(gContentMutex);
+        found = DeleteContentLocked(*registry, data);
+    }
+    if (!found)
+        return XamComplete(overlapped, XAM_ERROR_FILE_NOT_FOUND);
     fprintf(stderr, "[xam] deleted content \"%.*s\"\n", int(strnlen(data->szFileName, sizeof(data->szFileName))), data->szFileName);
     return XamComplete(overlapped, ERROR_SUCCESS);
 }
 
+// Puts the files of the package the guest still has open in place (closed
+// ones were when they were closed): what a flush promises, the package's
+// writes on the disk.
 uint32_t XamContentFlush(const char* rootName, XXOVERLAPPED* overlapped)
 {
+    if (std::string root = XamGetRootPath(rootName); !root.empty())
+        vfs::CommitStagedFiles(root);
     return XamComplete(overlapped, ERROR_SUCCESS);
 }
 
@@ -507,6 +605,8 @@ uint32_t XamContentGetLicenseMask(be<uint32_t>* mask, XXOVERLAPPED* overlapped)
 uint32_t XamContentGetThumbnail(uint32_t userIndex, const XCONTENT_DATA* data, uint8_t* buffer, be<uint32_t>* bufferSize,
     XXOVERLAPPED* overlapped)
 {
+    if (ContentRegistry(data->dwContentType) == nullptr || !ValidContentName(ContentName(*data)))
+        return XamComplete(overlapped, XAM_ERROR_INVALID_PARAMETER);
     std::ifstream f(ThumbnailPath(*data), std::ios::binary | std::ios::ate);
     if (!f)
         return XamComplete(overlapped, XAM_ERROR_FILE_NOT_FOUND);
@@ -524,8 +624,17 @@ uint32_t XamContentGetThumbnail(uint32_t userIndex, const XCONTENT_DATA* data, u
 uint32_t XamContentSetThumbnail(uint32_t userIndex, const XCONTENT_DATA* data, const uint8_t* buffer, uint32_t size,
     XXOVERLAPPED* overlapped)
 {
-    std::ofstream f(ThumbnailPath(*data), std::ios::binary | std::ios::trunc);
-    f.write(reinterpret_cast<const char*>(buffer), size);
+    if (ContentRegistry(data->dwContentType) == nullptr || !ValidContentName(ContentName(*data)))
+        return XamComplete(overlapped, XAM_ERROR_INVALID_PARAMETER);
+    // Atomically (kernel/vfs.h), and a failure reported: the unchecked
+    // ofstream left an empty or cut-short image on a full disk or a crash.
+    // From a copy, as the .xcontent file (CreateContentLocked).
+    const std::vector<uint8_t> image(buffer, buffer + size);
+    if (std::string error = vfs::WriteAtomically(ThumbnailPath(*data), image.data(), image.size()); !error.empty())
+    {
+        fprintf(stderr, "[xam] saving a thumbnail failed: %s\n", error.c_str());
+        return XamComplete(overlapped, XAM_ERROR_FUNCTION_FAILED);
+    }
     return XamComplete(overlapped, ERROR_SUCCESS);
 }
 

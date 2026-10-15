@@ -150,6 +150,9 @@ uint32_t ExGetXConfigSetting(uint16_t Category, uint16_t Setting, void* Buffer, 
                 default:
                     return 1;
             }
+            // Without this the AV region fell through into the user
+            // category below, whose time zone case 0x0002 zeroed it again.
+            break;
         }
 
         case 0x0003:
@@ -189,11 +192,16 @@ uint32_t ExGetXConfigSetting(uint16_t Category, uint16_t Setting, void* Buffer, 
                 default:
                     return 1;
             }
+            break;
         }
     }
 
-    *RequiredSize = 4;
-    memcpy(Buffer, data, std::min((size_t)SizeOfBuffer, sizeof(data)));
+    // Both pointers may be null: a caller that knows the size passes no
+    // RequiredSize, and one asking only for the size passes no buffer.
+    if (RequiredSize)
+        *RequiredSize = 4;
+    if (Buffer)
+        memcpy(Buffer, data, std::min((size_t)SizeOfBuffer, sizeof(data)));
 
     return 0;
 }
@@ -493,7 +501,12 @@ uint32_t ExCreateThread(be<uint32_t>* handle, uint32_t stackSize, be<uint32_t>* 
     GuestThreadParams params = xApiThreadStartup != 0
         ? GuestThreadParams{ xApiThreadStartup, startAddress, creationFlags, startContext }
         : GuestThreadParams{ startAddress, startContext, creationFlags };
-    *handle = GetKernelHandle(GuestThread::Start(params, &hostThreadId));
+    // SpeedBreaker: no host thread (GuestThread::Start logged why): the call
+    // fails instead of handing the guest a thread that never runs.
+    GuestThreadHandle* thread = GuestThread::Start(params, &hostThreadId);
+    if (thread == nullptr)
+        return STATUS_NO_MEMORY;
+    *handle = GetKernelHandle(thread);
 
     if (threadId != nullptr)
         *threadId = hostThreadId;

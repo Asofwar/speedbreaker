@@ -1,5 +1,6 @@
 // Adapted from Unleashed Recompiled (https://github.com/hedge-dev/UnleashedRecomp), GPL-3.0-or-later.
 #pragma once
+#include <string>
 #include <xbox.h>
 
 #define MSGID(Area, Number) (uint32_t)((uint16_t)(Area) << 16 | (uint16_t)(Number))
@@ -9,7 +10,9 @@
 XCONTENT_DATA XamMakeContent(uint32_t type, const std::string_view& name);
 void XamRegisterContent(const XCONTENT_DATA& data, const std::string_view& root);
 
-std::string_view XamGetRootPath(const std::string_view& root);
+// The host folder a root (save:, ...) is open on, or "". A copy, not a view
+// into the root table: XamContentClose may remove the root meanwhile.
+std::string XamGetRootPath(const std::string_view& root);
 void XamRootCreate(const std::string_view& root, const std::string_view& path);
 
 uint32_t XamNotifyCreateListener(uint64_t qwAreas);

@@ -7,6 +7,7 @@
 #include <stdafx.h>
 #include <kernel/function.h>
 #include <kernel/overlapped.h>
+#include <kernel/vfs.h>
 #include <user/paths.h>
 
 #include <fstream>
@@ -121,25 +122,23 @@ namespace
         }
     }
 
+    // Atomically (kernel/vfs.h: flushed to the disk before the rename, and
+    // nothing renamed after a failed write). The unchecked ofstream and
+    // rename it replaces put an empty or cut-short file over the good one
+    // after a full disk or a crash, losing the game's options. The settings
+    // stay in s_blobs for this session either way: a failure is logged.
     void SaveBlobs()
     {
-        std::error_code ec;
-        std::filesystem::create_directories(GetUserPath(), ec);
-        std::filesystem::path tmp = BlobPath();
-        tmp += ".tmp";
+        std::string bytes;
+        for (const auto& [id, data] : s_blobs)
         {
-            std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-            for (const auto& [id, data] : s_blobs)
-            {
-                uint32_t size = uint32_t(data.size());
-                f.write(reinterpret_cast<const char*>(&id), 4);
-                f.write(reinterpret_cast<const char*>(&size), 4);
-                f.write(reinterpret_cast<const char*>(data.data()), size);
-            }
+            uint32_t size = uint32_t(data.size());
+            bytes.append(reinterpret_cast<const char*>(&id), 4);
+            bytes.append(reinterpret_cast<const char*>(&size), 4);
+            bytes.append(reinterpret_cast<const char*>(data.data()), size);
         }
-        std::filesystem::rename(tmp, BlobPath(), ec);
-        if (ec)
-            fprintf(stderr, "[profile] saving %s failed: %s\n", BlobPath().string().c_str(), ec.message().c_str());
+        if (std::string error = vfs::WriteAtomically(BlobPath(), bytes.data(), bytes.size()); !error.empty())
+            fprintf(stderr, "[profile] saving %s failed: %s\n", BlobPath().string().c_str(), error.c_str());
     }
 
     uint32_t Finish(XXOVERLAPPED* overlapped, uint32_t result)
