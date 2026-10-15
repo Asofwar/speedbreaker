@@ -123,6 +123,16 @@ sb_test(front_end_matrix_test)
 sb_test(fullscreen_policy_test ARGS ${RT}/video/presenter.cpp)
 # Game time in whole vblanks (game/whole_vblanks.h), header only.
 sb_test(whole_vblanks_test)
+# The timedemo (game/timedemo.h, header only): its switches, which Joylog
+# path goes where, the DbgBreakPoint callers that are the log's checks, the
+# fixed step, the uncapped swap and the capture's .json; the runtime folder
+# is read to check vfs.cpp, frame_time.cpp, movie_pacing.cpp, main.cpp,
+# ui.cpp, imports_unleashed.cpp and timedemo.cpp use it.
+sb_test(timedemo_logic_test ARGS ${RT})
+# The timedemo benchmark's statistics and report formats (debug/bench_stats.h,
+# header only): nearest-rank percentiles, the 1% and 0.1% low averages,
+# FNV-1a 64, the JSON and CSV writers.
+sb_test(bench_stats_test)
 # The nitrous light trails' ring at the 360's 30 fps length (game/light_trails.h,
 # header only; GitHub issue #10).
 sb_test(light_trails_test)
@@ -137,6 +147,8 @@ if(Python3_FOUND)
     add_test(NAME report_zip_check COMMAND Python3::Interpreter ${CMAKE_CURRENT_SOURCE_DIR}/report_zip_check.py
         ${CMAKE_CURRENT_BINARY_DIR}/report_zip_out)
     set_tests_properties(report_zip_check PROPERTIES DEPENDS report_zip_test)
+    # scripts/bench_compare.py on made-up timedemo reports (docs/timedemo.md).
+    add_test(NAME bench_compare_test COMMAND Python3::Interpreter ${CMAKE_CURRENT_SOURCE_DIR}/bench_compare_test.py)
 endif()
 # "Choose a folder..." in the installer (install/placement.h): where the game
 # goes in a picked folder and what is refused, on planted facts and in a
@@ -177,6 +189,10 @@ if(NOT WIN32)
     # $XDG_CACHE_HOME is ignored. POSIX only (mkdtemp, setrlimit, setenv).
     sb_test(saves_atomic_test ARGS ${CMAKE_CURRENT_BINARY_DIR})
     sb_test(saves_xdg_paths_test)
+    # NFSMW_SAVE_DIR (user/paths.h, header only): saves and
+    # profile_settings.bin from an absolute folder, as before otherwise;
+    # imports_user.cpp and xam.cpp are read. POSIX only (setenv).
+    sb_test(timedemo_save_dir_test ARGS ${RT})
 endif()
 # The SteamOS launcher's hybrid-graphics part (NVIDIA PRIME render offload,
 # scripts/steamos/bundle/speedbreaker.sh) on made-up /sys, /proc and Vulkan

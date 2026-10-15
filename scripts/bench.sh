@@ -1,9 +1,15 @@
 #!/bin/bash
+# Superseded by scripts/timedemo.sh (docs/timedemo.md): a recorded race
+# replayed frame for frame, measured in motion, with percentiles and a
+# report that scripts/bench_compare.py compares. This one stays for a quick
+# look without a recorded race (its taps expect a new profile's career).
+#
 # Repeatable in-race benchmark: career -> first race -> pause menu (the full
 # 3D scene keeps rendering behind it), then average the [perf] lines logged
 # between BENCH_FROM and BENCH_TO seconds. Extra env vars pass through.
 #   scripts/bench.sh [label]
 cd "$(dirname "$0")/.." || exit 1
+echo "bench.sh: superseded by scripts/timedemo.sh (docs/timedemo.md)" >&2
 FROM=${BENCH_FROM:-175}
 TO=${BENCH_TO:-205}
 LOG=build/bench_${1:-run}.log
