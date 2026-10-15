@@ -1,10 +1,11 @@
 // SpeedBreaker runtime. GPL-3.0-or-later (see COPYING).
 //
-// Object manager. Kernel objects live until NtClose destroys them (see
-// xdm.h), so reference counting is not modelled yet: references taken with
-// ObReferenceObjectByHandle / ObReferenceObject are simply not counted.
-// If the game ever closes a handle while still holding a reference, this is
-// where to add real counts.
+// Object manager. Kernel objects are reference counted (handles, running
+// threads, waits and armed timers hold references, see xdm.h), but
+// references taken with ObReferenceObjectByHandle / ObReferenceObject are
+// not counted yet. If the game ever closes a handle while still holding
+// such a reference, this is where to add real counts (together with
+// ObReferenceObjectByHandle, which returns the handle itself).
 #include <stdafx.h>
 #include "function.h"
 #include "xdm.h"

@@ -31,6 +31,9 @@ namespace
             fprintf(stderr, "[sync] %s: named objects are not supported yet (creating an unnamed one)\n", who);
     }
 
+    // WaitForObjects holds each object for the whole wait. Not covered: a
+    // handle closed between its lookup here and that point, a race in the
+    // guest itself (on the 360 the wait fails or not, by which came first).
     uint32_t WaitHandles(std::span<const be<uint32_t>> handles, bool waitAll, const be<int64_t>* timeout)
     {
         std::vector<Waitable*> objects;
@@ -241,17 +244,28 @@ uint32_t NtWaitForMultipleObjectsEx(uint32_t count, be<uint32_t>* handles, uint3
 uint32_t NtSignalAndWaitForSingleObjectEx(uint32_t signalHandle, uint32_t waitHandle, uint32_t alertable,
     uint32_t unknown, be<int64_t>* timeout)
 {
-    KernelObject* signal = IsKernelObject(signalHandle) ? GetKernelObject(signalHandle) : nullptr;
-    if (auto* e = dynamic_cast<EventObject*>(signal))
-        e->Set();
-    else if (auto* s = dynamic_cast<SemaphoreObject*>(signal))
-        s->Release(1, nullptr);
-    else if (auto* m = dynamic_cast<MutantObject*>(signal))
-        m->Release(nullptr);
-    else
+    auto* e = FromHandle<EventObject>(signalHandle);
+    auto* s = FromHandle<SemaphoreObject>(signalHandle);
+    auto* m = FromHandle<MutantObject>(signalHandle);
+    if (e == nullptr && s == nullptr && m == nullptr)
         return STATUS_OBJECT_TYPE_MISMATCH;
-    be<uint32_t> h = waitHandle;
-    return WaitHandles({ &h, 1 }, false, timeout);
+    // Both objects are looked up before the signal, as the 360's kernel
+    // does (an invalid wait handle signals nothing), and the one waited on
+    // is held from then: the thread the signal wakes may close its handle
+    // before the wait starts (WaitForObjects holds it from there on).
+    Waitable* w = WaitableFromHandle(waitHandle);
+    if (w == nullptr)
+        return STATUS_INVALID_HANDLE;
+    RetainKernelObject(w);
+    if (e != nullptr)
+        e->Set();
+    else if (s != nullptr)
+        s->Release(1, nullptr);
+    else
+        m->Release(nullptr);
+    uint32_t status = WaitForObjects({ &w, 1 }, false, Deadline(timeout));
+    ReleaseKernelObject(w);
+    return status;
 }
 
 // ---- Delays --------------------------------------------------------------------

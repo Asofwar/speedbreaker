@@ -87,7 +87,8 @@ struct KernelObject
 {
     // SpeedBreaker: handles are reference counted. Each handle (creation,
     // NtDuplicateObject) holds one reference and NtClose releases it; a
-    // running thread also holds one on its own object.
+    // running thread also holds one on its own object, a wait one on each
+    // object it waits on, and an armed timer one on itself.
     std::atomic<uint32_t> refs{ 1 };
 
     virtual ~KernelObject() 
