@@ -27,7 +27,7 @@
 // frames (stream_hold.h): until then a position is reported as 0 even if data
 // is in, and from then on the main thread waits for the data if it isn't
 // (kWaitMax at most, after which the status goes to the game as it is; a
-// hold, too, lets go after kWaitMax, should a frame ask again and again
+// hold, too, lets go after kWaitMax, should one frame ask again and again
 // without ending). The wait is between two calls of the wrapper, so the sound
 // lock isn't held meanwhile. The player's own threads and its own update see the channel as
 // it is. Each stream's first data leaves a [timedemo] stream line. Outside a
@@ -47,9 +47,13 @@ namespace
     constexpr auto kWaitStep = std::chrono::microseconds(500);
 
     game::streams::Channel s_channels[kChannels];  // the main thread's only
-    // When each channel's hold began (host time): a hold that outlasts
-    // kWaitMax (a frame that never ends, asking again and again) lets go.
+    // When each held channel's current frame first asked (host time), and
+    // that frame's loop: a hold that one frame asks about for kWaitMax (a
+    // frame that never ends, asking again and again) lets go. The count
+    // starts again with each frame, so a slow frame inside the hold (a load,
+    // a pipeline built on the spot, a debugger) doesn't end it a frame early.
     std::chrono::steady_clock::time_point s_heldSince[kChannels];
+    uint32_t s_heldLoop[kChannels];
 }
 
 PPC_FUNC(sub_821C8AD8)
@@ -68,8 +72,11 @@ PPC_FUNC(sub_821C8AD8)
     auto next = [&] { return game::streams::Next(c, loop, PPC_LOAD_U32(out.u32), PPC_LOAD_U32(out.u32 + 8)); };
     Action action = next();
     const auto start = std::chrono::steady_clock::now();
-    if (!held && c.phase == game::streams::Channel::Phase::Held)
+    if (c.phase == game::streams::Channel::Phase::Held && (!held || loop != s_heldLoop[channel]))
+    {
         s_heldSince[channel] = start;
+        s_heldLoop[channel] = loop;
+    }
     if (action == Action::Hide)
     {
         if (start - s_heldSince[channel] > kWaitMax)
