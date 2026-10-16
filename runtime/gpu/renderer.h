@@ -171,6 +171,11 @@ namespace gpu::renderer
         CP_OPT_TEXTURE_CACHE = 32,   // texture lookups kept per fetch slot (NFSMW_TEXTURE_CACHE=0)
         CP_OPT_SHADER_CACHE = 64,    // IM_LOAD shaders found by address (NFSMW_SHADER_CACHE=0)
         CP_OPT_VERTEX_SPANS = 128,   // vertex snapshots copy only what the draw's indices reach (gpu/vertex_snapshot.h)
+        CP_OPT_DYNAMIC_STATE = 256,  // cull mode, front face, depth and stencil tests set per draw, not in the pipeline
+                                     // (where the device has VK_EXT_extended_dynamic_state: NFSMW_DYNAMIC_STATE, presenter)
+        CP_OPT_KEEP_BINDINGS = 512,  // the ring stays bound as the index buffer (firstIndex picks a draw's indices),
+                                     // compute work leaves the graphics bindings bound, push constants pushed from the
+                                     // first changed row
     };
     inline const uint32_t g_cpOpt = [] { const char* v = std::getenv("NFSMW_CP_OPT"); return v ? uint32_t(strtoul(v, nullptr, 0)) : ~0u; }();
 

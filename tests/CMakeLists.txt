@@ -68,6 +68,12 @@ sb_test(gpu_texture_formats_test ARGS ${RT}/gpu/renderer.cpp ${RT}/gpu/shader_tr
 # copies the spans and the shaders address vertices as modelled.
 sb_test(gpu_vertex_snapshot_test SOURCES ${RT}/gpu/shader_translator.cpp ${RT}/gpu/xenos/ucode.cpp
     ARGS ${RT}/gpu/renderer.cpp ${RT}/gpu/shader_translator.cpp)
+# Draw state the renderer records two ways (gpu/draw_state.h, header only):
+# the depth and stencil tests a pipeline bakes in or a draw sets as dynamic
+# state, and the push-constant rows a draw changes; renderer.cpp is read to
+# check both ways take the tests from it and Draw sets what its pipelines
+# leave dynamic.
+sb_test(gpu_draw_state_test ARGS ${RT}/gpu/renderer.cpp)
 # Which front image the renderer's next swap writes (gpu/front_ring.h,
 # header only): a model of the presenter and the renderer, which must show
 # every frame as itself or count it as dropped (v0.1.4's single image lost

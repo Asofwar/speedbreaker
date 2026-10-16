@@ -2036,12 +2036,18 @@ void main()
 #ifdef VK_EXT_depth_bias_control
         bool depthBiasControl = false;
 #endif
+#ifdef VK_EXT_extended_dynamic_state
+        bool dynamicState = false;
+#endif
         for (auto& e : avail)
         {
             displayTiming |= strcmp(e.extensionName, VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME) == 0;
             mirrorClamp |= strcmp(e.extensionName, VK_KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_EXTENSION_NAME) == 0;
 #ifdef VK_EXT_depth_bias_control
             depthBiasControl |= strcmp(e.extensionName, VK_EXT_DEPTH_BIAS_CONTROL_EXTENSION_NAME) == 0;
+#endif
+#ifdef VK_EXT_extended_dynamic_state
+            dynamicState |= strcmp(e.extensionName, VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME) == 0;
 #endif
             if (strcmp(e.extensionName, "VK_KHR_portability_subset") == 0)
                 devExts.push_back("VK_KHR_portability_subset");
@@ -2110,6 +2116,44 @@ void main()
             depthBiasFeatures.leastRepresentableValueForceUnormRepresentation = VK_TRUE;
             depthBiasFeatures.depthBiasExact = exact;
             devExts.push_back(VK_EXT_DEPTH_BIAS_CONTROL_EXTENSION_NAME);
+        }
+#endif
+        // The renderer sets cull mode, front face and the depth and stencil
+        // tests per draw (VK_EXT_extended_dynamic_state) instead of baking
+        // them into its pipelines, where the device has it (RADV, Turnip,
+        // MoltenVK): the game switches them between draws of the same
+        // shaders (front face for mirrored meshes, depth writes around the
+        // transparent ones), about 1 race draw in 20 bound another pipeline
+        // only for them, and each such bind cost RADV about 1 us of command
+        // processor time (it emits all of a pipeline's state again at the
+        // next draw; gpu/renderer.cpp, CP_OPT_DYNAMIC_STATE). Enabling it
+        // changes nothing until a pipeline asks for the dynamic states.
+        // NFSMW_DYNAMIC_STATE=0 leaves it off, =1 on; on by default except on
+        // Apple platforms (MoltenVK has it, but it is untested there). Off,
+        // the device is created as without it.
+#ifdef VK_EXT_extended_dynamic_state
+        VkPhysicalDeviceExtendedDynamicStateFeaturesEXT dynamicStateFeatures{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT };
+#if defined(__APPLE__)
+        constexpr bool kDynamicStateByDefault = false;
+#else
+        constexpr bool kDynamicStateByDefault = true;
+#endif
+        const char* dynamicStateSwitch = std::getenv("NFSMW_DYNAMIC_STATE");
+        const bool dynamicStateWanted = dynamicStateSwitch ? dynamicStateSwitch[0] == '1' : kDynamicStateByDefault;
+        if (dynamicState && dynamicStateWanted)
+        {
+            VkPhysicalDeviceFeatures2 features2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 };
+            features2.pNext = &dynamicStateFeatures;
+            vkGetPhysicalDeviceFeatures2(s_physical, &features2);
+            dynamicState = dynamicStateFeatures.extendedDynamicState;
+        }
+        else
+            dynamicState = false;
+        if (dynamicState)
+        {
+            dynamicStateFeatures = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT };
+            dynamicStateFeatures.extendedDynamicState = VK_TRUE;
+            devExts.push_back(VK_EXT_EXTENDED_DYNAMIC_STATE_EXTENSION_NAME);
         }
 #endif
         // NFSMW_SHADING_RATE=<w>x<h>: an experiment (presenter.h).
@@ -2234,6 +2278,13 @@ void main()
             dci.pNext = &depthBiasFeatures;
         }
 #endif
+#ifdef VK_EXT_extended_dynamic_state
+        if (dynamicState)
+        {
+            dynamicStateFeatures.pNext = const_cast<void*>(dci.pNext);
+            dci.pNext = &dynamicStateFeatures;
+        }
+#endif
         dci.pEnabledFeatures = &features;
         dci.queueCreateInfoCount = 1;
         dci.pQueueCreateInfos = &qci;
@@ -2327,6 +2378,36 @@ void main()
                 ? (s_context.depthBiasExact ? "in unorm24 steps, exact (VK_EXT_depth_bias_control)" : "in unorm24 steps (VK_EXT_depth_bias_control)")
             : unormBiasOff ? "the float depth's steps (NFSMW_DEPTH_BIAS_UNORM=0): less below depth 0.5"
                            : "the float depth's steps (no VK_EXT_depth_bias_control FORCE_UNORM on this device): less below depth 0.5");
+#endif
+#ifdef VK_EXT_extended_dynamic_state
+        if (dynamicState)
+        {
+            VulkanContext& c = s_context;
+            c.cmdSetCullMode = (PFN_vkCmdSetCullModeEXT)vkGetDeviceProcAddr(s_device, "vkCmdSetCullModeEXT");
+            c.cmdSetFrontFace = (PFN_vkCmdSetFrontFaceEXT)vkGetDeviceProcAddr(s_device, "vkCmdSetFrontFaceEXT");
+            c.cmdSetDepthTestEnable = (PFN_vkCmdSetDepthTestEnableEXT)vkGetDeviceProcAddr(s_device, "vkCmdSetDepthTestEnableEXT");
+            c.cmdSetDepthWriteEnable = (PFN_vkCmdSetDepthWriteEnableEXT)vkGetDeviceProcAddr(s_device, "vkCmdSetDepthWriteEnableEXT");
+            c.cmdSetDepthCompareOp = (PFN_vkCmdSetDepthCompareOpEXT)vkGetDeviceProcAddr(s_device, "vkCmdSetDepthCompareOpEXT");
+            c.cmdSetStencilTestEnable = (PFN_vkCmdSetStencilTestEnableEXT)vkGetDeviceProcAddr(s_device, "vkCmdSetStencilTestEnableEXT");
+            c.cmdSetStencilOp = (PFN_vkCmdSetStencilOpEXT)vkGetDeviceProcAddr(s_device, "vkCmdSetStencilOpEXT");
+            // All or none: the renderer takes the states out of its
+            // pipelines only when it can set every one of them.
+            if (!c.cmdSetCullMode || !c.cmdSetFrontFace || !c.cmdSetDepthTestEnable || !c.cmdSetDepthWriteEnable ||
+                !c.cmdSetDepthCompareOp || !c.cmdSetStencilTestEnable || !c.cmdSetStencilOp)
+            {
+                c.cmdSetCullMode = nullptr;
+                c.cmdSetFrontFace = nullptr;
+                c.cmdSetDepthTestEnable = nullptr;
+                c.cmdSetDepthWriteEnable = nullptr;
+                c.cmdSetDepthCompareOp = nullptr;
+                c.cmdSetStencilTestEnable = nullptr;
+                c.cmdSetStencilOp = nullptr;
+            }
+        }
+        fprintf(stderr, "[video] cull mode, front face, depth and stencil tests: %s\n", s_context.cmdSetCullMode
+                ? "set per draw (VK_EXT_extended_dynamic_state)"
+            : !dynamicStateWanted ? "in the pipelines (NFSMW_DYNAMIC_STATE off)"
+                                  : "in the pipelines (no VK_EXT_extended_dynamic_state on this device)");
 #endif
         s_contextReady = true;
         s_settingsGeneration = settings::Generation();

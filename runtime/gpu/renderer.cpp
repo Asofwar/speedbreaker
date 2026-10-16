@@ -9,6 +9,7 @@
 #include <debug/timeline.h>
 #include <unordered_set>
 #include "block_ranges.h"
+#include "draw_state.h"
 #include "edge_bars.h"
 #include "front_ring.h"
 #include "memory_plan.h"
@@ -62,6 +63,10 @@ namespace gpu::renderer
         VkDevice s_dev = VK_NULL_HANDLE;
         const uint32_t* s_regs = nullptr;
         PFN_vkCmdPushDescriptorSetKHR s_pushDescriptorSet = nullptr;
+        // CP_OPT_DYNAMIC_STATE where the device has VK_EXT_extended_dynamic_state
+        // (the presenter's function pointers): cull mode, front face and the
+        // depth and stencil tests are set per draw, not baked into pipelines.
+        bool s_dynamicState = false;  // constant after Initialize
         Stats s_stats{};
         // NFSMW_GPU_EXP bitmask, for performance experiments: 1 skip draw
         // calls, 2 skip resolve copies, 4 skip texture loads, 8 bind 1x1
@@ -764,8 +769,25 @@ namespace gpu::renderer
 
         void EndPass();
         // Bumped when the command buffer's graphics state is unknown (a new
-        // command buffer; compute work, which shares the push constants).
+        // command buffer; without CP_OPT_KEEP_BINDINGS also compute work,
+        // which shares the push constants).
         uint64_t s_stateEpoch = 1;
+        // Bumped by compute work with CP_OPT_KEEP_BINDINGS: the next draw
+        // pushes all of its push constants again (RADV keeps one copy of them
+        // for both bind points, so a dispatch's overwrites the draw's), and
+        // keeps the rest. Compute work binds its pipeline and descriptors at
+        // the compute bind point, which leaves the graphics one's bound, and
+        // no dynamic state changes (the Vulkan spec), so the draw after a
+        // resolve or an untile no longer binds and sets everything again
+        // (about 15 times a race frame, ~3 us each on RADV).
+        uint64_t s_pushEpoch = 1;
+        void ComputeWorkRecorded()
+        {
+            if (g_cpOpt & CP_OPT_KEEP_BINDINGS)
+                s_pushEpoch++;
+            else
+                s_stateEpoch++;
+        }
 
         // Write-watch GPU guard for the submission being recorded, once per
         // range and submission (the same vertex buffer serves many draws).
@@ -2538,8 +2560,10 @@ namespace gpu::renderer
             uint32_t depthFormat;
             uint32_t blend[4];       // RB_BLENDCONTROL, or ~0u when blending is off
             uint32_t colorMask;      // 4 bits per target
-            uint32_t depthControl;   // RB_DEPTHCONTROL (0 without a depth target, or one attached for the pass only)
-            uint32_t raster;         // cull | front CW << 2 | depth clamp << 3 | depth bias << 4
+            uint32_t depthControl;   // RB_DEPTHCONTROL (0 without a depth target, or one attached for the pass only;
+                                     // 0 with dynamic state)
+            uint32_t raster;         // cull | front CW << 2 | depth clamp << 3 | depth bias << 4 | alpha test << 5 |
+                                     // dynamic state << 6 (CP_OPT_DYNAMIC_STATE: no cull or front face then)
             uint32_t pad;
 
             bool operator==(const PipelineKey& o) const { return memcmp(this, &o, sizeof(*this)) == 0; }
@@ -2640,19 +2664,16 @@ namespace gpu::renderer
             VkPipelineDepthStencilStateCreateInfo dss{ VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
             if (key.depthFormat != 0)
             {
-                reg::RB_DEPTHCONTROL dc{};
-                dc.value = key.depthControl;
-                dss.depthTestEnable = dc.z_enable;
-                dss.depthWriteEnable = dc.z_enable && dc.z_write_enable;
-                dss.depthCompareOp = VkCompareOp(dc.zfunc);
-                dss.stencilTestEnable = dc.stencil_enable;
-                dss.front = { VkStencilOp(dc.stencilfail), VkStencilOp(dc.stencilzpass), VkStencilOp(dc.stencilzfail),
-                    VkCompareOp(dc.stencilfunc), 0xFF, 0xFF, 0 };
-                if (dc.backface_enable)
-                    dss.back = { VkStencilOp(dc.stencilfail_bf), VkStencilOp(dc.stencilzpass_bf), VkStencilOp(dc.stencilzfail_bf),
-                        VkCompareOp(dc.stencilfunc_bf), 0xFF, 0xFF, 0 };
-                else
-                    dss.back = dss.front;
+                // As Draw sets them per draw with CP_OPT_DYNAMIC_STATE (gpu/draw_state.h).
+                const gpu::draw_state::DepthStencil d = gpu::draw_state::FromDepthControl(key.depthControl);
+                dss.depthTestEnable = d.depthTest;
+                dss.depthWriteEnable = d.depthWrite;
+                dss.depthCompareOp = VkCompareOp(d.depthCompareOp);
+                dss.stencilTestEnable = d.stencilTest;
+                dss.front = { VkStencilOp(d.front.failOp), VkStencilOp(d.front.passOp), VkStencilOp(d.front.depthFailOp),
+                    VkCompareOp(d.front.compareOp), 0xFF, 0xFF, 0 };
+                dss.back = { VkStencilOp(d.back.failOp), VkStencilOp(d.back.passOp), VkStencilOp(d.back.depthFailOp),
+                    VkCompareOp(d.back.compareOp), 0xFF, 0xFF, 0 };
             }
 
             VkPipelineColorBlendAttachmentState att[4]{};
@@ -2680,11 +2701,22 @@ namespace gpu::renderer
             cb.attachmentCount = 4;
             cb.pAttachments = att;
 
-            VkDynamicState dyn[] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
+            VkDynamicState dyn[14] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
                 VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
                 VK_DYNAMIC_STATE_DEPTH_BIAS };
+            uint32_t dynCount = 7;
+#ifdef VK_EXT_extended_dynamic_state
+            // Raster bit 6 (CP_OPT_DYNAMIC_STATE): cull mode, front face and
+            // the depth and stencil tests are set per draw (Draw), and the
+            // key leaves them out (rs and dss above hold zeros, ignored).
+            if ((key.raster >> 6) & 1)
+                for (VkDynamicState d : { VK_DYNAMIC_STATE_CULL_MODE_EXT, VK_DYNAMIC_STATE_FRONT_FACE_EXT, VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE_EXT,
+                         VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE_EXT, VK_DYNAMIC_STATE_DEPTH_COMPARE_OP_EXT, VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE_EXT,
+                         VK_DYNAMIC_STATE_STENCIL_OP_EXT })
+                    dyn[dynCount++] = d;
+#endif
             VkPipelineDynamicStateCreateInfo ds{ VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
-            ds.dynamicStateCount = uint32_t(std::size(dyn));
+            ds.dynamicStateCount = dynCount;
             ds.pDynamicStates = dyn;
 
             VkPipelineRenderingCreateInfoKHR rci{ VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR };
@@ -4250,7 +4282,7 @@ void main()
                             };
                             if (!t.uploaded && slice == 0)
                                 ToGeneral(t.image.image, VK_IMAGE_ASPECT_COLOR_BIT, layers);
-                            s_stateEpoch++;
+                            ComputeWorkRecorded();
                             vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_untileStorePipeline);
                             s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_untileStoreLayout, 0, AddSharedParts(w, 2), w);
                             vkCmdPushConstants(s_cmd, s_untileStoreLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uc), &uc);
@@ -4280,7 +4312,7 @@ void main()
                             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &s_sharedInfo[0], nullptr },
                             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &ring, nullptr },
                         };
-                        s_stateEpoch++;
+                        ComputeWorkRecorded();
                         vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_untilePipeline);
                         s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_untileLayout, 0, AddSharedParts(w, 2), w);
                         vkCmdPushConstants(s_cmd, s_untileLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uc), &uc);
@@ -4338,7 +4370,7 @@ void main()
                                 { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &s_sharedInfo[0], nullptr },
                                 { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &ring, nullptr },
                             };
-                            s_stateEpoch++;
+                            ComputeWorkRecorded();
                             vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_untilePipeline);
                             s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_untileLayout, 0, AddSharedParts(w, 2), w);
                             vkCmdPushConstants(s_cmd, s_untileLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uc), &uc);
@@ -5630,7 +5662,7 @@ void main()
                         VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &table, nullptr };
                     w[4] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 4, 0, 1,
                         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ti, nullptr, nullptr };
-                    s_stateEpoch++;
+                    ComputeWorkRecorded();
                     bool coalesced = scaledWrite && s_scaled.coalesce;  // 32x2 pixels a group
                     vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ResolvePipeline(coalesced, source->scale));
                     s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_resolveLayout, 0, AddSharedParts(w, 5), w);
@@ -6075,7 +6107,7 @@ void main()
             const gpu::RenderScale& sc = s_scaled.scale;
             struct { uint32_t base, pitch, width, height, endian, slotWords, scaleX, scaleY, denX, denY; } pc = { base, pitchBlocks,
                 t.width, t.height, endian, s_scaled.slotWords, sc.x.num, sc.y.num, sc.x.den, sc.y.den };
-            s_stateEpoch++;
+            ComputeWorkRecorded();
             if (t.storeView)
             {
                 // Straight into the image. Everything before is behind a full
@@ -6136,7 +6168,7 @@ void main()
                 const gpu::RenderScale& sc = s_scaled.scale;
                 struct { uint32_t count, slotWords, listWord, pad, scaleX, scaleY, denX, denY; } pc = { count, s_scaled.slotWords,
                     uint32_t(list / 4), 0, sc.x.num, sc.y.num, sc.x.den, sc.y.den };
-                s_stateEpoch++;
+                ComputeWorkRecorded();
                 vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_scaledFillPipeline);
                 s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_scaledFillLayout, 0, AddSharedParts(w, 3), w);
                 vkCmdPushConstants(s_cmd, s_scaledFillLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
@@ -7299,6 +7331,9 @@ void main()
             s_vk = nullptr;
             return false;
         }
+#ifdef VK_EXT_extended_dynamic_state
+        s_dynamicState = (g_cpOpt & CP_OPT_DYNAMIC_STATE) && s_vk->cmdSetCullMode;
+#endif
         glslang_initialize_process();
         CreatePipelineCache();
 
@@ -7873,6 +7908,18 @@ void main()
             gpu::RunsGuestPixelShader(edramMode, s_depthOnlyGuestPs);
         key.raster = cull | (modeCntl.face ? 4u : 0u) | (clipCntl.clip_disable ? 8u : 0u) | (depthBias ? 16u : 0u) |
             (alphaTest ? 32u : 0u);
+        // CP_OPT_DYNAMIC_STATE: cull mode, front face and the depth and
+        // stencil tests are set per draw (below, from these), so draws that
+        // differ only in them share a pipeline. In a race 1 draw in 20 bound
+        // another pipeline only for them (the front face of mirrored meshes,
+        // depth writes on and off), and a pipeline bind costs RADV about
+        // 1 us (it emits the whole pipeline's state again at the next draw).
+        const uint32_t rasterState = key.raster, depthState = key.depthControl;
+        if (s_dynamicState)
+        {
+            key.raster = (key.raster & ~7u) | 64u;
+            key.depthControl = 0;
+        }
 
         bool pipelinePending;
         VkPipeline pipeline = GetPipeline(key, layout.pipeline, pipelinePending);
@@ -8959,17 +9006,22 @@ void main()
         // same value again are skipped (most draws change only a few). Set 0
         // stays bound and push constants stay valid across the texture
         // layouts (same set-0 layout and push-constant range); set 1 is
-        // pushed again whenever the layout changes. Compute work and a new
-        // command buffer reset it (s_stateEpoch).
+        // pushed again whenever the layout changes. A new command buffer
+        // resets it (s_stateEpoch), and so does compute work without
+        // CP_OPT_KEEP_BINDINGS (with it, only the push constants are pushed
+        // whole again: s_pushEpoch).
         struct BoundState
         {
-            uint64_t epoch = 0;
+            uint64_t epoch = 0, pushEpoch = 0;
             VkPipeline pipeline = VK_NULL_HANDLE;
             VkViewport viewport{};
             VkRect2D scissor{};
             uint32_t stencil[6] = {};
             float blend[4] = {}, bias[3] = {};
             bool unormBias = false;  // the bias set in unorm24's steps (FORCE_UNORM)
+            uint32_t cullMode = 0, frontFace = 0;  // CP_OPT_DYNAMIC_STATE, with the depth and stencil tests
+            gpu::draw_state::DepthStencil tests{};
+            int32_t indexType = -1;  // CP_OPT_KEEP_BINDINGS: the ring's index type bound, or none
             uint32_t setOffset = ~0u;
             VkPipelineLayout textureLayout = VK_NULL_HANDLE;
             uint32_t textureCount = ~0u;
@@ -9003,8 +9055,24 @@ void main()
             vkCmdSetScissor(s_cmd, 0, 1, &r);
             bound.scissor = r;
         };
-        auto pushConstants = [&](const DrawConstants& c) {
-            vkCmdPushConstants(s_cmd, layout.pipeline, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(c), &c);
+        // `whole` after a reset; else only when something changed, and with
+        // CP_OPT_KEEP_BINDINGS only the 16-byte rows from the first changed
+        // one to the last (nearly every race draw changes the vertex
+        // snapshots' rows, the last four of seven, and little else). Every
+        // layout has the same push-constant range, so the rows not pushed
+        // keep their values (Vulkan's incremental push-constant updates).
+        auto pushConstants = [&](const DrawConstants& c, bool whole) {
+            static_assert(sizeof(DrawConstants) % 16 == 0);
+            uint32_t lo = 0, hi = sizeof(c);
+            if (!whole)
+            {
+                if (!gpu::draw_state::ChangedRows(&bound.pc, &c, sizeof(c), lo, hi))
+                    return;
+                if (!(g_cpOpt & CP_OPT_KEEP_BINDINGS))
+                    lo = 0, hi = sizeof(c);
+            }
+            vkCmdPushConstants(s_cmd, layout.pipeline, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, lo, hi - lo,
+                reinterpret_cast<const uint8_t*>(&c) + lo);
             bound.pc = c;
         };
         if (fresh || memcmp(&bound.scissor, &scissor, sizeof(scissor)) != 0)
@@ -9077,6 +9145,47 @@ void main()
             memcpy(bound.bias, bias, sizeof(bias));
             bound.unormBias = unormBias;
         }
+#ifdef VK_EXT_extended_dynamic_state
+        // CP_OPT_DYNAMIC_STATE: what the pipeline key left out (above), as
+        // BuildPipeline would bake it (gpu/draw_state.h; no depth target, or
+        // one attached for the pass only: no depth or stencil test or
+        // write). Each command only when its value changed (every pipeline
+        // has these dynamic, so a pipeline bind leaves them as set).
+        if (s_dynamicState)
+        {
+            const uint32_t cullMode = rasterState & 3u, frontFace = (rasterState >> 2) & 1u;
+            const gpu::draw_state::DepthStencil tests = gpu::draw_state::FromDepthControl(depthState);
+            if (fresh || bound.cullMode != cullMode)
+                s_vk->cmdSetCullMode(s_cmd, VkCullModeFlags(cullMode));
+            if (fresh || bound.frontFace != frontFace)
+                s_vk->cmdSetFrontFace(s_cmd, frontFace ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE);
+            if (fresh || bound.tests.depthTest != tests.depthTest)
+                s_vk->cmdSetDepthTestEnable(s_cmd, tests.depthTest);
+            if (fresh || bound.tests.depthWrite != tests.depthWrite)
+                s_vk->cmdSetDepthWriteEnable(s_cmd, tests.depthWrite);
+            if (fresh || bound.tests.depthCompareOp != tests.depthCompareOp)
+                s_vk->cmdSetDepthCompareOp(s_cmd, VkCompareOp(tests.depthCompareOp));
+            if (fresh || bound.tests.stencilTest != tests.stencilTest)
+                s_vk->cmdSetStencilTestEnable(s_cmd, tests.stencilTest);
+            if (fresh || !(bound.tests.front == tests.front) || !(bound.tests.back == tests.back))
+            {
+                auto setOps = [&](VkStencilFaceFlags faces, const gpu::draw_state::StencilFace& f) {
+                    s_vk->cmdSetStencilOp(s_cmd, faces, VkStencilOp(f.failOp), VkStencilOp(f.passOp), VkStencilOp(f.depthFailOp),
+                        VkCompareOp(f.compareOp));
+                };
+                if (tests.front == tests.back)
+                    setOps(VK_STENCIL_FACE_FRONT_AND_BACK, tests.front);
+                else
+                {
+                    setOps(VK_STENCIL_FACE_FRONT_BIT, tests.front);
+                    setOps(VK_STENCIL_FACE_BACK_BIT, tests.back);
+                }
+            }
+            bound.cullMode = cullMode;
+            bound.frontFace = frontFace;
+            bound.tests = tests;
+        }
+#endif
 
         uint32_t dynamicOffset = uint32_t(constantsOffset);
         if (fresh || bound.setOffset != dynamicOffset)
@@ -9115,8 +9224,8 @@ void main()
                     bound.textures[i] = *writes[i].pImageInfo;
             }
         }
-        if (fresh || memcmp(&bound.pc, &pc, sizeof(pc)) != 0)
-            pushConstants(pc);
+        pushConstants(pc, fresh || bound.pushEpoch != s_pushEpoch);
+        bound.pushEpoch = s_pushEpoch;
 
         // Guest memory this draw reads when the GPU runs it: vertex data, and
         // indices when the shader fetches them itself.
@@ -9167,10 +9276,29 @@ void main()
                     scissor.extent.height, scissor.offset.x, scissor.offset.y);
             }
         }
+        // CP_OPT_KEEP_BINDINGS: the ring stays bound as the index buffer
+        // (again only when the index type changes) and firstIndex finds the
+        // draw's indices in it: their offset is 256-byte aligned, so a whole
+        // number of indices, and the ring (192 MB) keeps it in 32 bits.
+        // Before, every indexed draw (all of a race's) bound it at its own
+        // offset.
+        uint32_t firstIndex = 0;
         if (useIndices)
         {
-            vkCmdBindIndexBuffer(s_cmd, s_ring, indexOffset, indices16 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
-            vkCmdDrawIndexed(s_cmd, vertexCount, 1, 0, 0, 0);
+            const VkIndexType indexType = indices16 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
+            if (!(g_cpOpt & CP_OPT_KEEP_BINDINGS))
+                vkCmdBindIndexBuffer(s_cmd, s_ring, indexOffset, indexType);
+            else
+            {
+                static_assert(kRingSize / 2 <= UINT32_MAX);
+                if (fresh || bound.indexType != int32_t(indexType))
+                {
+                    vkCmdBindIndexBuffer(s_cmd, s_ring, 0, indexType);
+                    bound.indexType = int32_t(indexType);
+                }
+                firstIndex = uint32_t(indexOffset >> (indices16 ? 1 : 2));
+            }
+            vkCmdDrawIndexed(s_cmd, vertexCount, 1, firstIndex, 0, 0);
         }
         else
         {
@@ -9208,13 +9336,13 @@ void main()
         {
             DrawConstants fill = pc;
             memcpy(fill.posScale, barPlan.posScale, sizeof(barPlan.posScale));
-            pushConstants(fill);
+            pushConstants(fill, false);
             for (uint32_t i = 0; i < barPlan.rectCount; i++)
             {
                 const gpu::bars::Rect& r = barPlan.rects[i];
                 setScissor(VkRect2D{ { r.x0, r.y0 }, { uint32_t(r.x1 - r.x0), uint32_t(r.y1 - r.y0) } });
                 if (useIndices)
-                    vkCmdDrawIndexed(s_cmd, vertexCount, 1, 0, 0, 0);
+                    vkCmdDrawIndexed(s_cmd, vertexCount, 1, firstIndex, 0, 0);
                 else
                     vkCmdDraw(s_cmd, vertexCount, 1, 0, 0);
             }
@@ -9499,7 +9627,7 @@ void main()
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &pool, nullptr },
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &table, nullptr },
         };
-        s_stateEpoch++;
+        ComputeWorkRecorded();
         vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_frontPipeline);
         s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_frontLayout, 0, AddSharedParts(w, 4), w);
         vkCmdPushConstants(s_cmd, s_frontLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);

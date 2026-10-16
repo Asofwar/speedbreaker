@@ -136,6 +136,21 @@ namespace video
         PFN_vkCmdSetDepthBias2EXT cmdSetDepthBias2 = nullptr;
         bool depthBiasExact = false;
 #endif
+#ifdef VK_EXT_extended_dynamic_state
+        // VK_EXT_extended_dynamic_state is enabled (where the device has it;
+        // NFSMW_DYNAMIC_STATE, presenter.cpp): the renderer sets cull mode,
+        // front face and the depth and stencil tests per draw through these
+        // rather than baking them into its pipelines (gpu/renderer.cpp,
+        // CP_OPT_DYNAMIC_STATE). All set or all nullptr (in the pipelines,
+        // as before).
+        PFN_vkCmdSetCullModeEXT cmdSetCullMode = nullptr;
+        PFN_vkCmdSetFrontFaceEXT cmdSetFrontFace = nullptr;
+        PFN_vkCmdSetDepthTestEnableEXT cmdSetDepthTestEnable = nullptr;
+        PFN_vkCmdSetDepthWriteEnableEXT cmdSetDepthWriteEnable = nullptr;
+        PFN_vkCmdSetDepthCompareOpEXT cmdSetDepthCompareOp = nullptr;
+        PFN_vkCmdSetStencilTestEnableEXT cmdSetStencilTestEnable = nullptr;
+        PFN_vkCmdSetStencilOpEXT cmdSetStencilOp = nullptr;
+#endif
     };
 
     // nullptr when running headless.
