@@ -79,6 +79,10 @@ namespace timedemo
     // NFSMW_TIMEDEMO_CAPTURE_SECONDS, and notes a replay's log running out.
     void OnMainFrame();
 
+    // The calling thread is the guest main thread (the one OnMainFrame runs
+    // on; false on every thread before its first frame).
+    bool OnMainThread();
+
     // kernel/imports_unleashed.cpp: the system UI the runtime reports for the
     // game's own XamShowDeviceSelectorUI call, which shows nothing. True while
     // a mode is on, in capture and replay alike: don't send it.

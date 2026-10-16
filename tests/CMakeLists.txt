@@ -162,6 +162,9 @@ sb_test(whole_vblanks_test)
 # is read to check vfs.cpp, frame_time.cpp, movie_pacing.cpp, main.cpp,
 # ui.cpp, imports_unleashed.cpp and timedemo.cpp use it.
 sb_test(timedemo_logic_test ARGS ${RT})
+# A timedemo's audio streams: the frame the main thread sees a stream's first
+# data in (game/stream_hold.h, header only).
+sb_test(stream_hold_test)
 # The timedemo benchmark's statistics and report formats (debug/bench_stats.h,
 # header only): nearest-rank percentiles, the 1% and 0.1% low averages,
 # FNV-1a 64, the JSON and CSV writers.

@@ -17,7 +17,7 @@
 // replay's file size at +16, the name at +20 and a 1 MB buffer at +280.
 //
 // What the runtime adds (the overrides below, kernel/vfs.cpp, frame_time.cpp,
-// movie_pacing.cpp, main.cpp):
+// movie_pacing.cpp, stream_status.cpp, main.cpp):
 //   - the flag, before the init runs, and a check that the mode came on
 //     (exit 2 otherwise: the game would quietly play, or capture over the
 //     log meant for a replay);
@@ -34,7 +34,11 @@
 //     another build calls DbgBreakPoint (sub_8262CE48), which the runtime's
 //     import stub ends the process on (exit 3). Those four callers are
 //     reported instead and the game goes on (it stops replaying by itself);
-//     every other caller, the game's asserts, still exits as before.
+//     every other caller, the game's asserts, still exits as before;
+//   - what the log doesn't hold and the game waits on: an audio stream's
+//     first data, shown to the main thread a fixed two frames after the
+//     stream started (stream_status.cpp; a race's start waits on its intro
+//     stream).
 //
 // A replay's log ends when a read finds no more (sub_823B72D0 clears the
 // replay flag and returns 0, and the game plays live from there). The last
@@ -141,6 +145,7 @@ namespace
         uint32_t sinceFlush = 0;
         bool flushPending = false, finishing = false, quitSent = false;
     } s_main;
+    thread_local bool t_mainThread = false;
 
     std::filesystem::path Sibling(const char* suffix)
     {
@@ -480,8 +485,14 @@ namespace timedemo
             fprintf(stderr, "[timedemo] saves in %s (NFSMW_SAVE_DIR)\n", saveDir);
     }
 
+    bool OnMainThread()
+    {
+        return t_mainThread;
+    }
+
     void OnMainFrame()
     {
+        t_mainThread = true;
         uint32_t loop = RealLoop();
         if (s_raceLoop.load(std::memory_order_relaxed) < 0 && FlowState() == kRacing)
         {
