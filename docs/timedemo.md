@@ -225,14 +225,14 @@ resolution. Each is the same frame in every run, capped or uncapped:
 
 ```sh
 SHOTS=NFSMW_BENCH_SHOTS=1600,2200,2800,3400,4000,4600,5200
-# Capped runs (here as the warm-ups, which measure nothing): the strict gate.
-scripts/timedemo.sh run WA 1 --bundle ~/sb/A NFSMW_BENCH_FROM=1530 $SHOTS
-scripts/timedemo.sh run WB 1 --bundle ~/sb/B NFSMW_BENCH_FROM=1530 $SHOTS
-python3 scripts/compare_shots.py ~/sb-bench/runs/WA-1 ~/sb-bench/runs/WB-1 --strict --diff /tmp/shots-diff
-# The measured runs take them too (a GPU copy a shot): the default gate.
+# The measured runs take them (a GPU copy a shot): the strict gate.
 scripts/timedemo.sh run A 1 --bundle ~/sb/A NFSMW_TIMEDEMO_UNCAPPED=1 NFSMW_BENCH_FROM=1530 $SHOTS
 scripts/timedemo.sh run B 1 --bundle ~/sb/B NFSMW_TIMEDEMO_UNCAPPED=1 NFSMW_BENCH_FROM=1530 $SHOTS
-python3 scripts/compare_shots.py ~/sb-bench/runs/A-1 ~/sb-bench/runs/B-1
+python3 scripts/compare_shots.py ~/sb-bench/runs/A-1 ~/sb-bench/runs/B-1 --strict --diff /tmp/shots-diff
+# Capped runs (as the warm-ups, which measure nothing) compare the same way.
+scripts/timedemo.sh run WA 1 --bundle ~/sb/A NFSMW_BENCH_FROM=1530 $SHOTS
+scripts/timedemo.sh run WB 1 --bundle ~/sb/B NFSMW_BENCH_FROM=1530 $SHOTS
+python3 scripts/compare_shots.py ~/sb-bench/runs/WA-1 ~/sb-bench/runs/WB-1 --strict
 ```
 
 Runs at different internal resolutions (0.75x with Upscaling FSR 1 against
@@ -254,31 +254,31 @@ than `--tolerance` percent of its pixels are off by more than `--threshold`
 and its PSNR reaches `--min-psnr`. Exit 0 when every shot passes, 1 when
 one doesn't, 2 when the runs can't be compared.
 
-Two runs of one build don't draw quite the same pictures, and how far apart
-they are depends on the pace. On the Steam Deck (the default race, seven
-shots):
+A replay draws its pictures the same at any pace: the two things a picture
+took from the timing, the exposure's brightness and the clouds' drift, wait
+and hold still in a replay ([Exposure and clouds](#exposure-and-clouds)).
+On the Steam Deck (the default race, seven shots):
 
-- Uncapped (as measured; five runs): no two pictures identical. Small
-  differences over much of the picture (0.01% to 43% of the pixels changed,
-  by 1 to 20 levels mostly), worst in the sky and bright areas, while the HUD
-  stays identical; in each shot the runs fall into a few groups, as if one
-  setting of the picture (exposure, bloom) differed a little. At worst a
-  colour value off by 49 between two uncapped runs (61 against a capped
-  one), 1167 pixels (0.13%) off by more than 32, PSNR 37.4 dB (33.6 against
-  a capped run).
-- Capped (at the vblank's pace; two runs): two of the seven pictures
-  identical, the rest off by 1 to 3 at most, PSNR 55.8 dB or more.
+- Uncapped against uncapped, the usual build against its ThinLTO and PGO
+  build: two of the seven pictures identical, the rest off by 1 level at
+  most (0.01% to 0.04% of the pixels), PSNR 86.9 dB or more.
+- Capped against uncapped, one build: one picture identical, five off by 1
+  or 2 levels at most, one with a spot off by up to 11 (0.31% of the pixels
+  changed), PSNR 57.1 dB or more.
+- Before the wait and the hold, uncapped runs of one build differed over
+  much of the picture (0.01% to 43% of the pixels, by 1 to 20 levels mostly,
+  at worst 49, PSNR down to 37.4 dB; 61 and 33.6 dB against a capped run),
+  worst in the sky and bright areas.
 
-So the default gate (`--threshold 64 --tolerance 0.05 --min-psnr 30`) is for
-uncapped runs: it passes their noise and fails what a broken draw does, a
-missing, misplaced or wrongly textured object (hundreds of pixels far off)
-or the whole picture off by 8 levels or more; a picture two frames later
-fails it by far (2% to 12% of the pixels off by more than 64, PSNR 14 to 24
-dB). `--strict` (`--threshold 8 --tolerance 0.01 --min-psnr 50`) is for
-capped runs (no `NFSMW_TIMEDEMO_UNCAPPED`) and catches subtle changes too:
-compare capped runs for that, taking the shots in the warm-up runs, which
-measure nothing. `--exact` asks for identical pictures. Either way only runs
-that skipped no draws in the window compare (`pipelines.skips` 0: a warm
+So `--strict` (`--threshold 8 --tolerance 0.01 --min-psnr 50`) works for
+uncapped runs too, the measured ones included, and catches subtle changes:
+use it. The default gate (`--threshold 64 --tolerance 0.05 --min-psnr 30`)
+fails only what a broken draw does, a missing, misplaced or wrongly textured
+object (hundreds of pixels far off) or the whole picture off by 8 levels or
+more; a picture two frames later fails it by far (2% to 12% of the pixels
+off by more than 64, PSNR 14 to 24 dB): for runs made without the wait and
+the hold. `--exact` asks for identical pictures. Either way only runs that
+skipped no draws in the window compare (`pipelines.skips` 0: a warm
 pipeline cache), as for their times.
 
 Which frame a step's picture is. The game's main loop runs ahead of its
