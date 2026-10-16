@@ -404,7 +404,7 @@ data at loop 4414 (2569 ms in; waited 0.0 ms)`; a wait above a few ms
 there is a slow read, and counts in that frame's time like any wait. Only a
 timedemo holds streams.
 
-## Exposure
+## Exposure and clouds
 
 The game's exposure follows the scene's brightness: once a frame its render
 thread draws the frame down to 64x64, resolves that into one of two
@@ -426,12 +426,25 @@ of D3D's waits on the GPU, as the `[hitch]` lines and `NFSMW_TIMELINE`
 count them). Times from replays without the wait don't compare with times
 from replays with it: give both sides of an A/B the same.
 
+The clouds were the other thing a picture took from the timing. The sky's
+cloud scroll (its vertex shader constant c13.x) moves on whenever the sky's
+setup, as it draws, finds the main thread's tick counter changed, by the
+wind times the main thread's frame time: both read live from the drawing
+side, so how far the clouds had drifted by a shot was the threads' timing
+(between uncapped runs of builds of different speeds, up to 24 levels over a
+fifth of a picture). In a replay the clouds hold still where the replay
+started them (`[timedemo] clouds: ...`; `NFSMW_TIMEDEMO_CLOUD_HOLD=0` lets
+them drift). With both, the shader constants of every draw were the same in
+three uncapped headless replays.
+
 ## Switches
 
 All off by default: without them the game behaves exactly as without this
 feature. A timedemo also holds audio streams ([Audio streams](#audio-streams)),
 capture and replay alike, and a replay waits for the exposure's brightness
-([Exposure](#exposure)); `NFSMW_TIMEDEMO_EXPOSURE_WAIT=0` turns the latter off.
+and holds the clouds still ([Exposure](#exposure-and-clouds));
+`NFSMW_TIMEDEMO_EXPOSURE_WAIT=0` and `NFSMW_TIMEDEMO_CLOUD_HOLD=0` turn
+those off.
 
 | Variable | Meaning |
 |---|---|
@@ -447,7 +460,8 @@ capture and replay alike, and a replay waits for the exposure's brightness
 | `NFSMW_BENCH_TIMEOUT=<s>` | a partial report and exit after this long (900) |
 | `NFSMW_BENCH_EXIT=0` | stay in the game after the report (the default is to exit) |
 | `NFSMW_BENCH_SHOTS=<step>,...` | the picture of these world steps of the race (counted as `NFSMW_BENCH_FROM` is), as `shot-<step>.ppm` in the report's folder (see [Pictures](#4-compare-pictures)) |
-| `NFSMW_TIMEDEMO_EXPOSURE_WAIT=0` | replay: the exposure's brightness as the GPU side has it when the game reads it, as before the wait (see [Exposure](#exposure)) |
+| `NFSMW_TIMEDEMO_EXPOSURE_WAIT=0` | replay: the exposure's brightness as the GPU side has it when the game reads it, as before the wait (see [Exposure](#exposure-and-clouds)) |
+| `NFSMW_TIMEDEMO_CLOUD_HOLD=0` | replay: the clouds drift as the threads' timing has it, as before the hold (see [Exposure](#exposure-and-clouds)) |
 | `NFSMW_SAVE_DIR=<dir>` | an absolute path: `save/` and `profile_settings.bin` there instead of the data folder's |
 
 ## The report
