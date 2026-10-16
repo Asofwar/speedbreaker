@@ -28,15 +28,30 @@ layout(set = 0, binding = 2) uniform sampler2D uVelocity;  // guest NDC, previou
 layout(set = 0, binding = 3) uniform sampler2D uHistory;   // output size
 layout(set = 0, binding = 4, rgba16f) uniform writeonly image2D oHistory;
 layout(set = 0, binding = 5, rgba8) uniform writeonly image2D oOut;
+layout(std430, set = 0, binding = 6) writeonly buffer DepthOut { float oDepth[]; };  // flags bit 6: the output's depth
 layout(push_constant) uniform P
 {
     mat4 camera;        // previous clip = camera * current clip (guest clip space; columns)
     vec2 jitter;        // render pixels, as the scene was shifted
     vec2 renderSize;    // the scene's render size (host pixels)
     vec2 outSize;       // the output size (host pixels)
-    uint flags;         // bits 0-1 mode (0 draws, 1 camera, 2 none), 2 reset, 3 debug vectors, 4 no history clip
+    uint flags;         // bits 0-1 mode (0 draws, 1 camera, 2 none), 2 reset, 3 debug vectors, 4 no history clip,
+                        // 5 reprojection error (the previous frame moved by the vectors against this one, x4),
+                        // 6 depth at the output size into oDepth (below 1x: the game's composite reads it)
     float feedback;     // history weight
 } p;
+
+// Lanczos 2 (as FSR 2 reconstructs the current frame), |x| < 2.
+float Lanczos2(float x)
+{
+    x = abs(x);
+    if (x < 1e-4)
+        return 1.0;
+    if (x >= 2.0)
+        return 0.0;
+    float a = 3.14159265 * x;
+    return sin(a) * sin(a * 0.5) / (a * a * 0.5);
+}
 
 vec3 ToYCoCg(vec3 c) { return vec3(0.25 * c.r + 0.5 * c.g + 0.25 * c.b, 0.5 * c.r - 0.5 * c.b, -0.25 * c.r + 0.5 * c.g - 0.25 * c.b); }
 vec3 FromYCoCg(vec3 c) { return vec3(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z); }
@@ -94,10 +109,14 @@ void main()
     // The render pixel whose (jittered) sample is nearest.
     vec2 rp = uv * p.renderSize + p.jitter;
     ivec2 rc = ivec2(floor(rp));
-    ivec2 rmax = ivec2(p.renderSize) - 1;
+    ivec2 rmax = ivec2(ceil(p.renderSize)) - 1;
+    if ((p.flags & 64u) != 0u)
+        oDepth[o.y * int(p.outSize.x) + o.x] = texelFetch(uDepth, clamp(rc, ivec2(0), rmax), 0).r;
     vec4 sum = vec4(0.0);
     float wsum = 0.0;
     vec4 m1 = vec4(0.0), m2 = vec4(0.0);
+    vec4 cmin = vec4(1e9), cmax = vec4(-1e9);
+    float wnear = 0.0;
     float nearest = 2.0;
     ivec2 nearestAt = clamp(rc, ivec2(0), rmax);
     for (int y = -1; y <= 1; y++)
@@ -108,9 +127,12 @@ void main()
             vec4 cy = vec4(ToYCoCg(c.rgb), c.a);
             // Distance from the output pixel's centre to the sample, in render pixels.
             vec2 d = vec2(k) + 0.5 - rp;
-            float w = exp(-2.29 * dot(d, d));
+            float w = Lanczos2(d.x) * Lanczos2(d.y);
             sum += c * w;
             wsum += w;
+            wnear = max(wnear, w);
+            cmin = min(cmin, c);
+            cmax = max(cmax, c);
             m1 += cy;
             m2 += cy * cy;
             float z = texelFetch(uDepth, k, 0).r;
@@ -120,7 +142,8 @@ void main()
                 nearestAt = k;
             }
         }
-    vec4 current = sum / max(wsum, 1e-5);
+    // (Lanczos rings: kept inside the samples' range.)
+    vec4 current = clamp(sum / max(wsum, 1e-5), cmin, cmax);
     vec2 motion = MotionAt(nearestAt, mode);
     if ((p.flags & 8u) != 0u)
     {
@@ -134,6 +157,17 @@ void main()
     }
     vec2 prevUv = uv + vec2(motion.x, -motion.y) * 0.5;
     bool reset = (p.flags & 4u) != 0u || any(lessThan(prevUv, vec2(0.0))) || any(greaterThan(prevUv, vec2(1.0)));
+    if ((p.flags & 32u) != 0u)
+    {
+        // The vectors' own error: last frame's picture (kept as drawn, not
+        // accumulated) at the pixel's previous place against this frame's
+        // pixel. Where the previous place is off screen: none (black).
+        vec4 c = texelFetch(uColor, clamp(rc, ivec2(0), rmax), 0);
+        vec4 e = reset ? vec4(0.0) : abs(History(prevUv) - c);
+        imageStore(oHistory, o, c);
+        imageStore(oOut, o, vec4(clamp(e.rgb * 4.0, 0.0, 1.0), 1.0));
+        return;
+    }
     vec4 result = current;
     if (!reset)
     {
@@ -153,9 +187,11 @@ void main()
                 hy = mean + dir / m;
         }
         vec4 hc = vec4(FromYCoCg(hy.rgb), hy.a);
-        // Less of the history where the sample is far from the pixel (an
-        // upscale: an output pixel between render samples learns slower).
-        float a = clamp(1.0 - p.feedback, 0.0, 1.0);
+        // The current frame's weight: more where a sample lies near the
+        // pixel (an upscale: one between samples learns slower) and where
+        // the picture moves fast (each resample of the history blurs it).
+        float speed = length(vec2(motion.x, -motion.y) * 0.5 * p.outSize);
+        float a = p.feedback <= 0.0 ? 1.0 : clamp((1.0 - p.feedback) * (0.5 + wnear) + speed * 0.01, 0.03, 0.6);
         result = mix(hc, current, a);
     }
     result = clamp(result, vec4(0.0), vec4(1.0));

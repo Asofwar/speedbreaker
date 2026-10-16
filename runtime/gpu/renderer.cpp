@@ -1954,7 +1954,7 @@ namespace gpu::renderer
             uint32_t mode = 0;      // NFSMW_MV_MODE: 0 the draws' vectors, 1 the camera's (depth), 2 none
             bool jitter = true;     // NFSMW_MV_JITTER=0: no jitter
             bool taau = true;       // NFSMW_MV_TAAU=0: no upscaler (the scene as drawn: vectors, jitter and size only)
-            bool debug = false;     // NFSMW_MV_DEBUG=1: the vectors as colours instead of the picture
+            uint32_t debug = 0;     // NFSMW_MV_DEBUG: 1 the vectors as colours, 2 their reprojection error, instead of the picture
             bool clip = true;       // NFSMW_MV_CLIP=0: the history unclipped (to see what the vectors alone do)
             float feedback = 0.9f;  // NFSMW_MV_FEEDBACK: the history's weight
             uint32_t phases = 8;    // NFSMW_MV_PHASES: jitter phases
@@ -1974,7 +1974,9 @@ namespace gpu::renderer
             // Resources.
             RenderTarget velocity{};  // R16G16_SFLOAT, not in s_targets: only the scene's passes attach it
             bool velocityMade = false;
-            Image taaHistory[2], out, depthTemp;
+            Image taaHistory[2], out;
+            VkBuffer depthOut = VK_NULL_HANDLE;  // the output's depth, below 1x copied into the scene's depth target
+            VkDeviceMemory depthOutMemory = VK_NULL_HANDLE;
             uint32_t historyIndex = 0, outW = 0, outH = 0;
             bool historyValid = false;
             VkSampler sampler = VK_NULL_HANDLE;
@@ -1983,6 +1985,8 @@ namespace gpu::renderer
             VkPipeline pipeline = VK_NULL_HANDLE;
         } s_mv;
         void MvFinishScene();
+        bool CreateDeviceBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkBuffer& buffer, VkDeviceMemory& memory, const char* what,
+            VkDeviceSize* allocated);
         const bool s_mvConfigured = [] {
             const char* v = std::getenv("NFSMW_MV");
             s_mv.on = v && v[0] == '1';
@@ -1995,7 +1999,7 @@ namespace gpu::renderer
             if (const char* s = std::getenv("NFSMW_MV_TAAU"))
                 s_mv.taau = s[0] != '0';
             if (const char* s = std::getenv("NFSMW_MV_DEBUG"))
-                s_mv.debug = s[0] == '1';
+                s_mv.debug = uint32_t(std::clamp(std::atoi(s), 0, 2));
             if (const char* s = std::getenv("NFSMW_MV_CLIP"))
                 s_mv.clip = s[0] != '0';
             if (const char* s = std::getenv("NFSMW_MV_FEEDBACK"))
@@ -2008,7 +2012,7 @@ namespace gpu::renderer
             if (s_mv.on)
                 fprintf(stderr, "[mv] motion vectors on: render scale %.3f, vectors %s, jitter %s (%u phases), upscaler %s%s\n", s_mv.scale,
                     s_mv.mode == 0 ? "per draw" : s_mv.mode == 1 ? "camera only" : "none", s_mv.jitter ? "on" : "off", s_mv.phases,
-                    s_mv.taau ? "on" : "off", s_mv.debug ? " (debug: vectors shown)" : "");
+                    s_mv.taau ? "on" : "off", s_mv.debug == 1 ? " (debug: vectors shown)" : s_mv.debug == 2 ? " (debug: reprojection error shown)" : "");
             return true;
         }();
 
@@ -6700,15 +6704,16 @@ void main()
                 sci.magFilter = sci.minFilter = VK_FILTER_LINEAR;
                 sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
                 Check(vkCreateSampler(s_dev, &sci, nullptr, &s_mv.sampler), "mv sampler");
-                VkDescriptorSetLayoutBinding b[6] = {
+                VkDescriptorSetLayoutBinding b[7] = {
                     { 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
                     { 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
                     { 2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
                     { 3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
                     { 4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
                     { 5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+                    { 6, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
                 };
-                CreateComputePipeline(gpu::kTaauGlsl, b, 6, 96, s_mv.setLayout, s_mv.layout, s_mv.pipeline);
+                CreateComputePipeline(gpu::kTaauGlsl, b, 7, 96, s_mv.setLayout, s_mv.layout, s_mv.pipeline);
             }
             if (s_mv.outW != outW || s_mv.outH != outH)
             {
@@ -6719,10 +6724,13 @@ void main()
                     DestroyImage(s_mv.taaHistory[0]);
                     DestroyImage(s_mv.taaHistory[1]);
                     DestroyImage(s_mv.out);
-                    if (s_mv.depthTemp.image)
-                        DestroyImage(s_mv.depthTemp);
-                    s_mv.depthTemp = {};
+                    vkDestroyBuffer(s_dev, s_mv.depthOut, nullptr);
+                    vkFreeMemory(s_dev, s_mv.depthOutMemory, nullptr);
+                    s_mv.depthOut = VK_NULL_HANDLE;
+                    s_mv.depthOutMemory = VK_NULL_HANDLE;
                 }
+                CreateDeviceBuffer(VkDeviceSize(outW) * outH * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                    s_mv.depthOut, s_mv.depthOutMemory, "mv depth", nullptr);
                 for (Image& h : s_mv.taaHistory)
                     h = CreateImage(VK_IMAGE_TYPE_2D, VK_FORMAT_R16G16B16A16_SFLOAT, { outW, outH, 1 }, 1,
                         VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT);
@@ -6740,6 +6748,24 @@ void main()
             Begin();
             FlushPendingClears(&s_mv.velocity);
             FullBarrier();
+            // NFSMW_PASS_PROFILE: the upscaler's steps, each an entry of the
+            // profile's list (as a pass, with no draws).
+            int32_t segment = -1;
+            auto profileStep = [&](const char* desc) {
+                if (!s_profiling)
+                    return;
+                if (segment >= 0)
+                    vkCmdWriteTimestamp(s_cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s_passQueries, uint32_t(segment) + 1);
+                segment = -1;
+                if (!desc || s_passQueryNext + 2 > 512)
+                    return;
+                vkCmdResetQueryPool(s_cmd, s_passQueries, s_passQueryNext, 2);
+                vkCmdWriteTimestamp(s_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, s_passQueries, s_passQueryNext);
+                s_passInfos.push_back({ desc, 0, s_slot, s_passQueryNext, 0, 0, 0, 0 });
+                segment = int32_t(s_passQueryNext);
+                s_passQueryNext += 2;
+            };
+            profileStep("mv: upscaler (compute)");
             struct
             {
                 float camera[16];
@@ -6757,7 +6783,9 @@ void main()
             p.renderSize[1] = float(outH) * s_mv.scale;
             p.outSize[0] = float(outW);
             p.outSize[1] = float(outH);
-            p.flags = s_mv.mode | (s_mv.historyValid ? 0u : 4u) | (s_mv.debug ? 8u : 0u) | (s_mv.clip ? 0u : 16u);
+            const bool upDepth = s_mv.scale != 1.0f && s_mv.depthOut;
+            p.flags = s_mv.mode | (s_mv.historyValid ? 0u : 4u) | (s_mv.debug == 1 ? 8u : s_mv.debug == 2 ? 32u : 0u) | (s_mv.clip ? 0u : 16u) |
+                (upDepth ? 64u : 0u);
             p.feedback = s_mv.feedback;
             const uint32_t prev = s_mv.historyIndex, next = prev ^ 1;
             VkDescriptorImageInfo ii[6] = {
@@ -6768,60 +6796,41 @@ void main()
                 { VK_NULL_HANDLE, s_mv.taaHistory[next].view, VK_IMAGE_LAYOUT_GENERAL },
                 { VK_NULL_HANDLE, s_mv.out.view, VK_IMAGE_LAYOUT_GENERAL },
             };
-            VkWriteDescriptorSet w[6];
+            VkWriteDescriptorSet w[7];
             for (uint32_t i = 0; i < 6; i++)
                 w[i] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, i, 0, 1,
                     i < 4 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ii[i], nullptr, nullptr };
+            VkDescriptorBufferInfo depthInfo{ s_mv.depthOut, 0, VK_WHOLE_SIZE };
+            w[6] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 6, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr,
+                &depthInfo, nullptr };
             ComputeWorkRecorded();
             vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_mv.pipeline);
-            s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_mv.layout, 0, 6, w);
+            s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_mv.layout, 0, 7, w);
             vkCmdPushConstants(s_cmd, s_mv.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p), &p);
             vkCmdDispatch(s_cmd, (outW + 7) / 8, (outH + 7) / 8, 1);
             FullBarrier();
+            profileStep("mv: output copied into the scene target");
             VkImageCopy region{};
             region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
             region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
             region.extent = { outW, outH, 1 };
             vkCmdCopyImage(s_cmd, s_mv.out.image, VK_IMAGE_LAYOUT_GENERAL, color->image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
             // Below 1x the depth too: the game's composite reads the scene's
-            // depth resolve (its depth effects). Nearest, through a copy (a
-            // blit can't overlap itself).
-            if (s_mv.scale != 1.0f)
+            // depth resolve (its depth effects). The upscaler wrote the
+            // output's depth (each pixel the nearest sample's) into a buffer:
+            // RADV can't blit D32S8, a buffer copy into the depth aspect works.
+            if (upDepth)
             {
-                if (!s_mv.depthTemp.image)
-                {
-                    VkFormatProperties fp;
-                    vkGetPhysicalDeviceFormatProperties(s_vk->physical, depth->vkFormat, &fp);
-                    const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
-                    if ((fp.optimalTilingFeatures & need) != need)
-                        LogOnce(0x4D56, "[mv] depth blits not supported: the scene's depth stays at the render size");
-                    else
-                    {
-                        s_mv.depthTemp = CreateImage(VK_IMAGE_TYPE_2D, depth->vkFormat, { outW, outH, 1 }, 1,
-                            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_VIEW_TYPE_2D,
-                            VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
-                        ToGeneral(s_mv.depthTemp.image, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 1);
-                    }
-                }
-                if (s_mv.depthTemp.image)
-                {
-                    const VkImageAspectFlags aspects = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
-                    VkImageBlit blit{};
-                    blit.srcSubresource = { aspects, 0, 0, 1 };
-                    blit.dstSubresource = { aspects, 0, 0, 1 };
-                    blit.srcOffsets[1] = { int32_t(std::lround(outW * s_mv.scale)), int32_t(std::lround(outH * s_mv.scale)), 1 };
-                    blit.dstOffsets[1] = { int32_t(outW), int32_t(outH), 1 };
-                    vkCmdBlitImage(s_cmd, depth->image.image, VK_IMAGE_LAYOUT_GENERAL, s_mv.depthTemp.image, VK_IMAGE_LAYOUT_GENERAL, 1, &blit,
-                        VK_FILTER_NEAREST);
-                    FullBarrier();
-                    VkImageCopy back{};
-                    back.srcSubresource = { aspects, 0, 0, 1 };
-                    back.dstSubresource = { aspects, 0, 0, 1 };
-                    back.extent = { outW, outH, 1 };
-                    vkCmdCopyImage(s_cmd, s_mv.depthTemp.image, VK_IMAGE_LAYOUT_GENERAL, depth->image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &back);
-                }
+                profileStep("mv: depth to the output size (buffer copy)");
+                VkBufferImageCopy back{};
+                back.bufferRowLength = outW;
+                back.bufferImageHeight = outH;
+                back.imageSubresource = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1 };
+                back.imageExtent = { outW, outH, 1 };
+                vkCmdCopyBufferToImage(s_cmd, s_mv.depthOut, depth->image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &back);
             }
             FullBarrier();
+            profileStep(nullptr);
             s_mv.historyIndex = next;
             s_mv.historyValid = true;
         }
