@@ -15,6 +15,8 @@
 //   set 1, binding 0/1/2  sampler2D / sampler3D / samplerCube arrays [32],
 //                     indexed by texture fetch constant slot
 #pragma once
+#include "vertex_snapshot.h"
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -37,6 +39,10 @@ namespace gpu
         bool usesMemExport = false;
         uint32_t vertexFetchMask = 0;    // fetch constant slots used by vfetch (x3 dwords... slot = const index)
         uint32_t vertexFetchConstants[3] = {};  // the vertex fetch constants (0..95) vfetch reads
+        // The same constants in increasing order, each with its fetches'
+        // strides and offsets and whether they all index with the vertex
+        // index (only a vertex shader's can, see gpu/vertex_snapshot.h).
+        std::vector<vsnap::FetchUse> vertexFetches;
         uint32_t texture2DMask = 0;      // texture fetch slots used, by dimension
         uint32_t texture3DMask = 0;
         uint32_t textureCubeMask = 0;

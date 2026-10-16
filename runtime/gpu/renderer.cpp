@@ -22,6 +22,7 @@
 #include "shared_memory_glsl.h"
 #include "texture_budget.h"
 #include "texture_formats.h"
+#include "vertex_snapshot.h"
 #include "xenos/registers.h"
 
 #include <kernel/vmem.h>
@@ -3008,28 +3009,41 @@ namespace gpu::renderer
         // otherwise 32-bit, with the reset index mapped to ~0 when `restart`.
         // For 16-bit indices, 8in16 and 8in32 swap each index's bytes; none
         // and 16in32 keep them (Get() picks the other half of the swapped word).
-        void ConvertIndices(uint8_t* dst, const IndexSource& src, uint32_t count, bool out16, bool restart, uint32_t resetIndex)
+        // Returns the lowest and highest index written, restarts left out
+        // (the vertices the draw runs: its vertex snapshots, gpu/vertex_snapshot.h).
+        // Found in the same pass, the highest as the highest index + 1,
+        // which wraps a restart (0xFFFF in 16 bits, ~0 in 32; never an index
+        // there, see above) to 0: no branch keeps the loops from vectorizing.
+        vsnap::IndexRange ConvertIndices(uint8_t* dst, const IndexSource& src, uint32_t count, bool out16, bool restart, uint32_t resetIndex)
         {
+            auto range = [](uint32_t lo, uint32_t hiPlus1) {
+                return hiPlus1 ? vsnap::IndexRange{ true, lo, hiPlus1 - 1 } : vsnap::IndexRange{ true, 1, 0 };  // (0: only restarts)
+            };
             if (!src.is32)
             {
                 const uint8_t* p = s_sharedHost + (src.base & 0x1FFFFFFE);
                 bool swap = src.endian == 1 || src.endian == 2;
                 if (out16)
                 {
-                    if (!swap)
-                    {
-                        memcpy(dst, p, size_t(count) * 2);
-                        return;
-                    }
-                    for (uint32_t i = 0; i < count; i++)
-                    {
-                        uint16_t v;
-                        memcpy(&v, p + size_t(i) * 2, 2);
-                        v = __builtin_bswap16(v);
-                        memcpy(dst + size_t(i) * 2, &v, 2);
-                    }
-                    return;
+                    uint16_t lo = 0xFFFF, hiPlus1 = 0;
+                    auto copy = [&](auto order) {
+                        for (uint32_t i = 0; i < count; i++)
+                        {
+                            uint16_t v;
+                            memcpy(&v, p + size_t(i) * 2, 2);
+                            v = order(v);
+                            memcpy(dst + size_t(i) * 2, &v, 2);
+                            lo = std::min(lo, v);
+                            hiPlus1 = std::max(hiPlus1, uint16_t(v + 1));
+                        }
+                    };
+                    if (swap)
+                        copy([](uint16_t v) { return __builtin_bswap16(v); });
+                    else
+                        copy([](uint16_t v) { return v; });
+                    return range(lo, hiPlus1);
                 }
+                uint32_t lo = 0xFFFFFFFFu, hiPlus1 = 0;
                 for (uint32_t i = 0; i < count; i++)
                 {
                     uint16_t v;
@@ -3037,10 +3051,13 @@ namespace gpu::renderer
                     uint32_t x = swap ? __builtin_bswap16(v) : v;
                     x = restart && x == resetIndex ? 0xFFFFFFFFu : x;
                     memcpy(dst + size_t(i) * 4, &x, 4);
+                    lo = std::min(lo, x);
+                    hiPlus1 = std::max(hiPlus1, x + 1);
                 }
-                return;
+                return range(lo, hiPlus1);
             }
             const uint8_t* p = s_sharedHost + (src.base & 0x1FFFFFFC);
+            uint32_t lo = 0xFFFFFFFFu, hiPlus1 = 0;
             for (uint32_t i = 0; i < count; i++)
             {
                 uint32_t w;
@@ -3048,7 +3065,10 @@ namespace gpu::renderer
                 uint32_t v = GpuSwap(w, src.endian) & 0xFFFFFF;
                 v = restart && v == resetIndex ? 0xFFFFFFFFu : v;
                 memcpy(dst + size_t(i) * 4, &v, 4);
+                lo = std::min(lo, v);
+                hiPlus1 = std::max(hiPlus1, v + 1);
             }
+            return range(lo, hiPlus1);
         }
 
 
@@ -7888,37 +7908,48 @@ void main()
         // first (a resolve into vertex memory) is never copied from the CPU.
         // Vertex data snapshots, copied into the ring with this draw's
         // constants and indices (one allocation: a submit between two would
-        // leave the snapshot in the previous submission's slot).
-        struct SnapshotRange { uint32_t base, size; };
+        // leave the snapshot in the previous submission's slot). Each holds
+        // only what the fetches through its range can read (gpu/vertex_snapshot.h:
+        // `use`, spanned once the indices are converted; a range two
+        // constants or both shaders read is copied once, for both), so a
+        // draw of a few vertices of a buffer no longer copies all of it.
+        // NFSMW_CP_OPT without CP_OPT_VERTEX_SPANS: whole ranges, as before.
+        struct SnapshotRange { uint32_t base, size; vsnap::FetchUse use; };
         SnapshotRange copies[4];
         uint32_t copyCount = 0;
-        VkDeviceSize copyBytes = 0;
+        VkDeviceSize copyBytes = 0;  // whole ranges: the most the copies take
         if (g_eagerWrites || s_shadowMode)
         {
             constexpr uint32_t kSnapshotMax = 64 * 1024;
             using Range = SnapshotRange;
             for (const Shader* shader : { s_vs, s_ps })
-                for (uint32_t word = 0; word < 3; word++)
-                    for (uint32_t bits = shader->info.vertexFetchConstants[word]; bits; bits &= bits - 1)
+                for (const vsnap::FetchUse& use : shader->info.vertexFetches)
+                {
+                    const uint32_t* vf = &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + use.constant * 2];
+                    Range r{ vf[0] & 0x1FFFFFFC, ((vf[1] >> 2) & 0xFFFFFF) * 4, use };
+                    r.size = std::min<uint32_t>(r.size, uint32_t(kSharedSize) - r.base);
+                    if (!(g_cpOpt & CP_OPT_VERTEX_SPANS))
+                        r.use.vertexIndexed = false;
+                    if (r.size == 0)
+                        continue;
+                    Range* same = std::find_if(copies, copies + copyCount, [&](const Range& c) { return c.base == r.base && c.size == r.size; });
+                    if (same != copies + copyCount)
                     {
-                        uint32_t constant = word * 32 + uint32_t(__builtin_ctz(bits));
-                        const uint32_t* vf = &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + constant * 2];
-                        Range r{ vf[0] & 0x1FFFFFFC, ((vf[1] >> 2) & 0xFFFFFF) * 4 };
-                        r.size = std::min<uint32_t>(r.size, uint32_t(kSharedSize) - r.base);
-                        if (r.size == 0 || std::any_of(copies, copies + copyCount, [&](const Range& c) { return c.base == r.base && c.size == r.size; }))
-                            continue;
-                        if (g_eagerWrites && r.size <= kSnapshotMax && copyCount < 4 &&
-                            !writewatch::GpuWritePending(r.base, r.size) && !writewatch::AnyGpuOwned(r.base, r.size))
-                        {
-                            copies[copyCount++] = r;
-                            copyBytes += (r.size + 255) & ~255u;
-                        }
-                        else
-                        {
-                            EnsureShadow(r.base, r.size);
-                            GuardGpu(r.base, r.size, false, "vertices");
-                        }
+                        vsnap::Merge(same->use, r.use);
+                        continue;
                     }
+                    if (g_eagerWrites && r.size <= kSnapshotMax && copyCount < 4 &&
+                        !writewatch::GpuWritePending(r.base, r.size) && !writewatch::AnyGpuOwned(r.base, r.size))
+                    {
+                        copies[copyCount++] = r;
+                        copyBytes += (r.size + 255) & ~255u;
+                    }
+                    else
+                    {
+                        EnsureShadow(r.base, r.size);
+                        GuardGpu(r.base, r.size, false, "vertices");
+                    }
+                }
             // Indices the shader fetches itself.
             if (pc.indexAddress)
             {
@@ -8015,21 +8046,35 @@ void main()
                 s_lastConstantsSubmission = s_submissionCounter;
                 s_stats.constantUploads++;
             }
+            // The vertex indices the vertex shader runs for, as its index
+            // buffer holds them: the draw's own count without one; not
+            // scanned when the shader fetches its indices itself (pc.indexAddress).
+            vsnap::IndexRange vertices;
+            if (!useIndices && !pc.indexAddress)
+                vertices = { true, 0, count - 1 };
             if (useIndices)
             {
                 indexOffset = (at + (uploadConstants ? kConstantsSize : 0) + 255) & ~VkDeviceSize(255);
                 if (directIndices)
                 {
-                    ConvertIndices(s_ringHost + indexOffset, src, count, indices16, restart, resetIndex);
-                    // NFSMW_CP_OPT_VERIFY=1: compare with the plain conversion.
-                    static const bool verify = std::getenv("NFSMW_CP_OPT_VERIFY") != nullptr;
+                    vertices = ConvertIndices(s_ringHost + indexOffset, src, count, indices16, restart, resetIndex);
+                    // NFSMW_CP_OPT_VERIFY=1: compare with the plain conversion
+                    // (and its range). It reads the ring back, slowly: =spans
+                    // checks only the vertex snapshots' spans (below).
+                    static const bool verify = [] { const char* v = std::getenv("NFSMW_CP_OPT_VERIFY"); return v && strcmp(v, "spans") != 0; }();
                     if (verify)
                     {
                         static uint64_t checked = 0, bad = 0;
+                        uint32_t lo = UINT32_MAX, hi = 0;
                         for (uint32_t i = 0; i < count; i++)
                         {
                             uint32_t v = src.Get(i);
                             uint32_t want = restart && v == resetIndex ? 0xFFFFFFFFu : v, got;
+                            if (want != 0xFFFFFFFFu)
+                            {
+                                lo = std::min(lo, want);
+                                hi = std::max(hi, want);
+                            }
                             if (indices16)
                             {
                                 uint16_t g16;
@@ -8042,25 +8087,63 @@ void main()
                                 fprintf(stderr, "[cpverify] index mismatch at %u: %08X, want %08X (32-bit %d, endian %u, restart %d)\n",
                                     i, got, want, int(src.is32), src.endian, int(restart));
                         }
+                        bool none = lo > hi;
+                        if ((none ? vertices.lo <= vertices.hi : vertices.lo != lo || vertices.hi != hi) && bad++ < 10)
+                            fprintf(stderr, "[cpverify] index range %u..%u, want %u..%u (%u indices, 32-bit %d, restart %d)\n",
+                                vertices.lo, vertices.hi, lo, hi, count, int(src.is32), int(restart));
                         if (++checked % 100000 == 0)
                             fprintf(stderr, "[cpverify] %llu indexed draws checked, %llu mismatches\n", (unsigned long long)checked, (unsigned long long)bad);
                     }
                 }
                 else
+                {
                     memcpy(s_ringHost + indexOffset, indices.data(), indices.size() * 4);
+                    if (copyCount)
+                    {
+                        // (As ConvertIndices: a restart, ~0, wraps to 0.)
+                        uint32_t lo = UINT32_MAX, hiPlus1 = 0;
+                        for (uint32_t v : indices)
+                        {
+                            lo = std::min(lo, v);
+                            hiPlus1 = std::max(hiPlus1, v + 1);
+                        }
+                        vertices = hiPlus1 ? vsnap::IndexRange{ true, lo, hiPlus1 - 1 } : vsnap::IndexRange{ true, 1, 0 };
+                    }
+                }
             }
             if (copyCount)
             {
+                // As the shader sees them (+ VGT_INDX_OFFSET, pc.indexOffset).
+                vertices = vsnap::WithOffset(vertices, s_regs[XE_GPU_REG_VGT_INDX_OFFSET]);
+                // NFSMW_CP_OPT_VERIFY=1 or =spans: the whole range stays
+                // redirected, its bytes outside the span set to 0xFF (NaN in
+                // the float formats): a fetch the span missed draws visibly
+                // wrong (compare the frames with a run without: timedemo
+                // shots, docs/timedemo.md).
+                static const bool poison = std::getenv("NFSMW_CP_OPT_VERIFY") != nullptr;
                 VkDeviceSize snapshot = (at + (uploadConstants ? kConstantsSize : 0) + (useIndices ? 256 + indexBytes : 0) + 255) & ~VkDeviceSize(255);
-                s_stats.snapshotBytes += copyBytes;
                 for (uint32_t i = 0; i < copyCount; i++)
                 {
-                    memcpy(s_ringHost + snapshot, s_sharedHost + copies[i].base, copies[i].size);
-                    pc.vfRedirect[i][0] = copies[i].base;
-                    pc.vfRedirect[i][1] = copies[i].size;
+                    const vsnap::Span span = vsnap::Needed(copies[i].use, vertices, copies[i].size);
+                    uint32_t start = span.start, size = span.Size();
+                    if (poison)
+                    {
+                        memset(s_ringHost + snapshot, 0xFF, copies[i].size);
+                        memcpy(s_ringHost + snapshot + start, s_sharedHost + copies[i].base + start, size);
+                        start = 0;
+                        size = copies[i].size;
+                    }
+                    else
+                        memcpy(s_ringHost + snapshot, s_sharedHost + copies[i].base + start, size);
+                    pc.vfRedirect[i][0] = copies[i].base + start;
+                    pc.vfRedirect[i][1] = size;
                     pc.vfRedirect[i][2] = uint32_t(snapshot);
-                    snapshot += (copies[i].size + 255) & ~255u;
+                    snapshot += (size + 255) & ~255u;
+                    s_stats.snapshotBytes += (size + 255) & ~255u;
                 }
+                // The allocation (this draw's last) made room for whole
+                // ranges: what the spans left goes back to the slot.
+                s_ringOffset = std::min(s_ringOffset, snapshot - VkDeviceSize(s_slot) * kSlotSize);
             }
             break;
         }

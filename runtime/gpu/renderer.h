@@ -170,6 +170,7 @@ namespace gpu::renderer
         CP_OPT_SKIP_REDUNDANT = 16,  // Vulkan state commands skipped when the value is already set
         CP_OPT_TEXTURE_CACHE = 32,   // texture lookups kept per fetch slot (NFSMW_TEXTURE_CACHE=0)
         CP_OPT_SHADER_CACHE = 64,    // IM_LOAD shaders found by address (NFSMW_SHADER_CACHE=0)
+        CP_OPT_VERTEX_SPANS = 128,   // vertex snapshots copy only what the draw's indices reach (gpu/vertex_snapshot.h)
     };
     inline const uint32_t g_cpOpt = [] { const char* v = std::getenv("NFSMW_CP_OPT"); return v ? uint32_t(strtoul(v, nullptr, 0)) : ~0u; }();
 

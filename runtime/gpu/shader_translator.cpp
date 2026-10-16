@@ -8,6 +8,7 @@
 
 #include "xenos/ucode.h"
 
+#include <algorithm>
 #include <cfloat>
 #include <cmath>
 #include <cstdio>
@@ -140,6 +141,33 @@ float xmul(float a, float b)
 
             // Previous vfetch_full, for vfetch_mini.
             VertexFetchInstruction lastFullFetch{};
+
+            // Whether an instruction emitted so far may write r0.x, the
+            // vertex index as a vertex shader starts (runVertex): a fetch
+            // indexed by r0.x after none did reads the vertex's own element
+            // (gpu/vertex_snapshot.h), in a flat program, which runs in the
+            // order it is emitted. A relative write may land on r0.
+            bool r0xWritten = false;
+
+            void NoteWrite(uint32_t index, bool relative, uint32_t componentMask)
+            {
+                if ((componentMask & 1) && (relative || index == 0))
+                    r0xWritten = true;
+            }
+
+            // A vertex fetch through `constant`, for TranslatedShader::vertexFetches.
+            void NoteFetchUse(uint32_t constant, bool vertexIndexed, uint32_t stride, int32_t offset)
+            {
+                auto it = std::find_if(out.vertexFetches.begin(), out.vertexFetches.end(),
+                    [&](const vsnap::FetchUse& u) { return u.constant == constant; });
+                if (it == out.vertexFetches.end())
+                {
+                    out.vertexFetches.emplace_back();
+                    it = out.vertexFetches.end() - 1;
+                    it->constant = constant;
+                }
+                it->Add(vertexIndexed, stride, offset);
+            }
 
             void Error(const std::string& message)
             {
@@ -457,6 +485,10 @@ float xmul(float a, float b)
                 else
                 {
                     if (vecMask)
+                        NoteWrite(op.vector_dest(), op.is_vector_dest_relative(), vecMask);
+                    if (scaMask)
+                        NoteWrite(op.scalar_dest(), op.is_scalar_dest_relative(), scaMask);
+                    if (vecMask)
                     {
                         std::string dst = Reg(op.vector_dest(), op.is_vector_dest_relative());
                         for (uint32_t c = 0; c < 4; c++)
@@ -483,6 +515,11 @@ float xmul(float a, float b)
             // Destination swizzle for fetches: 3 bits per component.
             void StoreFetchResult(uint32_t dest, bool destRelative, uint32_t swizzle, const std::string& value)
             {
+                uint32_t written = 0;
+                for (uint32_t c = 0; c < 4; c++)
+                    if (((swizzle >> (3 * c)) & 7) != 7)
+                        written |= 1u << c;
+                NoteWrite(dest, destRelative, written);
                 std::string dst = Reg(dest, destRelative);
                 for (uint32_t c = 0; c < 4; c++)
                 {
@@ -502,6 +539,12 @@ float xmul(float a, float b)
                 uint32_t slot = full.fetch_constant_index();  // 0..95 (3 per 6-dword slot)
                 out.vertexFetchMask |= 1u << (slot / 3);
                 out.vertexFetchConstants[slot / 32] |= 1u << (slot % 32);
+                // Indexed by the vertex index itself: r0.x, written by nothing
+                // emitted before (a mini fetch reads its full fetch's index
+                // register again, below). The address is that element's
+                // (stride and offset as below), see gpu/vertex_snapshot.h.
+                NoteFetchUse(slot, stage == ShaderStage::Vertex && full.src() == 0 && !full.is_src_relative() &&
+                    (full.src_swizzle() & 3) == 0 && !r0xWritten, full.stride(), op.offset());
 
                 if (op.is_predicated())
                 {
@@ -790,6 +833,15 @@ float xmul(float a, float b)
                 {
                     EmitStateMachine(cf);
                 }
+
+                // A loop, call or jump can run an instruction emitted later
+                // before one emitted earlier: there, fetches keep the vertex
+                // index only if nothing writes r0.x at all.
+                if (!flat && r0xWritten)
+                    for (vsnap::FetchUse& use : out.vertexFetches)
+                        use.vertexIndexed = false;
+                std::sort(out.vertexFetches.begin(), out.vertexFetches.end(),
+                    [](const vsnap::FetchUse& a, const vsnap::FetchUse& b) { return a.constant < b.constant; });
             }
 
             // Returns false once the program has ended.

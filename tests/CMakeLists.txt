@@ -60,6 +60,14 @@ sb_test(gpu_texture_budget_test ARGS ${RT}/gpu/renderer.cpp)
 # header only); renderer.cpp and shader_translator.cpp are read to check
 # LookupTexture and the untile's new loads use them.
 sb_test(gpu_texture_formats_test ARGS ${RT}/gpu/renderer.cpp ${RT}/gpu/shader_translator.cpp)
+# The vertex snapshots' spans (gpu/vertex_snapshot.h, header only): a span
+# covers every address a shader's fetch reads inside its range (the shaders'
+# addressing redone in C++), and the translator notes which fetches index
+# with the vertex index (shader_translator.cpp, on hand-assembled Xenos
+# shaders); renderer.cpp and shader_translator.cpp are read to check Draw
+# copies the spans and the shaders address vertices as modelled.
+sb_test(gpu_vertex_snapshot_test SOURCES ${RT}/gpu/shader_translator.cpp ${RT}/gpu/xenos/ucode.cpp
+    ARGS ${RT}/gpu/renderer.cpp ${RT}/gpu/shader_translator.cpp)
 # Which front image the renderer's next swap writes (gpu/front_ring.h,
 # header only): a model of the presenter and the renderer, which must show
 # every frame as itself or count it as dropped (v0.1.4's single image lost
