@@ -6210,6 +6210,17 @@ void main()
             const char* v = std::getenv("NFSMW_FRONT_IMAGES");
             return v ? std::clamp(std::atoi(v), 1, gpu::kMaxFrontImages) : gpu::kFrontImages;
         }();
+        // The image the last PresentFrontBuffer wrote, for ReadBackFrontImage
+        // (the timedemo's shots); null once destroyed.
+        struct LastFront
+        {
+            VkImage image = VK_NULL_HANDLE;
+            uint32_t width = 0, height = 0;
+        };
+        LastFront s_lastFront;
+        // Shot copies whose thread hasn't finished with their buffer yet
+        // (Shutdown waits for them a moment).
+        std::atomic<int> s_frontReadbacks{ 0 };
 
         // A ring of front images the presenter may still show or be reading:
         // taken back from it, then destroyed once the queue is idle.
@@ -6221,7 +6232,11 @@ void main()
                     video::ReleaseFrontImage(front.image);
             video::WaitGpuIdle();
             for (Image& front : ring.images)
+            {
+                if (front.image == s_lastFront.image)
+                    s_lastFront = {};
                 DestroyImage(front);
+            }
             ring.width = ring.height = 0;
         }
 
@@ -9410,6 +9425,7 @@ void main()
         FullBarrier();
         SubmitRecorded(7);  // the presenter's blit comes later in queue order
         video::SubmitFrontImage(front.image, outW, outH, width, height);
+        s_lastFront = { front.image, outW, outH };
         // Back at 1x (a live change): the host-resolution images are no
         // longer needed. The presenter has this frame to show instead.
         if (!scaled && s_frontScaled.width && s_renderScale.IsOne())
@@ -9482,6 +9498,111 @@ void main()
             }
         }
         return true;
+    }
+
+    void ReadBackFrontImage(FrontPixels done)
+    {
+        const LastFront front = s_lastFront;
+        if (!s_vk || !front.image)
+        {
+            done(nullptr, 0, 0);
+            return;
+        }
+        // A buffer of its own per copy, made here and freed by the thread
+        // that reads it: shots are a handful a run, and nothing the game's
+        // frames use (the upload ring, its slots) waits on them. Host-cached
+        // memory where there is some, as the shadow map's copy takes it: the
+        // CPU reads every byte.
+        struct Readback
+        {
+            VkBuffer buffer = VK_NULL_HANDLE;
+            VkDeviceMemory memory = VK_NULL_HANDLE;
+            void* host = nullptr;
+            bool coherent = true;
+        };
+        auto rb = std::make_shared<Readback>();
+        auto release = [](Readback& r) {
+            if (r.host)
+                vkUnmapMemory(s_dev, r.memory);
+            if (r.buffer)
+                vkDestroyBuffer(s_dev, r.buffer, nullptr);
+            if (r.memory)
+                vkFreeMemory(s_dev, r.memory, nullptr);
+            r = {};
+        };
+        VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+        bci.size = VkDeviceSize(front.width) * front.height * 4;
+        bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        bool ok = vkCreateBuffer(s_dev, &bci, nullptr, &rb->buffer) == VK_SUCCESS;
+        if (ok)
+        {
+            VkMemoryRequirements req{};
+            vkGetBufferMemoryRequirements(s_dev, rb->buffer, &req);
+            const VkMemoryPropertyFlags visible = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+            const VkMemoryPropertyFlags cached = visible | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+            VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+            mai.allocationSize = req.size;
+            mai.memoryTypeIndex = UINT32_MAX;
+            for (uint32_t i = 0; i < s_memProps.memoryTypeCount && mai.memoryTypeIndex == UINT32_MAX; i++)
+                if ((req.memoryTypeBits & (1u << i)) && (s_memProps.memoryTypes[i].propertyFlags & cached) == cached)
+                    mai.memoryTypeIndex = i;
+            if (mai.memoryTypeIndex == UINT32_MAX)
+                mai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, visible | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            ok = (s_memProps.memoryTypes[mai.memoryTypeIndex].propertyFlags & visible) == visible &&
+                vkAllocateMemory(s_dev, &mai, nullptr, &rb->memory) == VK_SUCCESS &&
+                vkBindBufferMemory(s_dev, rb->buffer, rb->memory, 0) == VK_SUCCESS &&
+                vkMapMemory(s_dev, rb->memory, 0, VK_WHOLE_SIZE, 0, &rb->host) == VK_SUCCESS;
+            rb->coherent = (s_memProps.memoryTypes[mai.memoryTypeIndex].propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
+        }
+        if (!ok)
+        {
+            fprintf(stderr, "[renderer] no host-visible buffer for a front image copy (%ux%u)\n", front.width, front.height);
+            release(*rb);
+            done(nullptr, 0, 0);
+            return;
+        }
+        // In the command stream after the swap's conversion and before any
+        // later write of the image (the next swaps' conversions begin with a
+        // full barrier too), so the copy is this swap's picture whatever the
+        // GPU's pace. The guest sees nothing of it.
+        EndPass();
+        Begin();
+        FullBarrier();
+        VkBufferImageCopy region{};
+        region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+        region.imageExtent = { front.width, front.height, 1 };
+        vkCmdCopyImageToBuffer(s_cmd, front.image, VK_IMAGE_LAYOUT_GENERAL, rb->buffer, 1, &region);
+        VkMemoryBarrier toHost{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
+        toHost.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        toHost.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+        vkCmdPipelineBarrier(s_cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &toHost, 0, nullptr, 0, nullptr);
+        s_frontReadbacks.fetch_add(1, std::memory_order_relaxed);
+        // Once the GPU is past the copy: on the completion thread, under its
+        // lock, when the GPU passes the event SignalWrites records after the
+        // copy, else at the submission's completion. Not QueueWrite: with
+        // eager writes (the default) that runs at once, and the reader found
+        // the buffer still empty, or half copied. The reading (and whatever
+        // `done` writes) goes to a thread of its own, so neither the
+        // completions nor the game wait for it.
+        auto landed = [rb, release, front, done = std::move(done)]() mutable {
+            std::thread([rb, release, front, done = std::move(done)] {
+                if (!rb->coherent)
+                {
+                    VkMappedMemoryRange range{ VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE };
+                    range.memory = rb->memory;
+                    range.size = VK_WHOLE_SIZE;
+                    vkInvalidateMappedMemoryRanges(s_dev, 1, &range);
+                }
+                done(static_cast<const uint8_t*>(rb->host), front.width, front.height);
+                release(*rb);
+                s_frontReadbacks.fetch_sub(1, std::memory_order_relaxed);
+            }).detach();
+        };
+        {
+            std::lock_guard lock(s_submitMutex);
+            s_submissions[s_slot].writes.push_back({ std::move(landed) });
+        }
+        SignalWrites();  // (outside a pass: this recording has none open)
     }
 
     void OnSwap(uint64_t frame)
@@ -9687,6 +9808,10 @@ void main()
         }
         s_compileCv.notify_all();
         SavePipelineCache();
+        // A shot's copy still being read and written out (ReadBackFrontImage):
+        // a moment for it, so its file is whole and its buffer freed.
+        for (int i = 0; i < 200 && s_frontReadbacks.load(std::memory_order_relaxed) > 0; i++)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
     void HitchReport(uint64_t frame, double frameMs, uint32_t vblanks)

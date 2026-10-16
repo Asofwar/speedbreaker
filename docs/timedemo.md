@@ -207,6 +207,93 @@ Steam Deck's `python3` does).
    change is the CP's and the GPU's busy time. That is where to look in the
    race for what got slower.
 
+## 4. Compare pictures
+
+A change meant to make the game faster must not change what it draws. With
+`NFSMW_BENCH_SHOTS=<step>,<step>,...` a replay also saves the picture of
+those world steps of the race (counted from the race's load, as
+`NFSMW_BENCH_FROM` is): `shot-<step>.ppm` in the run's folder, the frame as
+the renderer hands it to the presenter, before the presenter's
+post-processing (anti-aliasing, scaling, sharpening) and at the internal
+resolution. Each is the same frame in every run, capped or uncapped:
+
+```sh
+SHOTS=NFSMW_BENCH_SHOTS=1600,2200,2800,3400,4000,4600,5200
+# Capped runs (here as the warm-ups, which measure nothing): the strict gate.
+scripts/timedemo.sh run WA 1 --bundle ~/sb/A NFSMW_BENCH_FROM=1530 $SHOTS
+scripts/timedemo.sh run WB 1 --bundle ~/sb/B NFSMW_BENCH_FROM=1530 $SHOTS
+python3 scripts/compare_shots.py ~/sb-bench/runs/WA-1 ~/sb-bench/runs/WB-1 --strict --diff /tmp/shots-diff
+# The measured runs take them too (a GPU copy a shot): the default gate.
+scripts/timedemo.sh run A 1 --bundle ~/sb/A NFSMW_TIMEDEMO_UNCAPPED=1 NFSMW_BENCH_FROM=1530 $SHOTS
+scripts/timedemo.sh run B 1 --bundle ~/sb/B NFSMW_TIMEDEMO_UNCAPPED=1 NFSMW_BENCH_FROM=1530 $SHOTS
+python3 scripts/compare_shots.py ~/sb-bench/runs/A-1 ~/sb-bench/runs/B-1
+```
+
+`compare_shots.py` prints, for each step, whether the two pictures are
+identical, and if not how many pixels changed, by how much at most (0-255),
+the PSNR, how many are off by more than `--threshold`, and where those are
+(the rectangle they lie in, and the tiles of an 8x8 grid that hold most of
+them); `--diff <dir>` writes a picture of where. A shot passes when no more
+than `--tolerance` percent of its pixels are off by more than `--threshold`
+and its PSNR reaches `--min-psnr`. Exit 0 when every shot passes, 1 when
+one doesn't, 2 when the runs can't be compared.
+
+Two runs of one build don't draw quite the same pictures, and how far apart
+they are depends on the pace. On the Steam Deck (the default race, seven
+shots):
+
+- Uncapped (as measured; five runs): no two pictures identical. Small
+  differences over much of the picture (0.01% to 43% of the pixels changed,
+  by 1 to 20 levels mostly), worst in the sky and bright areas, while the HUD
+  stays identical; in each shot the runs fall into a few groups, as if one
+  setting of the picture (exposure, bloom) differed a little. At worst a
+  colour value off by 49 between two uncapped runs (61 against a capped
+  one), 1167 pixels (0.13%) off by more than 32, PSNR 37.4 dB (33.6 against
+  a capped run).
+- Capped (at the vblank's pace; two runs): two of the seven pictures
+  identical, the rest off by 1 to 3 at most, PSNR 55.8 dB or more.
+
+So the default gate (`--threshold 64 --tolerance 0.05 --min-psnr 30`) is for
+uncapped runs: it passes their noise and fails what a broken draw does, a
+missing, misplaced or wrongly textured object (hundreds of pixels far off)
+or the whole picture off by 8 levels or more; a picture two frames later
+fails it by far (2% to 12% of the pixels off by more than 64, PSNR 14 to 24
+dB). `--strict` (`--threshold 8 --tolerance 0.01 --min-psnr 50`) is for
+capped runs (no `NFSMW_TIMEDEMO_UNCAPPED`) and catches subtle changes too:
+compare capped runs for that, taking the shots in the warm-up runs, which
+measure nothing. `--exact` asks for identical pictures. Either way only runs
+that skipped no draws in the window compare (`pipelines.skips` 0: a warm
+pipeline cache), as for their times.
+
+Which frame a step's picture is. The game's main loop runs ahead of its
+pictures: its render thread draws and swaps a frame while the loop runs the
+next ones (up to four ahead, uncapped), and the GPU side executes that swap
+later still, by a lag that changes from frame to frame, so the swap the GPU
+side is at when the loop reaches a step is a different frame in every run.
+What is the same in every run is that in a race the game swaps once a
+frame, in order: the race frame that began at main loop iteration L
+(`RealLoopCounter`) is the game's swap L + 1 + an offset (0 in the race
+recorded on the Deck; its menus ran 2), and two runs of a replay make the
+same swaps. The recorder measures the offset in the race (the most swaps the
+game had made at the start of a race frame, less the frame's loop count: at
+the vblank's pace, before the window, the render thread has caught up at
+nearly every frame's start), keeps it from the first shot on, and names
+each shot's swap from its frame's loop count; the command processor copies
+that swap's front image when it executes it. `shots.verified` says the
+offset held: no race frame after the first shot started with more swaps
+than it allows (a swap that isn't a frame's). An unverified shot may picture
+another frame. The offset needs race frames at the vblank's pace before the
+first shot: keep `NFSMW_BENCH_FROM` well past the race's load (the default
+race's 1530 gives 1500 of them).
+
+What it costs, for each shot: at its swap the command processor makes a
+buffer of the picture's size (3.5 MB at 1280x720) and records a copy into it
+(well under a millisecond), the GPU copies, and a thread of its own writes
+the file once the copy has landed. The game waits for none of it, so shots
+can be taken in measured runs: on the Deck five uncapped runs with shots
+made 118.4 to 119.1 fps, three without 118.7 to 118.8. The trace hash and the
+draws are those of a run without shots.
+
 ## Switches
 
 All off by default: without them the game behaves exactly as without this
@@ -225,6 +312,7 @@ feature.
 | `NFSMW_BENCH_OUT=<dir>` | where the report goes (default `<data folder>/logs/bench/<date>_<time>_<label>/`) |
 | `NFSMW_BENCH_TIMEOUT=<s>` | a partial report and exit after this long (900) |
 | `NFSMW_BENCH_EXIT=0` | stay in the game after the report (the default is to exit) |
+| `NFSMW_BENCH_SHOTS=<step>,...` | the picture of these world steps of the race (counted as `NFSMW_BENCH_FROM` is), as `shot-<step>.ppm` in the report's folder (see [Pictures](#4-compare-pictures)) |
 | `NFSMW_SAVE_DIR=<dir>` | an absolute path: `save/` and `profile_settings.bin` there instead of the data folder's |
 
 ## The report
@@ -247,6 +335,14 @@ In the run's folder (`NFSMW_BENCH_OUT`):
   late`.
 - `main.csv`: one row per game frame: `loop, step, t_us, frame_us, wait_us,
   flow`.
+- With `NFSMW_BENCH_SHOTS`: `shot-<step>.ppm` for each step taken, and
+  `shots` in `summary.json`: `verified`, `swap_offset` (the game's swaps
+  against its frames), `race_frames` (the race frames noted),
+  `frames_at_offset` (those that showed it before the first shot),
+  `frames_past_offset`, and
+  `taken[]`, each step's `status` (`ok`, `unverified`, `failed` with `why`,
+  `pending`, `not_reached`), the frame it pictures (`loop`, `frame_step`),
+  its `swap`, `file`, `width` and `height`.
 - A `[bench]` line in the game's log: `[bench] A-1 ok: 7200 frames 98.4 s |
   timedemo 73.2 fps, 1% low 51.0 | p50 13.1 p99 21.4 max 48.2 ms | ...`.
 
@@ -264,6 +360,9 @@ In the run's folder (`NFSMW_BENCH_OUT`):
 | `bench_compare.py` | 0 | comparable, and no regression beyond the threshold outside the noise |
 | | 1 | a regression |
 | | 2 | the runs aren't comparable, or bad input |
+| `compare_shots.py` | 0 | every picture within the tolerance (by default the run-to-run noise; `--exact`: identical) |
+| | 1 | a picture beyond it |
+| | 2 | the pictures can't be compared: one missing from a run, another size, another swap, not a binary PPM |
 
 ## Limits
 

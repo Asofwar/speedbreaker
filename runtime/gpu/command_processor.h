@@ -10,6 +10,7 @@
 // index*4 (we have no MMIO traps), so the write pointer is polled there and
 // the register file is mirrored back into that page for the game's reads.
 #pragma once
+#include <atomic>
 #include <cstdint>
 #include <string>
 
@@ -24,6 +25,11 @@ namespace gpu
 
     // Frames completed (XE_SWAP packets executed).
     uint64_t FrameCount();
+    // The same swaps as the game makes them (VdSwap calls, imports_video.cpp),
+    // ahead of FrameCount by the frames in the ring: equal once the command
+    // processor has caught up. The timedemo's shots (debug/bench_shots.h)
+    // count the game's swaps against its frames with it.
+    inline std::atomic<uint64_t> g_guestSwaps{ 0 };
 
     // For the hang watchdog (report/watchdog.cpp), any thread: since when
     // (steady clock, ns) the command processor has been polling one

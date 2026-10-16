@@ -501,7 +501,8 @@ namespace gpu
                 // Presented from the GPU without waiting; frame dumps (and the
                 // headless case) take the CPU path, which needs the GPU idle.
                 static const bool dumping = std::getenv("NFSMW_DUMP_FRAMES") != nullptr;
-                if (dumping || !renderer::PresentFrontBuffer(&s_regs[0x4800], width, height))
+                const bool gpuFront = !dumping && renderer::PresentFrontBuffer(&s_regs[0x4800], width, height);
+                if (!gpuFront)
                 {
                     renderer::Flush();
                     video::SubmitFrontBuffer(&s_regs[0x4800], width, height);
@@ -509,6 +510,10 @@ namespace gpu
                 s_counter++;
                 timeline::Mark(timeline::Swap);
                 uint64_t frame = ++s_frames;
+                // A timedemo shot's swap (NFSMW_BENCH_SHOTS; 0 otherwise): its
+                // front image is copied before anything else can replace it.
+                if (uint64_t shot = bench::g_shotSwap.load(std::memory_order_relaxed); shot && frame >= shot) [[unlikely]]
+                    bench::OnShotSwap(frame, gpuFront);
                 renderer::OnSwap(frame);
                 // Every 120 frames: frame rate and per-frame costs since the last line.
                 // Frame times are guest time (guesttime::NowNs: the host's

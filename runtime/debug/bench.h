@@ -9,16 +9,38 @@
 //   NFSMW_BENCH_OUT=<dir>           where the report goes (default: <user>/logs/bench/<time>_<label>/)
 //   NFSMW_BENCH_TIMEOUT=<s>         a partial report and exit after this long (900)
 //   NFSMW_BENCH_EXIT=0|1            exit once the report is written (default 1 in replay)
+//   NFSMW_BENCH_SHOTS=<step>,...    the picture of these world steps of the race
+//                                   (counted as NFSMW_BENCH_FROM is) into the
+//                                   report's folder as shot-<step>.ppm
 //   NFSMW_BENCH=0                   a replay without the recorder (to watch one)
 //
 // Without NFSMW_BENCH_STEPS the window ends 60 frames before the capture's meta
 // file (<file>.json) says the log stops being replayable (valid_until_loop,
 // else end_loop); without a meta file, where the log ends. A window of
 // NFSMW_BENCH_STEPS that reaches that point ends there, status log_ended.
+//
+// A shot is the front image (the renderer's picture of the frame, before the
+// presenter's post-processing and scaling) of the swap that shows the race's
+// first frame at or past its step: the same frame in every run of the replay,
+// uncapped or not (debug/bench_shots.h says how that swap is found). Steps up
+// to the window's end are taken; the report's "shots" lists them. A shot
+// costs a copy of the front image on the GPU and a file written on another
+// thread, nothing the game waits for. scripts/compare_shots.py compares two
+// runs' shots.
+#include <atomic>
 #include <cstdint>
 
 namespace bench
 {
+    // The next shot's swap number, 0 when none is due: the command processor
+    // checks each swap against it (OnShotSwap).
+    inline std::atomic<uint64_t> g_shotSwap{ 0 };
+    // The command processor, at swap `swap` (gpu::FrameCount() after it)
+    // once it reaches g_shotSwap, right after the swap's front image was
+    // written: `gpuFront` when the renderer wrote one (not headless, not
+    // NFSMW_DUMP_FRAMES). Copies it for every shot due by this swap.
+    void OnShotSwap(uint64_t swap, bool gpuFront);
+
     // A replay with the recorder on.
     bool Enabled();
     // The window is being measured (Running) or finished on the command

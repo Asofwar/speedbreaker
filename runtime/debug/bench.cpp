@@ -39,13 +39,22 @@
 // two runs of one log hash the same exactly when they stayed in step frame
 // for frame (the game's own checksum, timedemo.cpp's DIVERGENCE, says where
 // they didn't).
+//
+// Shots (NFSMW_BENCH_SHOTS, bench_shots.h): at each frame's start the main
+// thread notes the game's swaps against its frames, and when a shot's step
+// comes names the swap that will be that frame's picture; the command
+// processor copies that swap's front image as it executes it (OnShotSwap),
+// and a thread of the renderer's writes the file once the copy has landed.
+// Nothing waits for any of it but the report, for the files.
 #include <stdafx.h>
 #include "bench.h"
+#include "bench_shots.h"
 #include "bench_stats.h"
 
 #include <cerrno>
 #include <condition_variable>
 #include <ctime>
+#include <deque>
 #include <sys/resource.h>
 #include <unistd.h>
 
@@ -149,6 +158,7 @@ namespace bench
             bool exit = true;
             std::string label;
             std::filesystem::path out;  // empty: the default under the logs
+            std::vector<int64_t> shots; // NFSMW_BENCH_SHOTS, ascending
         };
 
         bool ParseInt(const char* text, int64_t& value)
@@ -192,6 +202,13 @@ namespace bench
                 c.label = "bench";
             if (const char* v = std::getenv("NFSMW_BENCH_OUT"); v && *v)
                 c.out = v;
+            if (const char* v = std::getenv("NFSMW_BENCH_SHOTS"); v && *v)
+            {
+                std::string bad;
+                c.shots = shots::ParseSteps(v, &bad);
+                if (!bad.empty())
+                    fprintf(stderr, "[bench] NFSMW_BENCH_SHOTS: %s isn't a step count: left out\n", bad.c_str());
+            }
             return c;
         }
 
@@ -334,6 +351,28 @@ namespace bench
         };
         CpTotals s_cpLast;
 
+        // Shots (see the top and bench_shots.h). One per NFSMW_BENCH_SHOTS
+        // step, made at Arm; then each changes under s_shotMutex.
+        struct Shot
+        {
+            enum class State : uint8_t { Waiting, Queued, Copying, Written, Failed };
+            int64_t step = 0;          // asked for
+            uint32_t loop = 0;         // the race's first frame at or past it (RealLoop at its start)
+            int64_t frameStep = -1;    // and its world step then
+            uint64_t swap = 0;         // its picture's swap
+            uint64_t copied = 0;       // the swap the command processor copied (late: past `swap`)
+            uint32_t width = 0, height = 0;
+            bool ahead = false;        // the game had already made `swap` when it was named: the model failed
+            State state = State::Waiting;
+            std::string why;           // Failed: why
+        };
+        std::mutex s_shotMutex;
+        std::condition_variable s_shotChanged;  // a shot was written or failed
+        std::vector<Shot> s_shots;
+        std::deque<size_t> s_shotQueue;         // Queued shots, by swap (frames come in order)
+        shots::SwapOffset s_swapOffset;         // the main thread's, under the mutex (the report reads it)
+        size_t s_shotNext = 0;                  // main thread: the first shot whose step hasn't come
+
         uint32_t Clamp32(int64_t v)
         {
             return uint32_t(std::clamp<int64_t>(v, 0, int64_t(UINT32_MAX)));
@@ -399,10 +438,126 @@ namespace bench
             if (!s_meta.found)
                 fprintf(stderr, "[bench] no meta file next to %s: race_loop isn't checked\n", timedemo::File().c_str());
 
+            if (!config.shots.empty())
+            {
+                s_shots.resize(config.shots.size());
+                std::string steps;
+                for (size_t i = 0; i < config.shots.size(); i++)
+                {
+                    s_shots[i].step = config.shots[i];
+                    steps += (i ? "," : "") + std::to_string(config.shots[i]);
+                }
+                fprintf(stderr, "[bench] shots at steps %s, into %s\n", steps.c_str(), s_outDir.c_str());
+            }
+
             s_deadline = std::chrono::steady_clock::now()
                 + std::chrono::milliseconds(int64_t(std::min(config.timeoutS, 1e9) * 1000.0));
             s_state.store(State::Armed, std::memory_order_release);
             std::thread(ReportThread).detach();
+        }
+
+        // --- Shots: the main thread's side ---
+
+        // Main thread, Armed or Running (a replay's frames up to the window's
+        // end), at the start of each race frame: the game's swaps against its
+        // frames noted (bench_shots.h), and each shot whose step has come
+        // named by its swap and queued for the command processor. The first
+        // shot keeps the offset. Nothing here waits.
+        void ShotsOnMainFrame(uint32_t loop, int64_t step, uint32_t flow)
+        {
+            if (flow != kRaceFlow || step < 0)
+                return;
+            const uint64_t swaps = gpu::g_guestSwaps.load(std::memory_order_relaxed);
+            std::lock_guard lock(s_shotMutex);
+            s_swapOffset.Note(swaps, loop);
+            while (s_shotNext < s_shots.size() && step >= s_shots[s_shotNext].step)
+            {
+                if (!s_swapOffset.Frozen())
+                {
+                    s_swapOffset.Freeze();
+                    fprintf(stderr, "[bench] shots: the game's swaps run %lld ahead of its frames (at %llu of the race's %llu "
+                        "frames so far)\n", (long long)s_swapOffset.Offset(), (unsigned long long)s_swapOffset.CaughtUp(),
+                        (unsigned long long)s_swapOffset.Frames());
+                }
+                const uint64_t swap = shots::PictureSwap(s_swapOffset.Offset(), loop);
+                const uint64_t executed = gpu::FrameCount();
+                Shot& shot = s_shots[s_shotNext++];
+                shot.loop = loop;
+                shot.frameStep = step;
+                shot.swap = swap;
+                // At this frame's start the game can't have made its picture
+                // yet: it did only if the offset is wrong.
+                shot.ahead = swaps >= swap;
+                if (executed >= swap)
+                {
+                    shot.state = Shot::State::Failed;
+                    shot.why = std::format("its swap {} had been executed already (at {})", swap, executed);
+                    fprintf(stderr, "[bench] shot %lld: %s\n", (long long)shot.step, shot.why.c_str());
+                    s_shotChanged.notify_all();
+                    continue;
+                }
+                shot.state = Shot::State::Queued;
+                s_shotQueue.push_back(size_t(&shot - s_shots.data()));
+                g_shotSwap.store(s_shots[s_shotQueue.front()].swap, std::memory_order_relaxed);
+            }
+        }
+
+        // Writes a copied picture (null: none) into each due shot's file;
+        // a renderer thread (ReadBackFrontImage).
+        void WriteShots(const std::vector<size_t>& due, const uint8_t* rgba, uint32_t width, uint32_t height)
+        {
+            std::string ppm, error;
+            if (!rgba)
+                error = "no front image to copy (headless, NFSMW_DUMP_FRAMES, or no memory for the copy)";
+            else
+            {
+                ppm = shots::Ppm(rgba, width, height, size_t(width) * 4);
+                std::error_code ec;
+                std::filesystem::create_directories(s_outDir, ec);
+                if (ec)
+                    error = std::format("can't create {}: {}", s_outDir.string(), ec.message());
+            }
+            for (size_t i : due)
+            {
+                int64_t step;
+                {
+                    std::lock_guard lock(s_shotMutex);
+                    step = s_shots[i].step;
+                }
+                std::filesystem::path path = s_outDir / shots::FileName(step);
+                std::string failed = !error.empty() ? error : vfs::WriteAtomically(path, ppm.data(), ppm.size());
+                std::lock_guard lock(s_shotMutex);
+                Shot& shot = s_shots[i];
+                shot.width = width;
+                shot.height = height;
+                shot.state = failed.empty() ? Shot::State::Written : Shot::State::Failed;
+                shot.why = failed;
+                if (failed.empty())
+                    fprintf(stderr, "[bench] shot %lld: frame at loop %u (step %lld), swap %llu: %s (%ux%u)\n", (long long)step, shot.loop,
+                        (long long)shot.frameStep, (unsigned long long)shot.swap, path.c_str(), width, height);
+                else
+                    fprintf(stderr, "[bench] shot %lld: %s\n", (long long)step, failed.c_str());
+            }
+            s_shotChanged.notify_all();
+        }
+
+        // The report thread: waits (10 s at most) for every named shot to be
+        // written or failed, so the report says what is on disk. The game
+        // goes on meanwhile: a shot named in the window's last frames has its
+        // swap a few frames later.
+        void WaitForShots()
+        {
+            if (s_shots.empty())
+                return;
+            std::unique_lock lock(s_shotMutex);
+            bool done = s_shotChanged.wait_for(lock, std::chrono::seconds(10), [] {
+                for (const Shot& shot : s_shots)
+                    if (shot.state == Shot::State::Queued || shot.state == Shot::State::Copying)
+                        return false;
+                return true;
+            });
+            if (!done)
+                fprintf(stderr, "[bench] shots: still copying after 10 s: reported as pending\n");
         }
 
         // Main thread: from one state to the next, unless the timeout got
@@ -530,9 +685,65 @@ namespace bench
 
         void Quit(int code);
 
+        // The report's "shots": the game's swaps against its frames
+        // (bench_shots.h) and each shot, with its status: ok (written, and
+        // verified: no race frame after the first shot went past the
+        // offset), unverified (written, but not that, or the game was past
+        // its swap when it was named), failed (with why), pending (still
+        // being copied), not_reached (the window ended before its step).
+        // Returns the [bench] line's summary.
+        std::string ShotsJson(stats::Json& json)
+        {
+            std::lock_guard lock(s_shotMutex);
+            const shots::SwapOffset& o = s_swapOffset;
+            const bool verified = o.Verified();
+            json.BeginObject("shots").Field("verified", verified);
+            if (o.Frozen())
+                json.Field("swap_offset", o.Offset());
+            else
+                json.Null("swap_offset");
+            json.Field("race_frames", o.Frames()).Field("frames_at_offset", o.CaughtUp()).Field("frames_past_offset", o.Past());
+            if (o.Past())
+                json.Field("past_by", o.PastBy());
+            json.BeginArray("taken");
+            size_t ok = 0, unverified = 0, failed = 0, other = 0;
+            for (const Shot& shot : s_shots)
+            {
+                const char* status = "not_reached";
+                switch (shot.state)
+                {
+                case Shot::State::Written:
+                    status = verified && !shot.ahead ? "ok" : "unverified";
+                    break;
+                case Shot::State::Failed: status = "failed"; break;
+                case Shot::State::Queued:
+                case Shot::State::Copying: status = "pending"; break;
+                default: break;
+                }
+                ok += strcmp(status, "ok") == 0;
+                unverified += strcmp(status, "unverified") == 0;
+                failed += strcmp(status, "failed") == 0;
+                other += strcmp(status, "pending") == 0 || strcmp(status, "not_reached") == 0;
+                json.BeginObject().Field("step", shot.step).Field("status", status);
+                if (shot.state != Shot::State::Waiting)
+                    json.Field("loop", shot.loop).Field("frame_step", shot.frameStep).Field("swap", shot.swap);
+                if (shot.state == Shot::State::Written)
+                    json.Field("file", shots::FileName(shot.step)).Field("width", shot.width).Field("height", shot.height);
+                if (shot.ahead)
+                    json.Field("ahead", true);
+                if (!shot.why.empty())
+                    json.Field("why", shot.why);
+                json.End();
+            }
+            json.End().End();
+            return std::format("{} ok, {} unverified, {} failed, {} not taken", ok, unverified, failed, other);
+        }
+
         void WriteReport()
         {
             const Config& config = GetConfig();
+            // The shots' files first: the report names what is on disk.
+            WaitForShots();
             // Whole rows only (see the top), and the command processor's up
             // to the window's last swap: one that raced the end is dropped.
             size_t mainCount = s_main.count.load(std::memory_order_acquire);
@@ -717,6 +928,7 @@ namespace bench
                 json.Null("divergence");
             json.Field("race_loop_matches", !s_raceLoopMismatch.load())
                 .Field("trace_hash", traceHex).Field("draws_total", draws).End();
+            std::string shotsLine = s_shots.empty() ? std::string() : ShotsJson(json);
             // What makes two runs comparable, in the bench script's words (the
             // settings their NFSMW_* variables set: NFSMW_RESOLUTION is
             // Internal Resolution, NFSMW_SCREEN_RESOLUTION the present
@@ -791,6 +1003,9 @@ namespace bench
                 written = WriteFile(s_outDir / "frames.csv", framesCsv.Text()) && written;
                 written = WriteFile(s_outDir / "main.csv", mainCsv.Text()) && written;
             }
+
+            if (!shotsLine.empty())
+                fprintf(stderr, "[bench] shots: %s (summary.json's \"shots\")\n", shotsLine.c_str());
 
             // The one line: the classic timedemo figure (main loop frames over
             // their time), then the command processor's frame times.
@@ -919,6 +1134,8 @@ namespace bench
         int64_t step = timedemo::WorldStep();
         uint32_t flow = timedemo::FlowState();
         s_loopNow.store(loop, std::memory_order_relaxed);
+        if (!s_shots.empty())
+            ShotsOnMainFrame(loop, step, flow);
         // The replay flag drops at the log's end (or a divergence, which
         // Diverged reports first); it is 0 too before boot sets it.
         bool replaying = ReadGuest32(kReplayOn) != 0;
@@ -989,6 +1206,43 @@ namespace bench
             s_logEnded.store(true);
         if (end != End::None)
             EndWindow(state, end, loop, step);
+    }
+
+    void OnShotSwap(uint64_t swap, bool gpuFront)
+    {
+        std::vector<size_t> due;
+        {
+            std::lock_guard lock(s_shotMutex);
+            while (!s_shotQueue.empty() && s_shots[s_shotQueue.front()].swap <= swap)
+            {
+                size_t i = s_shotQueue.front();
+                s_shotQueue.pop_front();
+                Shot& shot = s_shots[i];
+                shot.copied = swap;
+                if (swap != shot.swap)
+                {
+                    // Named after the command processor had passed it (a
+                    // race the model rules out): another frame, not written.
+                    shot.state = Shot::State::Failed;
+                    shot.why = std::format("its swap {} was named after the command processor had executed it (copied {})",
+                        shot.swap, swap);
+                    fprintf(stderr, "[bench] shot %lld: %s\n", (long long)shot.step, shot.why.c_str());
+                    continue;
+                }
+                shot.state = Shot::State::Copying;
+                due.push_back(i);
+            }
+            g_shotSwap.store(s_shotQueue.empty() ? 0 : s_shots[s_shotQueue.front()].swap, std::memory_order_relaxed);
+        }
+        s_shotChanged.notify_all();
+        if (due.empty())
+            return;
+        if (!gpuFront)
+        {
+            WriteShots(due, nullptr, 0, 0);
+            return;
+        }
+        renderer::ReadBackFrontImage([due](const uint8_t* rgba, uint32_t width, uint32_t height) { WriteShots(due, rgba, width, height); });
     }
 
     void OnSwap()

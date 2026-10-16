@@ -133,6 +133,10 @@ sb_test(timedemo_logic_test ARGS ${RT})
 # header only): nearest-rank percentiles, the 1% and 0.1% low averages,
 # FNV-1a 64, the JSON and CSV writers.
 sb_test(bench_stats_test)
+# The timedemo's frame images (debug/bench_shots.h, header only):
+# NFSMW_BENCH_SHOTS's steps, the main loop's holds, which swap is a frame's
+# picture, when a held game has settled, the PPM.
+sb_test(bench_shots_test)
 # The nitrous light trails' ring at the 360's 30 fps length (game/light_trails.h,
 # header only; GitHub issue #10).
 sb_test(light_trails_test)
@@ -149,6 +153,8 @@ if(Python3_FOUND)
     set_tests_properties(report_zip_check PROPERTIES DEPENDS report_zip_test)
     # scripts/bench_compare.py on made-up timedemo reports (docs/timedemo.md).
     add_test(NAME bench_compare_test COMMAND Python3::Interpreter ${CMAKE_CURRENT_SOURCE_DIR}/bench_compare_test.py)
+    # scripts/compare_shots.py on made-up timedemo frame images.
+    add_test(NAME compare_shots_test COMMAND Python3::Interpreter ${CMAKE_CURRENT_SOURCE_DIR}/compare_shots_test.py)
 endif()
 # "Choose a folder..." in the installer (install/placement.h): where the game
 # goes in a picked folder and what is refused, on planted facts and in a

@@ -76,6 +76,17 @@ namespace gpu::renderer
     // image on the GPU and hand it to the presenter. False when headless.
     bool PresentFrontBuffer(const uint32_t fetch[6], uint32_t width, uint32_t height);
 
+    // The timedemo's shots (NFSMW_BENCH_SHOTS, debug/bench.h): copy the image
+    // the last PresentFrontBuffer wrote (the game's frame as the presenter
+    // gets it, before its post-processing and scaling) into memory the CPU
+    // reads, without waiting for the GPU. Command processor thread, right
+    // after that swap. `done` runs on a thread of its own once the copy has
+    // landed: RGBA8, top row first, rows width * 4 bytes apart, valid only
+    // during the call; or with null pixels when there was no image (headless,
+    // NFSMW_DUMP_FRAMES) or no memory for the copy.
+    using FrontPixels = std::function<void(const uint8_t* rgba, uint32_t width, uint32_t height)>;
+    void ReadBackFrontImage(FrontPixels done);
+
     // After each swap (NFSMW_PASS_PROFILE=<frame> prints that frame's passes).
     void OnSwap(uint64_t frame);
 
