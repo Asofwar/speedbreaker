@@ -344,6 +344,10 @@ static void TestRenderer(const char* path)
     CHECK(has(all, "constuint32_ts_prewarmWorkers=std::max(s_pipelineThreads,2u)-1;") &&
             has(all, "return!s_prewarmQueue.empty()&&s_prewarmActive<s_prewarmWorkers;"),
         "the prewarm leaves a worker for draws");
+    // With fewer than two workers nothing is made ahead: one worker would be
+    // shared with the draws' compiles, none would build on the CP itself.
+    CHECK(has(all, "constboolprewarmWorkers=s_pipelineThreads>=2;if(s_prewarmOn&&prewarmWorkers){"),
+        "no prewarm with fewer than two pipeline workers");
 
     // Only what this session's Draw makes, from shaders that are the ones
     // the key names.

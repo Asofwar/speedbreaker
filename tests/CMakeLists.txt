@@ -173,7 +173,9 @@ sb_test(bench_shots_test)
 # The nitrous light trails' ring at the 360's 30 fps length (game/light_trails.h,
 # header only; GitHub issue #10).
 sb_test(light_trails_test)
-sb_test(guest_time_test SOURCES ${RT}/cpu/guest_time.cpp)
+# The guest clock across suspensions, on real sleeps: its thresholds hold on a
+# quiet machine, not under a parallel ctest or on a shared CI runner (timing).
+sb_test(guest_time_test SOURCES ${RT}/cpu/guest_time.cpp LABELS timing)
 # When the mouse cursor shows over the game (ui/cursor_idle.h, header only),
 # and how ui.cpp drives it.
 sb_test(cursor_idle_test ARGS ${RT}/ui/ui.cpp)

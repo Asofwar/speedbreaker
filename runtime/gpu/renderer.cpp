@@ -3256,7 +3256,14 @@ namespace gpu::renderer
             gpu::pipeline_keys::Prune(list, gpu::pipeline_keys::kMaxKeys);
             Prewarm& p = s_prewarm;
             p.listed = uint32_t(list.keys.size());
-            if (s_prewarmOn)
+            // Two pipeline workers at least: with one, a prewarm compile can
+            // hold the only worker while a draw waits for its own pipeline
+            // (20-80 ms with a cold driver cache), and with none
+            // (NFSMW_PIPELINE_THREADS=0) every pipeline would be built on the
+            // command processor itself, a whole one per swap. The list is
+            // still kept and saved either way.
+            const bool prewarmWorkers = s_pipelineThreads >= 2;
+            if (s_prewarmOn && prewarmWorkers)
             {
                 for (const gpu::pipeline_keys::Entry& e : list.keys)
                 {
@@ -3273,8 +3280,9 @@ namespace gpu::renderer
             if (p.listed)
                 fprintf(stderr, "[renderer] pipeline key list: %u pipelines and %zu shaders from %u sessions; %s\n", p.listed,
                     list.shaders.size(), list.session,
-                    !s_prewarmOn ? "none made ahead (NFSMW_PIPELINE_PREWARM=0)"
-                                 : std::format("{} to make ahead ({} not for this configuration)", p.keys.size(), p.unusable).c_str());
+                    !s_prewarmOn    ? "none made ahead (NFSMW_PIPELINE_PREWARM=0)"
+                    : !prewarmWorkers ? std::format("none made ahead ({} pipeline worker thread{}: it takes two)", s_pipelineThreads, s_pipelineThreads == 1 ? "" : "s").c_str()
+                                      : std::format("{} to make ahead ({} not for this configuration)", p.keys.size(), p.unusable).c_str());
             std::lock_guard lock(s_keyListMutex);
             s_keyListVendor = props.vendorID;
             s_keyListDevice = props.deviceID;
