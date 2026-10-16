@@ -176,6 +176,8 @@ namespace gpu::renderer
         CP_OPT_KEEP_BINDINGS = 512,  // the ring stays bound as the index buffer (firstIndex picks a draw's indices),
                                      // compute work leaves the graphics bindings bound, push constants pushed from the
                                      // first changed row
+        CP_OPT_TEXTURE_MEMO = 1024,  // a draw's textures are the draw before's, not looked up, while nothing they
+                                     // depend on changed (renderer.cpp, TextureDrawMemo; needs CP_OPT_TEXTURE_CACHE)
     };
     inline const uint32_t g_cpOpt = [] { const char* v = std::getenv("NFSMW_CP_OPT"); return v ? uint32_t(strtoul(v, nullptr, 0)) : ~0u; }();
 

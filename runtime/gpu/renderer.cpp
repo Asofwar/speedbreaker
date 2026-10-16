@@ -1796,6 +1796,15 @@ namespace gpu::renderer
             VkDescriptorSetLayout set = VK_NULL_HANDLE;
             VkPipelineLayout pipeline = VK_NULL_HANDLE;
             std::array<uint32_t, 3> vsMasks{}, psMasks{};
+            // Its bindings in binding order, as Draw looks them up and pushes
+            // them: d * 32 + n is fetch constant n sampled as dimension d (2D,
+            // 3D, cube). A list, so a draw walks its few textures instead of
+            // testing 96 mask bits twice (~6% of the command processor in a
+            // race, Deck profile). `fetchSlots`: the fetch constants they read
+            // (bit n), whatever the dimension.
+            uint32_t bindingCount = 0;
+            uint8_t bindings[96] = {};
+            uint32_t fetchSlots = 0;
         };
         std::map<std::array<uint32_t, 6>, std::unique_ptr<TextureLayout>> s_textureLayouts;
 
@@ -1831,7 +1840,11 @@ namespace gpu::renderer
                     VkShaderStageFlags stages = ((v[d] >> n) & 1 ? VK_SHADER_STAGE_VERTEX_BIT : 0) |
                         ((p[d] >> n) & 1 ? VK_SHADER_STAGE_FRAGMENT_BIT : 0);
                     if (stages)
+                    {
                         bindings.push_back({ d * 32 + n, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, stages, nullptr });
+                        slot->bindings[slot->bindingCount++] = uint8_t(d * 32 + n);
+                        slot->fetchSlots |= 1u << n;
+                    }
                 }
             VkDescriptorSetLayoutCreateInfo dslci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
             dslci.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
@@ -4429,26 +4442,91 @@ void main()
         // turns it off; NFSMW_CP_CACHE_VERIFY=1 also does the full lookup on
         // every hit and logs any difference (it then returns the full
         // lookup's result).
-        struct TextureCacheEntry
+        // A hit reads only the entry's first 64 bytes (and the fetch
+        // constant): the key, the epoch, the result and the frame it last
+        // set its texture's lastUsed in; revalidating it after a write, the
+        // rest of the entry. The texture itself, a cold line by the next
+        // draw (the snapshot copies stream megabytes a frame through the
+        // caches), is touched once a frame per entry, to set lastUsed.
+        struct alignas(64) TextureCacheEntry
         {
             uint32_t fetch[6] = {};
             uint32_t generation = 0;  // TextureCache::generation when made; 0: empty
             uint8_t dim = 0;
             bool scaledCandidate = false, drawScaled = false;
             uint64_t epoch = 0;  // WriteEpoch() it was last valid at
-            Texture* texture = nullptr;
             VkImageView view = VK_NULL_HANDLE;
             VkSampler sampler = VK_NULL_HANDLE;
+            uint64_t frame = 0;  // s_frame its texture's lastUsed was last set to through it
+            Texture* texture = nullptr;
             uint32_t base = 0, size = 0, mipBase = 0, mipSize = 0;
+            uint64_t loadedSequence = 0;  // the texture's when the entry was made (RevalidateTextureEntry)
+        };
+        static_assert(offsetof(TextureCacheEntry, frame) + sizeof(uint64_t) <= 64, "a hit's fields share the entry's first line");
+
+        // CP_OPT_TEXTURE_MEMO: the texture bindings of the last draw that
+        // looked its textures up, served again to the draws after it while
+        // nothing they depend on changed. In a race ~5,000 textures a frame
+        // were looked up one by one (~0.1 us each at a hit, ~9% of the
+        // command processor with the misses, Deck profile), while most draws
+        // bind what the draw before them bound. Its results are
+        // TextureCache::infos as LookupTextures left them (in the layout's
+        // binding order), and they are what looking each binding up now
+        // would give, with nothing loaded, while all of these hold:
+        // - the same layout (the same object: its bindings and their
+        //   dimensions);
+        // - each fetch constant those read holds the same 6 dwords (each
+        //   lookup's key, as an entry's);
+        // - WriteEpoch() is the one read before those lookups: no page
+        //   anywhere was written since (a CPU store faults and bumps it,
+        //   resolves mark what they write and fused textures are current
+        //   only through that, host writes mark theirs), so no texture can
+        //   be stale, and no scaled copy current (ScaledTextureValid is
+        //   decided per epoch). This is the rule a cache entry is valid by
+        //   (GetTexture), so each lookup would be a hit at its entry, or a
+        //   full lookup finding the same texture (nothing can have made or
+        //   reloaded it at this epoch) with the same view (kept until the
+        //   texture is dropped) and sampler (kept for good);
+        // - the same cache generation (DropTextures, a setting such as
+        //   anisotropy or mipmaps, the scaled resolve memory made or reset
+        //   bump it) and the same s_drawScaled (the scaled path's choice);
+        // - the same s_frame: those lookups set each texture's lastUsed to
+        //   it, as these would (the eviction's age);
+        // - no texture evicted since (EvictTextures forgets the memo, as it
+        //   does the entries).
+        // Each binding must have been a kept lookup (an entry's): a draw
+        // binding a placeholder or a scaled texture isn't memoized. With
+        // NFSMW_CP_CACHE_VERIFY=1 a draw the memo would serve looks its
+        // textures up anyway and logs any difference.
+        struct TextureDrawMemo
+        {
+            const TextureLayout* layout = nullptr;  // null: holds nothing
+            uint64_t epoch = 0, frame = 0;
+            uint32_t generation = 0;
+            bool drawScaled = false;
+            uint32_t fetch[32][6] = {};  // [n]: fetch constant n as looked up (the layout's fetchSlots)
         };
         struct TextureCache
         {
             TextureCacheEntry slots[3][32];
-            TextureCacheEntry recent[1024];
+            // By the fetch constant's hash: two entries a hash, the newer
+            // first. Direct-mapped (1,024), lookups of keys made before that
+            // a colliding key had pushed out were ~130 a frame in a race (300-
+            // 500 keys a frame; ~2 us each, a full lookup).
+            TextureCacheEntry recent[1024][2];
             uint32_t generation = 1;
             uint64_t settingsGeneration = 0;
-            bool on = false, verify = false;
+            bool on = false, verify = false, memoOn = false;
             uint64_t hits = 0, recentHits = 0, revalidated = 0, misses = 0, stale = 0, uncached = 0, mismatches = 0, raced = 0;
+            // Draw bindings: [i] is binding i of the last layout looked up
+            // (LookupTextures), what the memo serves and Draw pushes from.
+            // `infosSerial` moves on whenever they are rewritten, so the
+            // draw's bound set can tell they are still what it pushed.
+            VkDescriptorImageInfo infos[96] = {};
+            uint64_t infosSerial = 1;
+            TextureDrawMemo memo;
+            uint64_t evictions = 0;  // EvictTextures calls that evicted any
+            uint64_t memoDraws = 0, memoBindings = 0, lookupDraws = 0;  // draws with textures served by the memo, or looked up
         };
         // On the heap (as the shader cache): the renderer's globals move by a pointer, not by the tables (4K aliasing, see NOTES).
         TextureCache* const s_textureCache = [] {
@@ -4457,41 +4535,65 @@ void main()
             // (Built on the epoch rule: without it the full lookup rescans every time.)
             c->on = (g_cpOpt & CP_OPT_TEXTURE_CACHE) && (g_cpOpt & CP_OPT_TEXTURE_EPOCH) && !(v && v[0] == '0') && s_logTextureUse == 0;
             c->verify = std::getenv("NFSMW_CP_CACHE_VERIFY") != nullptr;
+            // (Built on the entries: their rules are its rules.)
+            c->memoOn = c->on && (g_cpOpt & CP_OPT_TEXTURE_MEMO);
             return c;
         }();
 
-        enum class TextureEntryState { kOtherKey, kStale, kValid };
+        // Whether entry `e` is this lookup's: its key is the fetch constant,
+        // the dimension, the cache's generation and, for a texture the
+        // scaled path could take, whether the draw renders into scaled
+        // targets (see above).
+        [[gnu::always_inline]] inline bool TextureEntryKey(const TextureCacheEntry& e, uint32_t generation, TexDim dim, const uint32_t* fetch,
+            bool drawScaled)
+        {
+            return e.generation == generation && e.dim == uint8_t(dim) && memcmp(e.fetch, fetch, sizeof(e.fetch)) == 0 &&
+                !(e.scaledCandidate && e.drawScaled != drawScaled);
+        }
 
-        // Whether entry `e` holds this lookup's result now (see above).
-        // `checked`: the texture's checkedEpoch before this looked.
-        TextureEntryState CheckTextureEntry(TextureCacheEntry& e, TexDim dim, const uint32_t* fetch, bool drawScaled, uint64_t epoch,
-            uint64_t& checked)
+        // Entry `e` of this lookup's key, not valid at `epoch` yet (some page
+        // was written since it last was): whether it still holds the full
+        // lookup's result, checked as the full lookup checks, in its order
+        // (its scaled copy first); if so it is valid at `epoch` from now on.
+        // Mostly from the entry alone: it keeps its texture's load sequence
+        // as of its last check, and nothing written after that is all the
+        // full lookup asks, so the texture (a cold line, ~2% of the command
+        // processor in a race when every check read it) isn't read. Only
+        // when something was: the texture may have been loaded since (by a
+        // full lookup through another entry, or a resolve storing into it,
+        // which writes its pages after the entry's sequence too), and is
+        // then checked against its own sequence, as the full lookup would.
+        // Every texture an entry holds is loaded (the full lookup keeps none
+        // before), and never unloaded while it lives.
+        [[gnu::noinline]] bool RevalidateTextureEntry(TextureCacheEntry& e, bool drawScaled, uint64_t epoch)
         {
             TextureCache& c = *s_textureCache;
-            if (e.generation != c.generation || e.dim != uint8_t(dim) || memcmp(e.fetch, fetch, sizeof(e.fetch)) != 0 ||
-                (e.scaledCandidate && e.drawScaled != drawScaled))
-                return TextureEntryState::kOtherKey;
-            Texture& t = *e.texture;
-            checked = t.checkedEpoch;
-            if (e.epoch == epoch)
-                return TextureEntryState::kValid;
-            // Some page was written since: the full lookup's checks, in its
-            // order (its scaled copy first).
-            bool valid = !(e.scaledCandidate && drawScaled && ScaledTextureValid(e.base, e.size)) &&
-                (checked == epoch || (t.uploaded && writewatch::WriteSequence(e.base, e.size) <= t.loadedSequence &&
-                    (!e.mipSize || writewatch::WriteSequence(e.mipBase, e.mipSize) <= t.loadedSequence)));
+            // (WrittenSince, as the full lookup asks: it skips the 256 KB
+            // blocks written before the load without reading their pages'
+            // sequences.)
+            auto writtenSince = [&](uint64_t sequence) {
+                return writewatch::WrittenSince(e.base, e.size, sequence) || (e.mipSize && writewatch::WrittenSince(e.mipBase, e.mipSize, sequence));
+            };
+            bool valid = !(e.scaledCandidate && drawScaled && ScaledTextureValid(e.base, e.size));
+            if (valid && writtenSince(e.loadedSequence))
+            {
+                const uint64_t loaded = e.texture->loadedSequence;
+                valid = loaded != e.loadedSequence && !writtenSince(loaded);
+                if (valid)
+                    e.loadedSequence = loaded;
+            }
             if (!valid)
             {
                 c.stale++;
-                return TextureEntryState::kStale;
+                return false;
             }
-            t.checkedEpoch = epoch;
             e.epoch = epoch;
             c.revalidated++;
-            return TextureEntryState::kValid;
+            return true;
         }
 
-        TextureCacheEntry& RecentTextureEntry(const uint32_t* fetch, TexDim dim)
+        // The recent table's two entries for this key (the newer first).
+        TextureCacheEntry* RecentTextureEntries(const uint32_t* fetch, TexDim dim)
         {
             uint64_t a, b, d;
             memcpy(&a, fetch, 8);
@@ -4501,43 +4603,65 @@ void main()
             return s_textureCache->recent[(h * 0x9E3779B97F4A7C15ull) >> 54];
         }
 
-        VkImageView GetTexture(uint32_t slot, TexDim dim, VkSampler& sampler)
+        // `kept`: the result is an entry's (a hit, or a lookup now kept),
+        // which the draw memo may serve again (TextureDrawMemo).
+        VkImageView GetTexture(uint32_t slot, TexDim dim, VkSampler& sampler, bool& kept)
         {
             TextureCache& c = *s_textureCache;
+            kept = false;
             if (!c.on)
                 return LookupTexture(slot, dim, sampler, nullptr);
             const uint32_t* fetch = &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + slot * 6];
             TextureCacheEntry& e = c.slots[uint32_t(dim)][slot & 31];
             const bool drawScaled = s_drawScaled && s_scaled.enabled;
             const uint64_t epoch = writewatch::WriteEpoch();
-            uint64_t checked = 0;
-            TextureEntryState state = CheckTextureEntry(e, dim, fetch, drawScaled, epoch, checked);
-            if (state == TextureEntryState::kOtherKey)
+            bool valid = false;
+            if (TextureEntryKey(e, c.generation, dim, fetch, drawScaled))
+                valid = e.epoch == epoch || RevalidateTextureEntry(e, drawScaled, epoch);
+            else
             {
-                TextureCacheEntry& r = RecentTextureEntry(fetch, dim);
-                state = CheckTextureEntry(r, dim, fetch, drawScaled, epoch, checked);
-                if (state == TextureEntryState::kValid)
+                // (A key is in one of the two at most: see the miss below.)
+                TextureCacheEntry* recent = RecentTextureEntries(fetch, dim);
+                for (uint32_t way = 0; way < 2; way++)
                 {
-                    e = r;
-                    c.recentHits++;
+                    TextureCacheEntry& r = recent[way];
+                    if (!TextureEntryKey(r, c.generation, dim, fetch, drawScaled))
+                        continue;
+                    if (r.epoch == epoch || RevalidateTextureEntry(r, drawScaled, epoch))
+                    {
+                        e = r;
+                        c.recentHits++;
+                        valid = true;
+                    }
+                    break;
                 }
             }
-            if (state == TextureEntryState::kValid)
+            if (valid)
             {
                 c.hits++;
-                e.texture->lastUsed = s_frame;
+                // The texture's lastUsed (the eviction's age), set through
+                // each entry once a frame, not at every hit (its line is
+                // cold): an entry whose frame is s_frame has set it to
+                // s_frame already, for this entry's texture, and lastUsed
+                // never goes back.
+                if (e.frame != s_frame)
+                {
+                    e.frame = s_frame;
+                    e.texture->lastUsed = s_frame;
+                }
                 if (s_textureVerify)
                     VerifyTexture(*e.texture, epoch);
                 if (!c.verify)
                 {
                     sampler = e.sampler;
+                    kept = true;
                     return e.view;
                 }
-                // The full lookup as if this hit hadn't happened: a reload
-                // it does is one the hit would have missed, unless a page
-                // was written during the check (another thread): the full
+                // The full lookup as if this hit hadn't happened (a hit
+                // changes nothing the full lookup checks): a reload it does
+                // is one the hit would have missed, unless a page was
+                // written during the check (another thread): the full
                 // lookup then saw memory the hit, a moment earlier, didn't.
-                e.texture->checkedEpoch = checked;
                 uint32_t loads = s_hitch.textures;
                 TextureLookup lookup;
                 VkImageView view = LookupTexture(slot, dim, sampler, &lookup);
@@ -4556,8 +4680,15 @@ void main()
                             (void*)lookup.texture, reloaded ? ", reloaded" : "", fetch[0], fetch[1], fetch[2], fetch[3],
                             fetch[4], fetch[5], (unsigned long long)epoch, (unsigned long long)e.epoch, int(e.scaledCandidate), int(drawScaled));
                     e.generation = 0;
-                    RecentTextureEntry(fetch, dim).generation = 0;
+                    for (uint32_t way = 0; way < 2; way++)
+                    {
+                        TextureCacheEntry& r = RecentTextureEntries(fetch, dim)[way];
+                        if (TextureEntryKey(r, c.generation, dim, fetch, drawScaled))
+                            r.generation = 0;
+                    }
+                    return view;
                 }
+                kept = true;
                 return view;
             }
             c.misses++;
@@ -4575,15 +4706,85 @@ void main()
             e.scaledCandidate = lookup.scaledCandidate;
             e.drawScaled = drawScaled;
             e.epoch = epoch;  // read before the lookup: a write meanwhile is checked next time
-            e.texture = lookup.texture;
             e.view = view;
             e.sampler = sampler;
+            e.frame = s_frame;  // (the lookup set its lastUsed)
+            e.texture = lookup.texture;
             e.base = lookup.base;
             e.size = lookup.size;
             e.mipBase = lookup.mipBase;
             e.mipSize = lookup.mipSize;
-            RecentTextureEntry(fetch, dim) = e;
+            e.loadedSequence = lookup.texture->loadedSequence;  // (current: the lookup found its pages unwritten since, or loaded it)
+            // Into the recent table as its newer entry, over this key's own
+            // older one (a stale one, which missed) if either holds it, so a
+            // key is never in both; else the newer one moves to second place.
+            TextureCacheEntry* recent = RecentTextureEntries(fetch, dim);
+            if (!TextureEntryKey(recent[0], c.generation, dim, fetch, drawScaled))
+                recent[1] = recent[0];
+            recent[0] = e;
+            kept = true;
             return view;
+        }
+
+        // Whether the draw memo holds `layout`'s bindings as they would be
+        // looked up now (TextureDrawMemo's rules); `epoch`: WriteEpoch() now.
+        bool TextureMemoHolds(const TextureLayout& layout, uint64_t epoch, bool drawScaled)
+        {
+            const TextureCache& c = *s_textureCache;
+            const TextureDrawMemo& m = c.memo;
+            if (m.layout != &layout || m.epoch != epoch || m.generation != c.generation || m.frame != s_frame || m.drawScaled != drawScaled)
+                return false;
+            const uint32_t* regs = &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0];
+            for (uint32_t bits = layout.fetchSlots; bits; bits &= bits - 1)
+            {
+                const uint32_t n = uint32_t(__builtin_ctz(bits));
+                if (memcmp(m.fetch[n], regs + n * 6, sizeof(m.fetch[n])) != 0)
+                    return false;
+            }
+            return true;
+        }
+
+        // Looks `layout`'s bindings up into TextureCache::infos, one by one
+        // (GetTexture); the memo then holds them if every one was kept and
+        // nothing a lookup depends on moved meanwhile (the generation, an
+        // eviction: a texture made here can push older ones out). `epoch`:
+        // WriteEpoch() before the lookups (a write during them leaves the
+        // memo behind the current epoch: the next draw looks up again).
+        void LookupTextures(const TextureLayout& layout, uint64_t epoch, bool drawScaled)
+        {
+            TextureCache& c = *s_textureCache;
+            const uint32_t generation = c.generation;
+            const uint64_t evictions = c.evictions;
+            c.memo.layout = nullptr;
+            bool kept = c.memoOn && !(s_exp & 8);
+            for (uint32_t i = 0; i < layout.bindingCount; i++)
+            {
+                const uint32_t b = layout.bindings[i], d = b >> 5;
+                VkDescriptorImageInfo& ii = c.infos[i];
+                ii = { s_sampler, s_dummy[d].view, VK_IMAGE_LAYOUT_GENERAL };
+                if (!(s_exp & 8))  // NFSMW_GPU_EXP bit 8: placeholders only (texture cost experiment)
+                {
+                    bool k;
+                    ii.imageView = GetTexture(b & 31, d == 0 ? TexDim::k2D : d == 1 ? TexDim::k3D : TexDim::kCube, ii.sampler, k);
+                    kept = kept && k;
+                }
+            }
+            c.infosSerial++;
+            c.lookupDraws++;
+            if (!kept || c.generation != generation || c.evictions != evictions)
+                return;
+            TextureDrawMemo& m = c.memo;
+            m.epoch = epoch;
+            m.frame = s_frame;
+            m.generation = generation;
+            m.drawScaled = drawScaled;
+            const uint32_t* regs = &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0];
+            for (uint32_t bits = layout.fetchSlots; bits; bits &= bits - 1)
+            {
+                const uint32_t n = uint32_t(__builtin_ctz(bits));
+                memcpy(m.fetch[n], regs + n * 6, sizeof(m.fetch[n]));
+            }
+            m.layout = &layout;
         }
 
         // ---------------------------------------------------------------
@@ -7024,8 +7225,16 @@ void main()
             for (auto& slots : c.slots)
                 for (TextureCacheEntry& e : slots)
                     forget(e);
-            for (TextureCacheEntry& e : c.recent)
-                forget(e);
+            for (auto& ways : c.recent)
+                for (TextureCacheEntry& e : ways)
+                    forget(e);
+            // And the draw memo, whatever it holds (TextureDrawMemo); a
+            // draw looking its textures up meanwhile then keeps none.
+            if (!gone.empty())
+            {
+                c.memo.layout = nullptr;
+                c.evictions++;
+            }
             s_textureEvictions.textures += gone.size();
             s_textureEvictions.bytes += bytes;
             return bytes;
@@ -7929,23 +8138,47 @@ void main()
             return skip(5, "pipeline creation failed");
 
         // Textures (may upload through the ring and so flush: before the
-        // constants are allocated).
-        if (s_textureCache->on && settings::Generation() != s_textureCache->settingsGeneration)
+        // constants are allocated): into TextureCache::infos, [i] binding i
+        // of the layout, unless the draw memo still holds them
+        // (CP_OPT_TEXTURE_MEMO: in a race ~2 in 3 draws with textures).
+        TextureCache& textureCache = *s_textureCache;
+        if (textureCache.on && settings::Generation() != textureCache.settingsGeneration)
         {
-            s_textureCache->settingsGeneration = settings::Generation();  // the anisotropy setting, in the samplers
-            s_textureCache->generation++;
+            textureCache.settingsGeneration = settings::Generation();  // the anisotropy setting, in the samplers
+            textureCache.generation++;
         }
-        VkDescriptorImageInfo textureInfos[96];
-        for (uint32_t d = 0; d < 3; d++)
-            for (uint32_t n = 0; n < 32; n++)
+        const uint32_t textureCount = layout.bindingCount;
+        if (textureCount)
+        {
+            const uint64_t epoch = writewatch::WriteEpoch();
+            const bool drawScaled = s_drawScaled && s_scaled.enabled;
+            if (!textureCache.memoOn || !TextureMemoHolds(layout, epoch, drawScaled))
+                LookupTextures(layout, epoch, drawScaled);
+            else if (!textureCache.verify)
             {
-                if (!(((layout.vsMasks[d] | layout.psMasks[d]) >> n) & 1))
-                    continue;
-                VkDescriptorImageInfo& ii = textureInfos[d * 32 + n];
-                ii = { s_sampler, s_dummy[d].view, VK_IMAGE_LAYOUT_GENERAL };
-                if (!(s_exp & 8))  // NFSMW_GPU_EXP bit 8: placeholders only (texture cost experiment)
-                    ii.imageView = GetTexture(n, d == 0 ? TexDim::k2D : d == 1 ? TexDim::k3D : TexDim::kCube, ii.sampler);
+                textureCache.memoDraws++;
+                textureCache.memoBindings += textureCount;
             }
+            else
+            {
+                // NFSMW_CP_CACHE_VERIFY: the lookups the memo stands for,
+                // done anyway, must give what it holds.
+                VkDescriptorImageInfo memo[96];
+                std::copy(textureCache.infos, textureCache.infos + textureCount, memo);
+                LookupTextures(layout, epoch, drawScaled);
+                for (uint32_t i = 0; i < textureCount; i++)
+                {
+                    const VkDescriptorImageInfo& now = textureCache.infos[i];
+                    if (now.imageView == memo[i].imageView && now.sampler == memo[i].sampler && now.imageLayout == memo[i].imageLayout)
+                        continue;
+                    if (textureCache.mismatches++ < 50)
+                        fprintf(stderr, "[cpverify] texture draw memo, binding %u: view %p sampler %p, looked up %p %p (epoch %llu)\n",
+                            uint32_t(layout.bindings[i]), (void*)memo[i].imageView, (void*)memo[i].sampler, (void*)now.imageView,
+                            (void*)now.sampler, (unsigned long long)epoch);
+                }
+            }
+        }
+        const VkDescriptorImageInfo* const textureInfos = textureCache.infos;
 
         // Vertex data the guest may reuse before the GPU runs this draw (its
         // fences are published early, see g_eagerWrites): small ranges are
@@ -9025,6 +9258,7 @@ void main()
             uint32_t setOffset = ~0u;
             VkPipelineLayout textureLayout = VK_NULL_HANDLE;
             uint32_t textureCount = ~0u;
+            uint64_t textureSerial = 0;  // TextureCache::infosSerial when `textures` were last its infos (0: never)
             VkDescriptorImageInfo textures[96];
             DrawConstants pc{};
         };
@@ -9194,35 +9428,36 @@ void main()
             bound.setOffset = dynamicOffset;
         }
 
-        VkWriteDescriptorSet writes[96];
-        uint32_t writeCount = 0;
-        for (uint32_t d = 0; d < 3; d++)
-            for (uint32_t n = 0; n < 32; n++)
-            {
-                if (!(((layout.vsMasks[d] | layout.psMasks[d]) >> n) & 1))
-                    continue;
-                VkWriteDescriptorSet& wds = writes[writeCount++];
-                wds = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
-                wds.dstBinding = d * 32 + n;
-                wds.descriptorCount = 1;
-                wds.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-                wds.pImageInfo = &textureInfos[d * 32 + n];
-            }
-        if (writeCount)
+        // The textures (set 1), pushed when they differ from the bound ones.
+        // The bound set notes the infos' serial it was last pushed from or
+        // found equal to: while the infos keep it (no lookup rewrote them:
+        // the memo served the draws since), they are the bound ones still,
+        // and aren't compared again. The writes are made only for a push.
+        if (textureCount)
         {
-            bool same = !fresh && bound.textureLayout == layout.pipeline && bound.textureCount == writeCount;
-            for (uint32_t i = 0; same && i < writeCount; i++)  // (not memcmp: the struct has padding)
-                same = bound.textures[i].sampler == writes[i].pImageInfo->sampler &&
-                    bound.textures[i].imageView == writes[i].pImageInfo->imageView &&
-                    bound.textures[i].imageLayout == writes[i].pImageInfo->imageLayout;
+            bool same = !fresh && bound.textureLayout == layout.pipeline && bound.textureCount == textureCount;
+            if (same && bound.textureSerial != textureCache.infosSerial)
+                for (uint32_t i = 0; same && i < textureCount; i++)  // (not memcmp: the struct has padding)
+                    same = bound.textures[i].sampler == textureInfos[i].sampler && bound.textures[i].imageView == textureInfos[i].imageView &&
+                        bound.textures[i].imageLayout == textureInfos[i].imageLayout;
             if (!same)
             {
-                s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout.pipeline, 1, writeCount, writes);
+                VkWriteDescriptorSet writes[96];
+                for (uint32_t i = 0; i < textureCount; i++)
+                {
+                    VkWriteDescriptorSet& wds = writes[i];
+                    wds = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+                    wds.dstBinding = layout.bindings[i];
+                    wds.descriptorCount = 1;
+                    wds.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                    wds.pImageInfo = &textureInfos[i];
+                }
+                s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout.pipeline, 1, textureCount, writes);
                 bound.textureLayout = layout.pipeline;
-                bound.textureCount = writeCount;
-                for (uint32_t i = 0; i < writeCount; i++)
-                    bound.textures[i] = *writes[i].pImageInfo;
+                bound.textureCount = textureCount;
+                std::copy(textureInfos, textureInfos + textureCount, bound.textures);
             }
+            bound.textureSerial = textureCache.infosSerial;
         }
         pushConstants(pc, fresh || bound.pushEpoch != s_pushEpoch);
         bound.pushEpoch = s_pushEpoch;
@@ -9905,19 +10140,23 @@ void main()
         {
             const TextureCache& t = *s_textureCache;
             const ShaderCache& sh = *s_shaderCache;
-            const uint64_t now[9] = { t.hits, t.misses, t.revalidated, t.stale, t.uncached, t.recentHits, sh.loads, sh.hits,
-                sh.comparedBytes };
-            static uint64_t last[9] = {};
-            uint64_t d[9];
-            for (int i = 0; i < 9; i++)
+            const uint64_t now[12] = { t.hits, t.misses, t.revalidated, t.stale, t.uncached, t.recentHits, sh.loads, sh.hits,
+                sh.comparedBytes, t.memoDraws, t.memoBindings, t.lookupDraws };
+            static uint64_t last[12] = {};
+            uint64_t d[12];
+            for (int i = 0; i < 12; i++)
                 d[i] = now[i] - last[i];
             std::copy(std::begin(now), std::end(now), last);
             auto pct = [](uint64_t part, uint64_t whole) { return whole ? 100.0 * double(part) / double(whole) : 0.0; };
+            // (The lookups are those the draw memo didn't serve; it serves
+            // a draw's textures without any.)
             fprintf(stderr, "[cpcache] textures: %.0f lookups/frame, %.1f%% kept (%.1f%% of them checked after a write, %.1f%% by hash), "
-                "%.1f%% stale, %.1f%% not keepable | shaders: %.0f loads/frame, %.1f%% found by address (%.0f KB compared) | "
+                "%.1f%% stale, %.1f%% not keepable; draw memo: %.1f%% of %.0f draws/frame with textures (%.0f bindings/frame) | "
+                "shaders: %.0f loads/frame, %.1f%% found by address (%.0f KB compared) | "
                 "mismatches: %llu textures, %llu shaders (%llu texture checks raced a write)\n",
                 double(d[0] + d[1]) / 120, pct(d[0], d[0] + d[1]), pct(d[2], d[0]), pct(d[5], d[0]), pct(d[3], d[0] + d[1]),
-                pct(d[4], d[0] + d[1]), double(d[6]) / 120, pct(d[7], d[6]), double(d[8]) / 1024 / 120,
+                pct(d[4], d[0] + d[1]), pct(d[9], d[9] + d[11]), double(d[9] + d[11]) / 120, double(d[10]) / 120,
+                double(d[6]) / 120, pct(d[7], d[6]), double(d[8]) / 1024 / 120,
                 (unsigned long long)t.mismatches, (unsigned long long)sh.mismatches, (unsigned long long)t.raced);
         }
         s_pipelineWaitLeftUs = s_pipelineWaitUs;

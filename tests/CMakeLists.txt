@@ -74,6 +74,12 @@ sb_test(gpu_vertex_snapshot_test SOURCES ${RT}/gpu/shader_translator.cpp ${RT}/g
 # check both ways take the tests from it and Draw sets what its pipelines
 # leave dynamic.
 sb_test(gpu_draw_state_test ARGS ${RT}/gpu/renderer.cpp)
+# The rules a draw's textures are served again by without being looked up
+# (renderer.cpp, TextureDrawMemo, CP_OPT_TEXTURE_MEMO): renderer.cpp is read
+# to check every part of the memo's key is compared, the memo is made only
+# from kept lookups, an eviction forgets it and Draw compares its bound
+# textures again whenever the lookups' results may have changed.
+sb_test(gpu_texture_memo_test ARGS ${RT}/gpu/renderer.cpp)
 # Which front image the renderer's next swap writes (gpu/front_ring.h,
 # header only): a model of the presenter and the renderer, which must show
 # every frame as itself or count it as dropped (v0.1.4's single image lost

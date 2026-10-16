@@ -274,7 +274,14 @@ static void TestRenderer(const char* path)
         return n;
     };
     CHECK(count("t.lastUsed=s_frame;") >= 2, "LookupTexture marks a texture at its creation (before its image) and at each lookup");
-    CHECK(count("e.texture->lastUsed=s_frame;") == 1, "GetTexture marks a texture its kept lookup hands out");
+    CHECK(count("if(e.frame!=s_frame){e.frame=s_frame;e.texture->lastUsed=s_frame;}") == 1,
+        "GetTexture marks a texture its kept lookup hands out (through each entry once a frame)");
+    CHECK(count("e.frame=s_frame;//(thelookupsetitslastUsed)") == 1, "an entry a full lookup made has marked its texture this frame");
+    // The draw memo hands out its draw's textures again only within the
+    // frame its lookups marked them in, and an eviction forgets it.
+    CHECK(all.find("m.frame!=s_frame") != std::string::npos && count("m.frame=s_frame;") == 1,
+        "the draw memo serves only the frame its lookups marked their textures in");
+    CHECK(all.find("c.memo.layout=nullptr;c.evictions++;") != std::string::npos, "an eviction forgets the draw memo");
     CHECK(count("fused->lastUsed=s_frame;") == 1, "a resolve storing into a cached texture marks it");
     const size_t swapAt = all.find("s_frame=frame;if(s_vk)TrimTextureCache();");
     CHECK(swapAt != std::string::npos, "OnSwap trims the cache right after s_frame moves on");
