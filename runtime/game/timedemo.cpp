@@ -17,7 +17,7 @@
 // replay's file size at +16, the name at +20 and a 1 MB buffer at +280.
 //
 // What the runtime adds (the overrides below, kernel/vfs.cpp, frame_time.cpp,
-// movie_pacing.cpp, stream_status.cpp, main.cpp):
+// movie_pacing.cpp, stream_status.cpp, exposure_lock.cpp, main.cpp):
 //   - the flag, before the init runs, and a check that the mode came on
 //     (exit 2 otherwise: the game would quietly play, or capture over the
 //     log meant for a replay);
@@ -38,7 +38,9 @@
 //   - what the log doesn't hold and the game waits on: an audio stream's
 //     first data, shown to the main thread a fixed two frames after the
 //     stream started (stream_status.cpp; a race's start waits on its intro
-//     stream).
+//     stream);
+//   - in a replay, what a picture depends on and the GPU side's lag decided:
+//     the exposure's brightness, read once the GPU has it (exposure_lock.cpp).
 //
 // A replay's log ends when a read finds no more (sub_823B72D0 clears the
 // replay flag and returns 0, and the game plays live from there). The last

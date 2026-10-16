@@ -414,10 +414,34 @@ data at loop 4414 (2569 ms in; waited 0.0 ms)`; a wait above a few ms
 there is a slow read, and counts in that frame's time like any wait. Only a
 timedemo holds streams.
 
+## Exposure
+
+The game's exposure follows the scene's brightness: once a frame its render
+thread draws the frame down to 64x64, resolves that into one of two
+textures, and averages the other one, the previous frame's, on the CPU. It
+locks that texture read-only, which skips D3D's wait for the GPU: on the
+console the GPU is done with the previous frame by then. Here the GPU side
+can be frames behind (uncapped, the game runs up to four ahead), and the
+average was of the previous frame's picture or of an older one, as the lag
+had it: every picture after came out a little brighter or darker, by up to
+20 to 49 levels between uncapped runs of one build (PSNR down to 37 dB), at
+the vblank's pace a level or two.
+
+So in a replay that one lock waits for its texture's fence, as a lock that
+isn't read-only does, and every run averages the previous frame
+(`[timedemo] exposure: ...` in the log; `NFSMW_TIMEDEMO_EXPOSURE_WAIT=0`
+turns it off). The render thread then waits, each frame, for the GPU to
+finish the previous frame's brightness pass, where it used to run on (one
+of D3D's waits on the GPU, as the `[hitch]` lines and `NFSMW_TIMELINE`
+count them). Times from replays without the wait don't compare with times
+from replays with it: give both sides of an A/B the same.
+
 ## Switches
 
 All off by default: without them the game behaves exactly as without this
-feature.
+feature. A timedemo also holds audio streams ([Audio streams](#audio-streams)),
+capture and replay alike, and a replay waits for the exposure's brightness
+([Exposure](#exposure)); `NFSMW_TIMEDEMO_EXPOSURE_WAIT=0` turns the latter off.
 
 | Variable | Meaning |
 |---|---|
@@ -434,6 +458,7 @@ feature.
 | `NFSMW_BENCH_EXIT=0` | stay in the game after the report (the default is to exit) |
 | `NFSMW_BENCH_SHOTS=<step>,...` | the picture of these world steps of the race (counted as `NFSMW_BENCH_FROM` is), as `shot-<step>.ppm` in the report's folder (see [Pictures](#4-compare-pictures)) |
 | `NFSMW_BENCH_SHOTS_SHOWN=1` | each of those also as the window shows it, after the presenter's post-processing: `shot-<step>-shown.ppm` |
+| `NFSMW_TIMEDEMO_EXPOSURE_WAIT=0` | replay: the exposure's brightness as the GPU side has it when the game reads it, as before the wait (see [Exposure](#exposure)) |
 | `NFSMW_SAVE_DIR=<dir>` | an absolute path: `save/` and `profile_settings.bin` there instead of the data folder's |
 
 ## The report
