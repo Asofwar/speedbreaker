@@ -26,9 +26,10 @@
 // has seen started (state nonzero) with no data for exactly kHeldFrames
 // frames (stream_hold.h): until then a position is reported as 0 even if data
 // is in, and from then on the main thread waits for the data if it isn't
-// (kWaitMax at most, after which the status goes to the game as it is). The
-// wait is between two calls of the wrapper, so the sound lock isn't held
-// meanwhile. The player's own threads and its own update see the channel as
+// (kWaitMax at most, after which the status goes to the game as it is; a
+// hold, too, lets go after kWaitMax, should a frame ask again and again
+// without ending). The wait is between two calls of the wrapper, so the sound
+// lock isn't held meanwhile. The player's own threads and its own update see the channel as
 // it is. Each stream's first data leaves a [timedemo] stream line. Outside a
 // timedemo nothing changes.
 #include <stdafx.h>
@@ -46,6 +47,9 @@ namespace
     constexpr auto kWaitStep = std::chrono::microseconds(500);
 
     game::streams::Channel s_channels[kChannels];  // the main thread's only
+    // When each channel's hold began (host time): a hold that outlasts
+    // kWaitMax (a frame that never ends, asking again and again) lets go.
+    std::chrono::steady_clock::time_point s_heldSince[kChannels];
 }
 
 PPC_FUNC(sub_821C8AD8)
@@ -63,12 +67,21 @@ PPC_FUNC(sub_821C8AD8)
     const bool held = c.phase == game::streams::Channel::Phase::Held;
     auto next = [&] { return game::streams::Next(c, loop, PPC_LOAD_U32(out.u32), PPC_LOAD_U32(out.u32 + 8)); };
     Action action = next();
+    const auto start = std::chrono::steady_clock::now();
+    if (!held && c.phase == game::streams::Channel::Phase::Held)
+        s_heldSince[channel] = start;
     if (action == Action::Hide)
     {
+        if (start - s_heldSince[channel] > kWaitMax)
+        {
+            game::streams::GiveUp(c);
+            fprintf(stderr, "[timedemo] stream %u: started at loop %u, still held at loop %u after %lld ms: as it is from here\n",
+                channel, c.startLoop, loop, (long long)std::chrono::duration_cast<std::chrono::milliseconds>(kWaitMax).count());
+            return;
+        }
         PPC_STORE_U32(out.u32 + 8, 0);
         return;
     }
-    const auto start = std::chrono::steady_clock::now();
     while (action == Action::Wait)
     {
         if (std::chrono::steady_clock::now() - start > kWaitMax)
