@@ -1067,8 +1067,14 @@ namespace video
         // bicubic with optional sharpening, clamped to the 2x2 source texels
         // around each sample so it can't ring.
         // NFSMW_AA=0 turns the anti-aliasing off; NFSMW_SCALING=linear (or
-        // bicubic, the default); NFSMW_SHARPEN=<0..1> (default 0.3). If the
-        // pipelines can't be built, frames are blitted as before.
+        // bicubic, the default; or fsr1, below); NFSMW_SHARPEN=<0..1> (default
+        // 0.3). If the pipelines can't be built, frames are blitted as before.
+        // Upscaling FSR 1 (for an internal resolution below 720p, which this
+        // scaling would only blur): the anti-aliasing as before, then AMD
+        // FidelityFX Super Resolution 1's EASU (compute) from the frame to an
+        // image of the picture's size, then its RCAS sharpening as the
+        // fragment pass into the window (kEasuCs, kRcasFs: ported from AMD's
+        // reference, THIRD_PARTY_NOTICES.md).
         const char* kFullscreenVs = R"(#version 460
 layout(location = 0) out vec2 uv;
 void main()
@@ -1349,6 +1355,259 @@ void main()
 #endif
         const bool s_fastScale = [] { const char* v = std::getenv("NFSMW_FAST_SCALE"); return v ? v[0] == '1' : kFastScaleByDefault; }();
 
+        // AMD FidelityFX Super Resolution 1 (FSR 1), from AMD's reference
+        // ffx_fsr1.h and ffx_a.h (GPUOpen-Effects/FidelityFX-FSR v1.0.2,
+        // commit a21ffb8f; MIT: LICENSES/FidelityFX-FSR-MIT.txt), its 32-bit
+        // GLSL paths ported line for line: EASU (FsrEasuF, FsrEasuTapF,
+        // FsrEasuSetF; FsrEasuCon's con0 comes from the CPU, ScaleFsr) and
+        // RCAS (FsrRcasF, no denoise, no alpha). ffx_a.h's approximate
+        // reciprocals are kept bit for bit (rcpLo, rsqLo, rcpMed).
+        // Where they differ from the reference, and why:
+        //   - EASU reads its 12 texels with texelFetch, clamped to the image
+        //     (the reference's gathers with clamp-to-edge read the same 12),
+        //     so each tap can also be kept to the span of the 16:9 band's three
+        //     that the output pixel's centre falls in (Hor+, Vert+:
+        //     band_filter.h's ClampTexel), as the AA pass and the bicubic
+        //     scaling keep theirs. A strip of black bars or a letterboxed movie
+        //     then doesn't bleed into the band, nor the band into the strips.
+        //   - RCAS's neighbours past the image's edge, or in another span than
+        //     the pixel (decided in integers in both passes, so they agree),
+        //     read the pixel itself: the span's edge, clamped.
+        //   - RCAS's two limiters divide by the ring's 4 x max and 4 x min - 4,
+        //     which are 0 where the ring is all black or all white: the
+        //     reference makes a NaN there (0 x inf), which AMD's GPUs drop in
+        //     the max() after it; other GPUs (Metal) need not, so the divisors
+        //     are kept off 0 by 2^-16 (no 8-bit picture comes nearer: the
+        //     smallest step is 1/255).
+        // The EASU pass: the frame (anti-aliased, or as rendered) in, an image
+        // of the picture's size out. con0: FsrEasuCon's (an output pixel to
+        // its position in the input, texels); inSize, outSize: the images';
+        // band: the 16:9 band's columns x..y and rows z..w in input texels
+        // (video::BandOf), used when bandOn is 1.
+        const char* kEasuCs = R"(#version 460
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D src;
+layout(set = 0, binding = 1, rgba8) uniform writeonly image2D dst;
+layout(push_constant) uniform P { vec4 con0; ivec2 inSize; ivec2 outSize; ivec4 band; uint bandOn; } p;
+
+// The texels a tap may read (inclusive): the image, or this pixel's span.
+ivec2 spanLo, spanHi;
+
+// Which of [0, lo), [lo, hi), [hi, inSize) output pixel i's centre falls in,
+// at (i + 0.5) x inSize / outSize input texels: compared in integers, exactly.
+int spanIndex(int i, int lo, int hi, int inSize, int outSize)
+{
+    int t = (2 * i + 1) * inSize;
+    return t < 2 * lo * outSize ? 0 : t < 2 * hi * outSize ? 1 : 2;
+}
+
+ivec2 spanOf(int index, int lo, int hi, int size)
+{
+    return index == 0 ? ivec2(0, lo) : index == 1 ? ivec2(lo, hi) : ivec2(hi, size);
+}
+
+vec3 tap(ivec2 t)
+{
+    return texelFetch(src, clamp(t, spanLo, spanHi), 0).rgb;
+}
+
+// ffx_a.h: APrxLoRcpF1, APrxLoRsqF1.
+float rcpLo(float a) { return uintBitsToFloat(0x7ef07ebbu - floatBitsToUint(a)); }
+float rsqLo(float a) { return uintBitsToFloat(0x5f347d74u - (floatBitsToUint(a) >> 1u)); }
+
+// FsrEasuTapF: one tap of the kernel, an approximate lanczos(2) rotated
+// along the edge and stretched across it.
+void easuTap(inout vec3 aC, inout float aW, vec2 off, vec2 dir, vec2 len, float lob, float clp, vec3 c)
+{
+    vec2 v;
+    v.x = (off.x * (dir.x)) + (off.y * dir.y);
+    v.y = (off.x * (-dir.y)) + (off.y * dir.x);
+    v *= len;
+    float d2 = v.x * v.x + v.y * v.y;
+    d2 = min(d2, clp);
+    float wB = float(2.0 / 5.0) * d2 + float(-1.0);
+    float wA = lob * d2 + float(-1.0);
+    wB *= wB;
+    wA *= wA;
+    wB = float(25.0 / 16.0) * wB + float(-(25.0 / 16.0 - 1.0));
+    float w = wB * wA;
+    aC += c * w;
+    aW += w;
+}
+
+// FsrEasuSetF: the edge's direction and length from the luma cross around
+// one of the 2x2 texels nearest the position, weighted bilinearly.
+void easuSet(inout vec2 dir, inout float len, vec2 pp, bool biS, bool biT, bool biU, bool biV, float lA, float lB, float lC,
+    float lD, float lE)
+{
+    float w = 0.0;
+    if (biS) w = (1.0 - pp.x) * (1.0 - pp.y);
+    if (biT) w = pp.x * (1.0 - pp.y);
+    if (biU) w = (1.0 - pp.x) * pp.y;
+    if (biV) w = pp.x * pp.y;
+    float dc = lD - lC;
+    float cb = lC - lB;
+    float lenX = max(abs(dc), abs(cb));
+    lenX = rcpLo(lenX);
+    float dirX = lD - lB;
+    dir.x += dirX * w;
+    lenX = clamp(abs(dirX) * lenX, 0.0, 1.0);
+    lenX *= lenX;
+    len += lenX * w;
+    float ec = lE - lC;
+    float ca = lC - lA;
+    float lenY = max(abs(ec), abs(ca));
+    lenY = rcpLo(lenY);
+    float dirY = lE - lA;
+    dir.y += dirY * w;
+    lenY = clamp(abs(dirY) * lenY, 0.0, 1.0);
+    lenY *= lenY;
+    len += lenY * w;
+}
+
+void main()
+{
+    ivec2 ip = ivec2(gl_GlobalInvocationID.xy);
+    if (ip.x >= p.outSize.x || ip.y >= p.outSize.y)
+        return;
+    spanLo = ivec2(0);
+    spanHi = p.inSize - 1;
+    if (p.bandOn != 0u)
+    {
+        ivec2 sx = spanOf(spanIndex(ip.x, p.band.x, p.band.y, p.inSize.x, p.outSize.x), p.band.x, p.band.y, p.inSize.x);
+        ivec2 sy = spanOf(spanIndex(ip.y, p.band.z, p.band.w, p.inSize.y, p.outSize.y), p.band.z, p.band.w, p.inSize.y);
+        spanLo = ivec2(sx.x, sy.x);
+        spanHi = max(ivec2(sx.y, sy.y) - 1, spanLo);
+    }
+    // FsrEasuF: the position of 'f' and the 12 texels around it.
+    //    b c
+    //  e f g h
+    //  i j k l
+    //    n o
+    vec2 pp = vec2(ip) * p.con0.xy + p.con0.zw;
+    vec2 fp = floor(pp);
+    pp -= fp;
+    ivec2 f0 = ivec2(fp);
+    vec3 b = tap(f0 + ivec2(0, -1)), c = tap(f0 + ivec2(1, -1));
+    vec3 e = tap(f0 + ivec2(-1, 0)), f = tap(f0), g = tap(f0 + ivec2(1, 0)), h = tap(f0 + ivec2(2, 0));
+    vec3 i = tap(f0 + ivec2(-1, 1)), j = tap(f0 + ivec2(0, 1)), k = tap(f0 + ivec2(1, 1)), l = tap(f0 + ivec2(2, 1));
+    vec3 n = tap(f0 + ivec2(0, 2)), o = tap(f0 + ivec2(1, 2));
+    // The simplest luma (times 2, in 2 FMAs).
+    float bL = b.b * 0.5 + (b.r * 0.5 + b.g), cL = c.b * 0.5 + (c.r * 0.5 + c.g);
+    float eL = e.b * 0.5 + (e.r * 0.5 + e.g), fL = f.b * 0.5 + (f.r * 0.5 + f.g);
+    float gL = g.b * 0.5 + (g.r * 0.5 + g.g), hL = h.b * 0.5 + (h.r * 0.5 + h.g);
+    float iL = i.b * 0.5 + (i.r * 0.5 + i.g), jL = j.b * 0.5 + (j.r * 0.5 + j.g);
+    float kL = k.b * 0.5 + (k.r * 0.5 + k.g), lL = l.b * 0.5 + (l.r * 0.5 + l.g);
+    float nL = n.b * 0.5 + (n.r * 0.5 + n.g), oL = o.b * 0.5 + (o.r * 0.5 + o.g);
+    vec2 dir = vec2(0.0);
+    float len = 0.0;
+    easuSet(dir, len, pp, true, false, false, false, bL, eL, fL, gL, jL);
+    easuSet(dir, len, pp, false, true, false, false, cL, fL, gL, hL, kL);
+    easuSet(dir, len, pp, false, false, true, false, fL, iL, jL, kL, nL);
+    easuSet(dir, len, pp, false, false, false, true, gL, jL, kL, lL, oL);
+    // Normalize with the approximation, and clean up close to zero.
+    vec2 dir2 = dir * dir;
+    float dirR = dir2.x + dir2.y;
+    bool zro = dirR < float(1.0 / 32768.0);
+    dirR = rsqLo(dirR);
+    dirR = zro ? 1.0 : dirR;
+    dir.x = zro ? 1.0 : dir.x;
+    dir *= vec2(dirR);
+    // Length {0 to 2} to {0 to 1}, shaped with a square.
+    len = len * 0.5;
+    len *= len;
+    // The kernel stretched from 1.0 (horizontal or vertical) to sqrt(2.0) on
+    // the diagonal; across an edge, x lerps to that, y to 2x.
+    float stretch = (dir.x * dir.x + dir.y * dir.y) * rcpLo(max(abs(dir.x), abs(dir.y)));
+    vec2 len2 = vec2(1.0 + (stretch - 1.0) * len, 1.0 + -0.5 * len);
+    // The window: from +-sqrt(2.0) to just past 2.0 with the edge's amount.
+    float lob = 0.5 + float((1.0 / 4.0 - 0.04) - 0.5) * len;
+    float clp = rcpLo(lob);
+    // Accumulated, then kept between the 2x2 nearest's min and max (no ringing).
+    vec3 min4 = min(min(f, min(g, j)), k);
+    vec3 max4 = max(max(f, max(g, j)), k);
+    vec3 aC = vec3(0.0);
+    float aW = 0.0;
+    easuTap(aC, aW, vec2(0.0, -1.0) - pp, dir, len2, lob, clp, b);
+    easuTap(aC, aW, vec2(1.0, -1.0) - pp, dir, len2, lob, clp, c);
+    easuTap(aC, aW, vec2(-1.0, 1.0) - pp, dir, len2, lob, clp, i);
+    easuTap(aC, aW, vec2(0.0, 1.0) - pp, dir, len2, lob, clp, j);
+    easuTap(aC, aW, vec2(0.0, 0.0) - pp, dir, len2, lob, clp, f);
+    easuTap(aC, aW, vec2(-1.0, 0.0) - pp, dir, len2, lob, clp, e);
+    easuTap(aC, aW, vec2(1.0, 1.0) - pp, dir, len2, lob, clp, k);
+    easuTap(aC, aW, vec2(2.0, 1.0) - pp, dir, len2, lob, clp, l);
+    easuTap(aC, aW, vec2(2.0, 0.0) - pp, dir, len2, lob, clp, h);
+    easuTap(aC, aW, vec2(1.0, 0.0) - pp, dir, len2, lob, clp, g);
+    easuTap(aC, aW, vec2(1.0, 2.0) - pp, dir, len2, lob, clp, o);
+    easuTap(aC, aW, vec2(0.0, 2.0) - pp, dir, len2, lob, clp, n);
+    imageStore(dst, ip, vec4(min(max4, max(min4, aC * vec3(1.0 / aW))), 1.0));
+}
+)";
+
+        // The RCAS pass: EASU's image, drawn 1:1 into the picture's part of
+        // the window (the viewport is its size). outSize: that image's;
+        // inSize and band: the EASU pass's input and band, for the spans;
+        // con: FsrRcasCon's sharpness, 2^-stops (Sharpening, ScaleFsr).
+        // As the scale shaders, its main can be wrapped by the tone's
+        // (ToneVariant): the output is `color`.
+        const char* kRcasFs = R"(#version 460
+layout(location = 0) in vec2 uv;
+layout(location = 0) out vec4 color;
+layout(set = 0, binding = 0) uniform sampler2D src;
+layout(push_constant) uniform P { ivec2 outSize; ivec2 inSize; ivec4 band; float con; uint bandOn; } p;
+
+// As kEasuCs's: which span output pixel i's centre falls in.
+int spanIndex(int i, int lo, int hi, int inSize, int outSize)
+{
+    int t = (2 * i + 1) * inSize;
+    return t < 2 * lo * outSize ? 0 : t < 2 * hi * outSize ? 1 : 2;
+}
+
+// ffx_a.h: APrxMedRcpF1.
+float rcpMed(float a)
+{
+    float b = uintBitsToFloat(0x7ef19fffu - floatBitsToUint(a));
+    return b * (-b * a + 2.0);
+}
+
+void main()
+{
+    ivec2 ip = clamp(ivec2(uv * vec2(p.outSize)), ivec2(0), p.outSize - 1);
+    // FsrRcasF's 3x3 cross:
+    //    b
+    //  d e f
+    //    h
+    vec3 e = texelFetch(src, ip, 0).rgb;
+    bool bIn = ip.y > 0, hIn = ip.y + 1 < p.outSize.y, dIn = ip.x > 0, fIn = ip.x + 1 < p.outSize.x;
+    if (p.bandOn != 0u)
+    {
+        int sx = spanIndex(ip.x, p.band.x, p.band.y, p.inSize.x, p.outSize.x);
+        int sy = spanIndex(ip.y, p.band.z, p.band.w, p.inSize.y, p.outSize.y);
+        bIn = bIn && spanIndex(ip.y - 1, p.band.z, p.band.w, p.inSize.y, p.outSize.y) == sy;
+        hIn = hIn && spanIndex(ip.y + 1, p.band.z, p.band.w, p.inSize.y, p.outSize.y) == sy;
+        dIn = dIn && spanIndex(ip.x - 1, p.band.x, p.band.y, p.inSize.x, p.outSize.x) == sx;
+        fIn = fIn && spanIndex(ip.x + 1, p.band.x, p.band.y, p.inSize.x, p.outSize.x) == sx;
+    }
+    vec3 b = bIn ? texelFetch(src, ip + ivec2(0, -1), 0).rgb : e;
+    vec3 d = dIn ? texelFetch(src, ip + ivec2(-1, 0), 0).rgb : e;
+    vec3 f = fIn ? texelFetch(src, ip + ivec2(1, 0), 0).rgb : e;
+    vec3 h = hIn ? texelFetch(src, ip + ivec2(0, 1), 0).rgb : e;
+    // Min and max of the ring.
+    vec3 mn4 = min(min(b, min(d, f)), h);
+    vec3 mx4 = max(max(b, max(d, f)), h);
+    // Limiters (high precision reciprocals), each channel: the lobe that
+    // would take the cross just to 0 or to 1.
+    vec2 peakC = vec2(1.0, -1.0 * 4.0);
+    vec3 hitMin = min(mn4, e) * (1.0 / max(4.0 * mx4, vec3(1.0 / 65536.0)));
+    vec3 hitMax = (peakC.x - max(mx4, e)) * (1.0 / min(4.0 * mn4 + peakC.y, vec3(-1.0 / 65536.0)));
+    vec3 lobeRGB = max(-hitMin, hitMax);
+    float lobe = max(float(-(0.25 - (1.0 / 16.0))), min(max(lobeRGB.r, max(lobeRGB.g, lobeRGB.b)), 0.0)) * p.con;
+    // Resolve, with the medium precision reciprocal (no visible tonality change).
+    float rcpL = rcpMed(4.0 * lobe + 1.0);
+    color = vec4((lobe * b + lobe * d + lobe * h + lobe * f + e) * rcpL, 1.0);
+}
+)";
+
         // Brightness and the 360's display gamma (video/display_tone.h): the
         // scale shader in use, its main renamed scaleMain, then this main,
         // which looks each channel of its result up in the tone table (256
@@ -1406,6 +1665,14 @@ void main()
             int32_t brightness = 0;
             bool ramp = false;
             uint64_t rampGeneration = 0;
+            // The RCAS pass's tone variant (Upscaling FSR 1), made the first
+            // time both are in use (EnsureToneRcas): its own layout, as RCAS's
+            // push constants aren't the scale shaders'.
+            bool rcasTried = false, rcasReady = false;
+            VkPipelineLayout rcasLayout = VK_NULL_HANDLE;
+            VkShaderModule rcasFs = VK_NULL_HANDLE;
+            VkPipeline rcasPipeline = VK_NULL_HANDLE;
+            VkFormat rcasFormat = VK_FORMAT_UNDEFINED;
         } s_tone;
 
         struct PostState
@@ -1423,11 +1690,35 @@ void main()
             VkDeviceMemory aaMemory = VK_NULL_HANDLE;
             VkImageView aaView = VK_NULL_HANDLE;
             uint32_t aaWidth = 0, aaHeight = 0;
+            // Upscaling FSR 1 (kEasuCs, kRcasFs), made the first time a frame
+            // asks for it (EnsureFsr): EASU's pipeline (the AA pass's set
+            // layout: a sampled image in, a storage image out) and RCAS's for
+            // the swapchain's format (the scale pass's set layout), and EASU's
+            // image, at the picture's size.
+            bool fsrTried = false, fsrReady = false;
+            VkPipelineLayout easuLayout = VK_NULL_HANDLE, rcasLayout = VK_NULL_HANDLE;
+            VkPipeline easu = VK_NULL_HANDLE, rcas = VK_NULL_HANDLE;
+            VkFormat rcasFormat = VK_FORMAT_UNDEFINED;
+            VkShaderModule rcasFs = VK_NULL_HANDLE;
+            VkImage easuImage = VK_NULL_HANDLE;
+            VkDeviceMemory easuMemory = VK_NULL_HANDLE;
+            VkImageView easuView = VK_NULL_HANDLE;
+            uint32_t easuWidth = 0, easuHeight = 0;
+            // An EASU pass has read the AA image: the barrier before the next
+            // AA write waits for compute reads too.
+            bool easuEver = false;
         } s_post;
         // Read every frame: the settings menu changes them live.
         bool AaEnabled() { return settings::GetBool(settings::Id::AntiAliasing); }
         bool Bicubic() { return settings::GetInt(settings::Id::Scaling) == int32_t(settings::ScalingMode::Bicubic); }
+        bool Fsr1() { return settings::GetInt(settings::Id::Scaling) == int32_t(settings::ScalingMode::Fsr1); }
         float Sharpen() { return std::clamp(settings::GetFloat(settings::Id::Sharpening), 0.0f, 1.0f); }
+        // FSR 1's RCAS strength from Sharpening, in AMD's stops (FsrRcasCon:
+        // 0 the most, each stop halves it): 2 x (1 - Sharpening), so 1.00 is
+        // RCAS's maximum, the default 0.30 is 1.4 stops (x0.38), 0.50 one
+        // stop; AMD's samples use 0.2 stops (Sharpening 0.90). 0 skips RCAS
+        // (the EASU image is copied as it is): no sharpening, as for bicubic.
+        float RcasStops(float sharpen) { return 2.0f * (1.0f - sharpen); }
 
         VkShaderModule PostModule(const char* glsl, int stage)
         {
@@ -1562,22 +1853,63 @@ void main()
             if (!EnsureScalePipeline())
                 return false;
             s_post.ready = true;
-            fprintf(stderr, "[video] post-processing: %s, %s scaling%s%s\n", AaEnabled() ? "anti-aliasing" : "no anti-aliasing",
-                Bicubic() ? "bicubic" : "linear", Bicubic() ? std::format(", sharpen {:.2f}", Sharpen()).c_str() : "",
-                s_fastScale ? " (NFSMW_FAST_SCALE: 7 fetches)" : "");
             return true;
         }
 
-        void EnsureAaImage(uint32_t width, uint32_t height)
+        // The "[video] post-processing:" line: the chain a frame goes through,
+        // logged with the first frame and again whenever it changes (a
+        // setting, the frame's size, the picture's: the front image is at
+        // the internal resolution, 1280x720 in menus and movies drawn at 1x).
+        // fsrAsked: Upscaling FSR 1; fsr: its passes run (else bicubic, and
+        // why); rcas: its RCAS pass too (Sharpening above 0).
+        void LogPostChain(bool fsrAsked, bool fsr, bool rcas, uint32_t w, uint32_t h, int32_t dw, int32_t dh)
         {
-            if (s_post.aaImage && s_post.aaWidth == width && s_post.aaHeight == height)
+            struct Chain
+            {
+                bool aa, fsrAsked, fsr, rcas;
+                int32_t mode, sharpen;
+                uint32_t w, h;
+                int32_t dw, dh;
+                bool operator==(const Chain&) const = default;
+            };
+            static Chain last{};
+            static bool logged = false;
+            const Chain now{ AaEnabled(), fsrAsked, fsr, rcas, settings::GetInt(settings::Id::Scaling), int32_t(std::lround(Sharpen() * 100.0f)), w, h,
+                dw, dh };
+            if (logged && now == last)
+                return;
+            logged = true;
+            last = now;
+            std::string scaling;
+            if (fsr)
+                scaling = std::format("FSR 1: EASU {}x{} -> {}x{}, {}", w, h, dw, dh,
+                    rcas ? std::format("RCAS {:.2f} stops (Sharpening {:.2f})", RcasStops(Sharpen()), Sharpen()) : std::string("no RCAS (Sharpening 0)"));
+            else
+            {
+                const bool bicubic = Bicubic() || fsrAsked;
+                scaling = std::format("{} scaling{} {}x{} -> {}x{}{}", bicubic ? "bicubic" : "linear",
+                    bicubic ? std::format(", sharpen {:.2f},", Sharpen()) : std::string(), w, h, dw, dh,
+                    s_fastScale && bicubic ? " (NFSMW_FAST_SCALE: 7 fetches)" : "");
+                if (fsrAsked)
+                    scaling += !s_post.fsrReady && s_post.fsrTried ? " (Upscaling FSR 1: its pipelines couldn't be made)"
+                        : " (Upscaling FSR 1: the picture isn't larger than the frame)";
+            }
+            fprintf(stderr, "[video] post-processing: %s, %s\n", now.aa ? "anti-aliasing" : "no anti-aliasing", scaling.c_str());
+        }
+
+        // An RGBA8 image a compute pass writes and the next pass samples (the
+        // AA pass's, EASU's), made again at a new size once nothing uses it.
+        void EnsurePostImage(VkImage& image, VkDeviceMemory& memory, VkImageView& view, uint32_t& imageWidth, uint32_t& imageHeight,
+            uint32_t width, uint32_t height)
+        {
+            if (image && imageWidth == width && imageHeight == height)
                 return;
             WaitIdle();
-            if (s_post.aaImage)
+            if (image)
             {
-                vkDestroyImageView(s_device, s_post.aaView, nullptr);
-                vkDestroyImage(s_device, s_post.aaImage, nullptr);
-                vkFreeMemory(s_device, s_post.aaMemory, nullptr);
+                vkDestroyImageView(s_device, view, nullptr);
+                vkDestroyImage(s_device, image, nullptr);
+                vkFreeMemory(s_device, memory, nullptr);
             }
             VkImageCreateInfo ii{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
             ii.imageType = VK_IMAGE_TYPE_2D;
@@ -1588,22 +1920,100 @@ void main()
             ii.samples = VK_SAMPLE_COUNT_1_BIT;
             ii.tiling = VK_IMAGE_TILING_OPTIMAL;
             ii.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-            vkCreateImage(s_device, &ii, nullptr, &s_post.aaImage);
+            vkCreateImage(s_device, &ii, nullptr, &image);
             VkMemoryRequirements req;
-            vkGetImageMemoryRequirements(s_device, s_post.aaImage, &req);
+            vkGetImageMemoryRequirements(s_device, image, &req);
             VkMemoryAllocateInfo ai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
             ai.allocationSize = req.size;
             ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-            vkAllocateMemory(s_device, &ai, nullptr, &s_post.aaMemory);
-            vkBindImageMemory(s_device, s_post.aaImage, s_post.aaMemory, 0);
+            vkAllocateMemory(s_device, &ai, nullptr, &memory);
+            vkBindImageMemory(s_device, image, memory, 0);
             VkImageViewCreateInfo vci{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
-            vci.image = s_post.aaImage;
+            vci.image = image;
             vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
             vci.format = VK_FORMAT_R8G8B8A8_UNORM;
             vci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-            vkCreateImageView(s_device, &vci, nullptr, &s_post.aaView);
-            s_post.aaWidth = width;
-            s_post.aaHeight = height;
+            vkCreateImageView(s_device, &vci, nullptr, &view);
+            imageWidth = width;
+            imageHeight = height;
+        }
+
+        void EnsureAaImage(uint32_t width, uint32_t height)
+        {
+            EnsurePostImage(s_post.aaImage, s_post.aaMemory, s_post.aaView, s_post.aaWidth, s_post.aaHeight, width, height);
+        }
+
+        void EnsureEasuImage(uint32_t width, uint32_t height)
+        {
+            EnsurePostImage(s_post.easuImage, s_post.easuMemory, s_post.easuView, s_post.easuWidth, s_post.easuHeight, width, height);
+        }
+
+        // Upscaling FSR 1's pipelines (kEasuCs, kRcasFs), RCAS's for the
+        // swapchain's format (made again if it changes, as the scale
+        // pipeline). False when they can't be made: the frame is then scaled
+        // bicubic, as with Upscaling Bicubic, and the post-processing line
+        // says so.
+        bool EnsureFsr()
+        {
+            if (!s_post.fsrTried)
+            {
+                s_post.fsrTried = true;
+                VkPushConstantRange easuRange{ VK_SHADER_STAGE_COMPUTE_BIT, 0, 52 }, rcasRange{ VK_SHADER_STAGE_FRAGMENT_BIT, 0, 40 };
+                VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+                plci.setLayoutCount = 1;
+                plci.pSetLayouts = &s_post.aaSet;
+                plci.pushConstantRangeCount = 1;
+                plci.pPushConstantRanges = &easuRange;
+                if (!Check(vkCreatePipelineLayout(s_device, &plci, nullptr, &s_post.easuLayout), "EASU pipeline layout"))
+                    return false;
+                plci.pSetLayouts = &s_post.scaleSet;
+                plci.pPushConstantRanges = &rcasRange;
+                if (!Check(vkCreatePipelineLayout(s_device, &plci, nullptr, &s_post.rcasLayout), "RCAS pipeline layout"))
+                    return false;
+                VkShaderModule cs = PostModule(kEasuCs, 2);
+                s_post.rcasFs = PostModule(kRcasFs, 1);
+                if (!cs || !s_post.rcasFs)
+                {
+                    fprintf(stderr, "[video] FSR 1: a shader failed to compile: bicubic scaling instead\n");
+                    return false;
+                }
+                VkComputePipelineCreateInfo cpci{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+                cpci.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, cs, "main", nullptr };
+                cpci.layout = s_post.easuLayout;
+                const VkResult made = vkCreateComputePipelines(s_device, VK_NULL_HANDLE, 1, &cpci, nullptr, &s_post.easu);
+                vkDestroyShaderModule(s_device, cs, nullptr);
+                if (made != VK_SUCCESS)
+                {
+                    fprintf(stderr, "[video] FSR 1: the EASU pipeline couldn't be made (%d): bicubic scaling instead\n", int(made));
+                    s_post.easu = VK_NULL_HANDLE;
+                    return false;
+                }
+                s_post.fsrReady = true;
+            }
+            if (!s_post.fsrReady)
+                return false;
+            if (s_post.rcas && s_post.rcasFormat == s_swapFormat)
+                return true;
+            if (s_post.rcas)
+                vkDestroyPipeline(s_device, s_post.rcas, nullptr);
+            s_post.rcas = MakeScalePipeline(s_post.rcasFs, s_post.rcasLayout);
+            if (!s_post.rcas)
+            {
+                fprintf(stderr, "[video] FSR 1: the RCAS pipeline couldn't be made: bicubic scaling instead\n");
+                s_post.fsrReady = false;
+                return false;
+            }
+            s_post.rcasFormat = s_swapFormat;
+            return true;
+        }
+
+        // FsrEasuCon's con0 for a w x h frame scaled to a dw x dh picture
+        // (the whole input image is the viewport): an output pixel's position
+        // in the input, as AMD's CPU code computes it.
+        std::array<float, 4> EasuCon0(uint32_t w, uint32_t h, int32_t dw, int32_t dh)
+        {
+            const float rx = 1.0f / float(dw), ry = 1.0f / float(dh);
+            return { float(w) * rx, float(h) * ry, 0.5f * float(w) * rx - 0.5f, 0.5f * float(h) * ry - 0.5f };
         }
 
         // The tone pipeline's pieces, made the first time Brightness or the
@@ -1703,6 +2113,49 @@ void main()
             s_tone.format = s_swapFormat;
             fprintf(stderr, "[video] tone: pipeline made in %.0f ms\n",
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+            return true;
+        }
+
+        // The RCAS pass's tone variant, after EnsureTone (its set layout and
+        // table): for Upscaling FSR 1 with Brightness or the 360's gamma on,
+        // which the default is. False if it can't be made: that frame's RCAS
+        // is then left out (the EASU image copied through the tone pipeline).
+        bool EnsureToneRcas()
+        {
+            if (!s_tone.ready)
+                return false;
+            if (!s_tone.rcasTried)
+            {
+                s_tone.rcasTried = true;
+                std::string glsl = ToneVariant(kRcasFs);
+                VkPushConstantRange range{ VK_SHADER_STAGE_FRAGMENT_BIT, 0, 40 };  // kRcasFs's P
+                VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+                plci.setLayoutCount = 1;
+                plci.pSetLayouts = &s_tone.set;
+                plci.pushConstantRangeCount = 1;
+                plci.pPushConstantRanges = &range;
+                if (glsl.empty() || !Check(vkCreatePipelineLayout(s_device, &plci, nullptr, &s_tone.rcasLayout), "tone RCAS pipeline layout") ||
+                    !(s_tone.rcasFs = PostModule(glsl.c_str(), 1)))
+                {
+                    fprintf(stderr, "[video] tone: no RCAS variant; FSR 1 shows its EASU image unsharpened\n");
+                    return false;
+                }
+                s_tone.rcasReady = true;
+            }
+            if (!s_tone.rcasReady)
+                return false;
+            if (s_tone.rcasPipeline && s_tone.rcasFormat == s_swapFormat)
+                return true;
+            if (s_tone.rcasPipeline)
+                vkDestroyPipeline(s_device, s_tone.rcasPipeline, nullptr);
+            s_tone.rcasPipeline = MakeScalePipeline(s_tone.rcasFs, s_tone.rcasLayout);
+            if (!s_tone.rcasPipeline)
+            {
+                fprintf(stderr, "[video] tone: the RCAS variant's pipeline couldn't be made; FSR 1 shows its EASU image unsharpened\n");
+                s_tone.rcasReady = false;
+                return false;
+            }
+            s_tone.rcasFormat = s_swapFormat;
             return true;
         }
 
@@ -3345,6 +3798,15 @@ void main()
         }
         VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
         const bool post = haveSource && EnsurePostProcessing();
+        // Upscaling FSR 1: only where the picture is the frame scaled up (or
+        // 1:1) on both axes. EASU is an upscaler (1x to 4x in area): a frame
+        // larger than its picture (2x on a 1080p screen) is scaled bicubic,
+        // as on a device that can't make FSR's pipelines.
+        const bool fsrAsked = post && Fsr1();
+        const bool fsr = fsrAsked && dw >= int32_t(w) && dh >= int32_t(h) && EnsureFsr();
+        const bool rcas = fsr && Sharpen() > 0.0f;
+        if (post)
+            LogPostChain(fsrAsked, fsr, rcas, w, h, dw, dh);
         if (post || !haveSource)
         {
             // Draw into the swapchain image: the scaled game frame (if any),
@@ -3382,8 +3844,11 @@ void main()
                 if (AaEnabled())
                 {
                     EnsureAaImage(w, h);
+                    // (After the last frame's reads: the scale pass's, or with
+                    // FSR 1 its EASU pass's, a compute one.)
                     Barrier(cmd, s_post.aaImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT,
-                        VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                        VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | (s_post.easuEver ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : 0),
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
                     VkDescriptorImageInfo in{ s_post.sampler, f.sourceView, VK_IMAGE_LAYOUT_GENERAL };
                     VkDescriptorImageInfo out{ VK_NULL_HANDLE, s_post.aaView, VK_IMAGE_LAYOUT_GENERAL };
                     VkWriteDescriptorSet writes[2] = {
@@ -3403,11 +3868,47 @@ void main()
                     vkCmdPushConstants(cmd, s_post.aaLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
                     vkCmdDispatch(cmd, (w + 7) / 8, (h + 7) / 8, 1);
                     Barrier(cmd, s_post.aaImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT,
-                        VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+                        VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | (fsr ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : 0));
                     scaleInput = s_post.aaView;
                 }
                 if (f.timed)
                     vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s_timestamps, s_frameIndex * 3 + 1);
+                if (fsr)
+                {
+                    // EASU: the frame (anti-aliased, or as rendered) to the
+                    // picture's size, kept to the 16:9 band's spans as the AA
+                    // pass is (the band in the frame's texels). Its image is
+                    // then the scale pass's input, drawn 1:1 by RCAS (or
+                    // copied: Sharpening 0).
+                    EnsureEasuImage(uint32_t(dw), uint32_t(dh));
+                    Barrier(cmd, s_post.easuImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT,
+                        VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                    VkDescriptorImageInfo in{ s_post.sampler, scaleInput, VK_IMAGE_LAYOUT_GENERAL };
+                    VkDescriptorImageInfo out{ VK_NULL_HANDLE, s_post.easuView, VK_IMAGE_LAYOUT_GENERAL };
+                    VkWriteDescriptorSet writes[2] = {
+                        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 0, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &in, nullptr, nullptr },
+                        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &out, nullptr, nullptr },
+                    };
+                    const std::array<float, 4> con0 = EasuCon0(w, h, dw, dh);
+                    struct
+                    {
+                        float con0[4];
+                        int32_t inWidth, inHeight, outWidth, outHeight;
+                        int32_t band[4];
+                        uint32_t bandOn;
+                    } pc = { { con0[0], con0[1], con0[2], con0[3] }, int32_t(w), int32_t(h), dw, dh, { band.x0, band.x1, band.y0, band.y1 },
+                        bandOn ? 1u : 0u };
+                    static_assert(sizeof(pc) == 52);
+                    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_post.easu);
+                    s_post.pushDescriptorSet(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_post.easuLayout, 0, 2, writes);
+                    vkCmdPushConstants(cmd, s_post.easuLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+                    vkCmdDispatch(cmd, (uint32_t(dw) + 7) / 8, (uint32_t(dh) + 7) / 8, 1);
+                    Barrier(cmd, s_post.easuImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT,
+                        VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+                    scaleInput = s_post.easuView;
+                    s_post.easuEver = true;
+                }
             }
 
             // Brightness and the 360's display gamma: false at Brightness 0
@@ -3435,11 +3936,18 @@ void main()
                 VkRect2D scissor{ { dx, dy }, { uint32_t(dw), uint32_t(dh) } };
                 vkCmdSetViewport(cmd, 0, 1, &viewport);
                 vkCmdSetScissor(cmd, 0, 1, &scissor);
-                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, tone ? s_tone.pipeline : s_post.scale);
+                // FSR 1: RCAS draws EASU's image 1:1 (with the tone, its
+                // variant; one that can't be made leaves RCAS out). Else the
+                // scale pass, which with FSR 1 copies EASU's image 1:1
+                // (Sharpening 0), and without scales the frame as before
+                // (bicubic where FSR 1 was asked for but isn't used).
+                const bool rcasPass = rcas && (!tone || EnsureToneRcas());
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                    rcasPass ? (tone ? s_tone.rcasPipeline : s_post.rcas) : tone ? s_tone.pipeline : s_post.scale);
                 VkDescriptorImageInfo in{ s_post.sampler, scaleInput, VK_IMAGE_LAYOUT_GENERAL };
                 VkWriteDescriptorSet write{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 0, 0, 1,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &in, nullptr, nullptr };
-                const VkPipelineLayout scaleLayout = tone ? s_tone.layout : s_post.scaleLayout;
+                const VkPipelineLayout scaleLayout = rcasPass ? (tone ? s_tone.rcasLayout : s_post.rcasLayout) : tone ? s_tone.layout : s_post.scaleLayout;
                 if (tone)
                 {
                     VkDescriptorImageInfo table{ s_post.sampler, s_tone.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
@@ -3449,18 +3957,36 @@ void main()
                     s_post.pushDescriptorSet(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, scaleLayout, 0, 2, writes);
                 }
                 else
-                    s_post.pushDescriptorSet(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, s_post.scaleLayout, 0, 1, &write);
-                bool bicubic = Bicubic();
-                struct
+                    s_post.pushDescriptorSet(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, scaleLayout, 0, 1, &write);
+                if (rcasPass)
                 {
-                    float width, height, sharpen;
-                    uint32_t bicubic;
-                    float band[4];
-                    uint32_t bandOn;
-                } pc = { float(w), float(h), Sharpen(), bicubic ? 1u : 0u, { float(band.x0), float(band.x1), float(band.y0), float(band.y1) },
-                    bandOn ? 1u : 0u };
-                static_assert(sizeof(pc) == 36);
-                vkCmdPushConstants(cmd, scaleLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
+                    struct
+                    {
+                        int32_t outWidth, outHeight, inWidth, inHeight;
+                        int32_t band[4];
+                        float con;
+                        uint32_t bandOn;
+                    } pc = { dw, dh, int32_t(w), int32_t(h), { band.x0, band.x1, band.y0, band.y1 }, std::exp2(-RcasStops(Sharpen())),
+                        bandOn ? 1u : 0u };
+                    static_assert(sizeof(pc) == 40);
+                    vkCmdPushConstants(cmd, scaleLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
+                }
+                else
+                {
+                    bool bicubic = Bicubic() || fsrAsked;
+                    struct
+                    {
+                        float width, height, sharpen;
+                        uint32_t bicubic;
+                        float band[4];
+                        uint32_t bandOn;
+                    } pc = { float(w), float(h), Sharpen(), bicubic ? 1u : 0u, { float(band.x0), float(band.x1), float(band.y0), float(band.y1) },
+                        bandOn ? 1u : 0u };
+                    if (fsr)
+                        pc = { float(dw), float(dh), 0.0f, 0u, {}, 0u };  // EASU's image, 1:1: a plain copy
+                    static_assert(sizeof(pc) == 36);
+                    vkCmdPushConstants(cmd, scaleLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
+                }
                 vkCmdDraw(cmd, 3, 1, 0, 0);
                 if (!captures.empty() && pictureRect.extent.width)
                 {

@@ -74,7 +74,10 @@ namespace settings
     enum class Apply : uint8_t { Live, Restart };
 
     // Values of the enum options (GetInt returns them).
-    enum class ScalingMode : int32_t { Bicubic = 0, Linear = 1 };
+    // Fsr1: AMD FidelityFX Super Resolution 1, EASU then RCAS (Sharpening
+    // sets RCAS's strength; video/presenter.cpp), for an internal resolution
+    // below the window's; bicubic where the frame isn't scaled up.
+    enum class ScalingMode : int32_t { Bicubic = 0, Linear = 1, Fsr1 = 2 };
     // Frame Rate: 60, 30, or Auto (video/frame_rate.h: 60, or 30 while the
     // device is hot or can't hold 60).
     constexpr int32_t kFrameRateAuto = 0;

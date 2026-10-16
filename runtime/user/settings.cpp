@@ -48,6 +48,7 @@ namespace settings
         constexpr EnumEntry kScalingEntries[] = {
             { int32_t(ScalingMode::Bicubic), "bicubic", "Bicubic" },
             { int32_t(ScalingMode::Linear), "linear", "Bilinear" },
+            { int32_t(ScalingMode::Fsr1), "fsr1", "FSR 1" },
         };
 
         // Frame Rate: the game's frames per second (60, or 30 on a GPU that
@@ -134,7 +135,7 @@ namespace settings
               .env = "NFSMW_AA", .defaultValue = 1 },
             { .id = Id::Scaling, .category = Category::Graphics, .type = Type::Enum, .apply = Apply::Live,
               .table = "video", .key = "scaling", .label = "Upscaling",
-              .description = "How the 720p image is scaled to the window. Bicubic is sharper, bilinear softer.",
+              .description = "How the image is scaled to the window. Bicubic is sharper, bilinear softer. FSR 1 (AMD's edge-adaptive upscaler) is for an Internal Resolution below 1x.",
               .env = "NFSMW_SCALING", .defaultValue = double(ScalingMode::Bicubic), .entries = kScalingEntries },
             { .id = Id::AspectRatio, .category = Category::Display, .type = Type::Enum, .apply = Apply::Live,
               .table = "video", .key = "aspect_ratio", .label = "Aspect Ratio",
@@ -151,7 +152,7 @@ namespace settings
               .env = "NFSMW_DISPLAY_GAMMA", .defaultValue = 1 },
             { .id = Id::Sharpening, .category = Category::Graphics, .type = Type::Float, .apply = Apply::Live,
               .table = "video", .key = "sharpening", .label = "Sharpening",
-              .description = "Extra sharpness for bicubic upscaling. 0 turns it off.",
+              .description = "Extra sharpness for bicubic upscaling, and FSR 1's sharpening (RCAS: 1.00 the most). 0 turns it off.",
               .env = "NFSMW_SHARPEN", .defaultValue = 0.3, .min = 0, .max = 1, .step = 0.05 },
             { .id = Id::Anisotropy, .category = Category::Graphics, .type = Type::Enum, .apply = Apply::Live,
               .table = "video", .key = "anisotropic_filtering", .label = "Anisotropic Filtering",
