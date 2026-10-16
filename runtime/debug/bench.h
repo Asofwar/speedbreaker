@@ -12,6 +12,9 @@
 //   NFSMW_BENCH_SHOTS=<step>,...    the picture of these world steps of the race
 //                                   (counted as NFSMW_BENCH_FROM is) into the
 //                                   report's folder as shot-<step>.ppm
+//   NFSMW_BENCH_SHOTS_SHOWN=1       also each one as the window shows it, after
+//                                   the presenter's post-processing, as
+//                                   shot-<step>-shown.ppm (below)
 //   NFSMW_BENCH=0                   a replay without the recorder (to watch one)
 //
 // Without NFSMW_BENCH_STEPS the window ends 60 frames before the capture's meta
@@ -27,6 +30,19 @@
 // costs a copy of the front image on the GPU and a file written on another
 // thread, nothing the game waits for. scripts/compare_shots.py compares two
 // runs' shots.
+//
+// The front image is at the internal resolution: below 1x (0.75x: 960x540)
+// it can't be compared with a 720p run's, and it isn't what the player sees
+// (the presenter's anti-aliasing and upscaling, FSR 1 or bicubic, come
+// after it). With NFSMW_BENCH_SHOTS_SHOWN=1 each shot's frame is also taken
+// as the window shows it (video::CaptureNextFrame: the picture after the
+// post-processing, without the UI or letterbox bars, at the window's
+// size whatever the internal resolution), armed just before the shot's swap
+// hands the frame over and copied when the presenter draws it: a GPU copy
+// and a file written on threads of their own, the main thread waiting for
+// neither. A frame the presenter replaces before it is drawn (a dropped
+// frame: uncapped runs drop many) has none: "shown_status" failed.
+// compare_shots.py --shown compares those.
 #include <atomic>
 #include <cstdint>
 
@@ -40,6 +56,11 @@ namespace bench
     // written: `gpuFront` when the renderer wrote one (not headless, not
     // NFSMW_DUMP_FRAMES). Copies it for every shot due by this swap.
     void OnShotSwap(uint64_t swap, bool gpuFront);
+    // The command processor, before swap `swap` (gpu::FrameCount() + 1)
+    // hands its frame to the presenter, once that reaches g_shotSwap: with
+    // NFSMW_BENCH_SHOTS_SHOWN, each shot of this swap asks the presenter for
+    // the frame as shown (video::CaptureNextFrame).
+    void BeforeShotSwap(uint64_t swap);
 
     // A replay with the recorder on.
     bool Enabled();

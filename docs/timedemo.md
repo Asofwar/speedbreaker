@@ -235,6 +235,16 @@ scripts/timedemo.sh run B 1 --bundle ~/sb/B NFSMW_TIMEDEMO_UNCAPPED=1 NFSMW_BENC
 python3 scripts/compare_shots.py ~/sb-bench/runs/A-1 ~/sb-bench/runs/B-1
 ```
 
+Runs at different internal resolutions (0.75x with Upscaling FSR 1 against
+1x) have front images of different sizes, and neither is what the player
+sees. With `NFSMW_BENCH_SHOTS_SHOWN=1` too, each shot's frame is also saved
+as the window shows it, after the presenter's post-processing and at the
+window's size, without the menus' UI or letterbox bars:
+`shot-<step>-shown.ppm`, compared with `compare_shots.py --shown`. The
+presenter copies the frame as it draws it, on a thread of its own: a frame
+it replaces with a newer one before drawing it (uncapped runs drop many) has
+no such picture (`shown_status` failed, with `shown_why`).
+
 `compare_shots.py` prints, for each step, whether the two pictures are
 identical, and if not how many pixels changed, by how much at most (0-255),
 the PSNR, how many are off by more than `--threshold`, and where those are
@@ -401,6 +411,7 @@ feature.
 | `NFSMW_BENCH_TIMEOUT=<s>` | a partial report and exit after this long (900) |
 | `NFSMW_BENCH_EXIT=0` | stay in the game after the report (the default is to exit) |
 | `NFSMW_BENCH_SHOTS=<step>,...` | the picture of these world steps of the race (counted as `NFSMW_BENCH_FROM` is), as `shot-<step>.ppm` in the report's folder (see [Pictures](#4-compare-pictures)) |
+| `NFSMW_BENCH_SHOTS_SHOWN=1` | each of those also as the window shows it, after the presenter's post-processing: `shot-<step>-shown.ppm` |
 | `NFSMW_SAVE_DIR=<dir>` | an absolute path: `save/` and `profile_settings.bin` there instead of the data folder's |
 
 ## The report
@@ -430,7 +441,9 @@ In the run's folder (`NFSMW_BENCH_OUT`):
   `frames_past_offset`, and
   `taken[]`, each step's `status` (`ok`, `unverified`, `failed` with `why`,
   `pending`, `not_reached`), the frame it pictures (`loop`, `frame_step`),
-  its `swap`, `file`, `width` and `height`.
+  its `swap`, `file`, `width` and `height`; with `NFSMW_BENCH_SHOTS_SHOWN`
+  also `shown_status` (`ok`, `failed` with `shown_why`, `pending`),
+  `shown_file`, `shown_width` and `shown_height`.
 - A `[bench]` line in the game's log: `[bench] A-1 ok: 7200 frames 98.4 s |
   timedemo 73.2 fps, 1% low 51.0 | p50 13.1 p99 21.4 max 48.2 ms | ...`.
 

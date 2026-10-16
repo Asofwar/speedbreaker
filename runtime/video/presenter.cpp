@@ -149,6 +149,21 @@ namespace video
         // it, so a frame dropped or written over can be told from the next.
         uint64_t s_frontSerial = 0, s_pendingSerial = 0, s_lastSerial = 0;
         bool s_lastQueued = false;
+        // Under s_pendingMutex: the timedemo's shots of the picture as shown
+        // (CaptureNextFrame), armed for the next frame handed over, then
+        // waiting for their frame (by serial) to be drawn.
+        std::vector<std::function<void(CapturedFrame)>> s_shotsArmed;
+        std::vector<std::pair<uint64_t, std::function<void(CapturedFrame)>>> s_shotsWaiting;
+        std::atomic<bool> s_shotsOn{ false };  // a shot was ever asked for (RunFrame looks only then)
+
+        // Under s_pendingMutex, as a frame is handed over (its serial just
+        // taken): the shots armed for it wait for it.
+        void ShotsForSubmitted()
+        {
+            for (auto& done : s_shotsArmed)
+                s_shotsWaiting.push_back({ s_pendingSerial, std::move(done) });
+            s_shotsArmed.clear();
+        }
 
         // Under s_pendingMutex: the waiting frame (s_pendingSerial) will
         // never be shown. Counted for the [perf] line (s_dropped), and logged
@@ -988,7 +1003,18 @@ namespace video
             VkBuffer buffer = VK_NULL_HANDLE;
             VkDeviceMemory memory = VK_NULL_HANDLE;
             uint32_t width = 0, height = 0;
+            VkFormat format = VK_FORMAT_UNDEFINED;  // the swapchain's when recorded
         };
+
+        // The timedemo's shots of the picture as shown (CaptureNextFrame)
+        // drawn in a frame slot's last frame: finished when the slot comes
+        // round again, after its fence (RunFrame), on a thread of their own.
+        struct FrameShots
+        {
+            RegionCapture capture;
+            std::vector<std::function<void(CapturedFrame)>> done;
+        };
+        FrameShots s_frameShots[FRAMES_IN_FLIGHT];
 
         // Records a copy of `rect` of `image` (in `layout`, last written at
         // `stage` with `access`) into a host-visible buffer, and puts the
@@ -999,6 +1025,7 @@ namespace video
             RegionCapture c;
             c.width = rect.extent.width;
             c.height = rect.extent.height;
+            c.format = s_swapFormat;
             VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
             bci.size = VkDeviceSize(c.width) * c.height * 4;
             bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
@@ -1038,8 +1065,10 @@ namespace video
         CapturedFrame FinishRegionCapture(RegionCapture& c)
         {
             CapturedFrame frame;
-            const bool bgr = s_swapFormat == VK_FORMAT_B8G8R8A8_UNORM || s_swapFormat == VK_FORMAT_B8G8R8A8_SRGB;
-            const bool rgb = s_swapFormat == VK_FORMAT_R8G8B8A8_UNORM || s_swapFormat == VK_FORMAT_R8G8B8A8_SRGB;
+            // (The format it was recorded in: a shot is finished on another
+            // thread, after the swapchain may have been made again.)
+            const bool bgr = c.format == VK_FORMAT_B8G8R8A8_UNORM || c.format == VK_FORMAT_B8G8R8A8_SRGB;
+            const bool rgb = c.format == VK_FORMAT_R8G8B8A8_UNORM || c.format == VK_FORMAT_R8G8B8A8_SRGB;
             void* mapped = nullptr;
             if ((bgr || rgb) && vkMapMemory(s_device, c.memory, 0, VK_WHOLE_SIZE, 0, &mapped) == VK_SUCCESS)
             {
@@ -3051,6 +3080,7 @@ void main()
         s_pendingNew = true;
         s_pendingVblank = s_guestVblank.load(std::memory_order_relaxed);
         s_pendingSerial = ++s_frontSerial;
+        ShotsForSubmitted();
     }
 
     namespace
@@ -3633,11 +3663,48 @@ void main()
                 promise.set_value({});
             captures.clear();
         }
+        // The timedemo's shots of the picture as shown (CaptureNextFrame):
+        // those of the frame drawn now (taken now, or drawn again), and those
+        // whose frame was replaced before it was taken, which get nothing
+        // (nor do any here without a picture or a readable swapchain).
+        std::vector<std::function<void(CapturedFrame)>> frameShots, missedShots;
+        if (s_shotsOn.load(std::memory_order_acquire))
+        {
+            std::lock_guard lock(s_pendingMutex);
+            for (size_t i = 0; i < s_shotsWaiting.size();)
+            {
+                const uint64_t serial = s_shotsWaiting[i].first;
+                if (serial > s_lastSerial)
+                {
+                    i++;
+                    continue;
+                }
+                (serial == s_lastSerial && haveSource && s_swapReadable ? frameShots : missedShots).push_back(std::move(s_shotsWaiting[i].second));
+                s_shotsWaiting.erase(s_shotsWaiting.begin() + ptrdiff_t(i));
+            }
+        }
+        if (!missedShots.empty())
+            std::thread([done = std::move(missedShots)]() mutable {
+                for (auto& fn : done)
+                    fn({});
+            }).detach();
         RegionCapture gameCapture;
 
         Frame& f = s_frames[s_frameIndex];
         if (vkWaitForFences(s_device, 1, &f.inFlight, VK_TRUE, UINT64_MAX) == VK_ERROR_DEVICE_LOST)
             DeviceLost("vkWaitForFences (the presenter's frame)");
+        if (s_frameShots[s_frameIndex].capture.buffer)
+        {
+            // This slot's last frame held a shot: its copy has landed (the
+            // fence), and is read out and handed over on a thread of its own,
+            // so no frame waits for it.
+            std::thread([shots = std::move(s_frameShots[s_frameIndex])]() mutable {
+                CapturedFrame frame = FinishRegionCapture(shots.capture);
+                for (auto& fn : shots.done)
+                    fn(frame);
+            }).detach();
+            s_frameShots[s_frameIndex] = {};
+        }
         if (f.timed)
         {
             uint64_t ts[3];
@@ -3679,6 +3746,13 @@ void main()
                 std::lock_guard lock(s_captureMutex);
                 for (auto& promise : captures)
                     s_captureRequests.push_back(std::move(promise));
+            }
+            if (!frameShots.empty())
+            {
+                // So do shots: of this frame drawn again, or none.
+                std::lock_guard lock(s_pendingMutex);
+                for (auto& done : frameShots)
+                    s_shotsWaiting.push_back({ s_lastSerial, std::move(done) });
             }
             if (acquired.other)
             {
@@ -3988,7 +4062,7 @@ void main()
                     vkCmdPushConstants(cmd, scaleLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
                 }
                 vkCmdDraw(cmd, 3, 1, 0, 0);
-                if (!captures.empty() && pictureRect.extent.width)
+                if ((!captures.empty() || !frameShots.empty()) && pictureRect.extent.width)
                 {
                     // The game's picture alone: pause the pass, copy it out,
                     // and carry on with the UI over it.
@@ -4099,7 +4173,7 @@ void main()
             blit.dstOffsets[1] = { dx + dw, dy + dh, 1 };
             vkCmdBlitImage(cmd, source, sourceLayout, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 1, &blit, VK_FILTER_LINEAR);
-            if (!captures.empty() && pictureRect.extent.width)
+            if ((!captures.empty() || !frameShots.empty()) && pictureRect.extent.width)
                 gameCapture = RecordRegionCapture(cmd, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
                     VK_PIPELINE_STAGE_TRANSFER_BIT, pictureRect);
             if (uiFrame)
@@ -4253,6 +4327,23 @@ void main()
             }
             for (auto& promise : captures)
                 promise.set_value(frame);
+            if (!frameShots.empty())
+                std::thread([frame, done = std::move(frameShots)]() mutable {
+                    for (auto& fn : done)
+                        fn(frame);
+                }).detach();
+        }
+        else if (!frameShots.empty())
+        {
+            // Read out when this slot comes round again (above), or nothing
+            // to read (no picture rectangle, no buffer for the copy).
+            if (gameCapture.buffer)
+                s_frameShots[s_frameIndex] = { gameCapture, std::move(frameShots) };
+            else
+                std::thread([done = std::move(frameShots)]() mutable {
+                    for (auto& fn : done)
+                        fn({});
+                }).detach();
         }
         if (captureBuffer)
         {
@@ -4310,6 +4401,7 @@ void main()
         s_pendingNew = true;
         s_pendingVblank = s_guestVblank.load(std::memory_order_relaxed);
         s_pendingSerial = ++s_frontSerial;
+        ShotsForSubmitted();
     }
 
     int ClaimFrontImage(const VkImage* images, int count)
@@ -4509,6 +4601,18 @@ void main()
         std::lock_guard lock(s_captureMutex);
         s_captureRequests.push_back(std::move(promise));
         return future;
+    }
+
+    void CaptureNextFrame(std::function<void(CapturedFrame)> done)
+    {
+        if (!s_window)
+        {
+            done({});
+            return;
+        }
+        std::lock_guard lock(s_pendingMutex);
+        s_shotsArmed.push_back(std::move(done));
+        s_shotsOn.store(true, std::memory_order_release);
     }
 
     void Shutdown()

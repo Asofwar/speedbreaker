@@ -140,6 +140,24 @@ namespace bench::shots
         return "shot-" + std::to_string(step) + ".ppm";
     }
 
+    // shot-<step>-shown.ppm: the same frame as the window showed it
+    // (NFSMW_BENCH_SHOTS_SHOWN; compare_shots.py --shown).
+    inline std::string ShownFileName(int64_t step)
+    {
+        return "shot-" + std::to_string(step) + "-shown.ppm";
+    }
+
+    // A binary PPM of an RGB8 image, rows packed, top row first (a picture
+    // as the window shows it: video::CapturedFrame).
+    inline std::string PpmRgb(const uint8_t* rgb, uint32_t width, uint32_t height)
+    {
+        char header[48];
+        int n = std::snprintf(header, sizeof(header), "P6\n%u %u\n255\n", width, height);
+        std::string out(header, size_t(std::max(n, 0)));
+        out.append(reinterpret_cast<const char*>(rgb), size_t(width) * height * 3);
+        return out;
+    }
+
     // A binary PPM (P6, 8 bits a channel, top row first) of an RGBA8 image
     // whose rows are `rowBytes` apart; the alpha channel, which the screen
     // never shows, is left out.

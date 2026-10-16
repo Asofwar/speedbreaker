@@ -6,7 +6,8 @@
 # pictures pass, one pixel off fails by default and passes within a
 # tolerance or a threshold, the differences' place is found, and pictures
 # that can't be compared (missing, another size, another swap, not a PPM)
-# stop it.
+# stop it; --shown compares the pictures as shown (shot-<step>-shown.ppm)
+# where the front images can't be (another internal resolution).
 #   python3 tests/compare_shots_test.py
 import json
 import math
@@ -250,12 +251,39 @@ def unverified(root):
     expect(code == 0 and "warning: shot 1600: run A says unverified" in text, f"unverified: exit {code}:\n{text}")
 
 
+def shown(root):
+    # NFSMW_BENCH_SHOTS_SHOWN: the front images at two internal resolutions
+    # (64x32 against 48x24: not comparable), the pictures as shown at the
+    # window's size (--shown: compared, the front images left alone).
+    a = make_run(root, "A", {1600: picture()}, swaps={1600: 4490})
+    b = make_run(root, "B", {}, swaps={})
+    write_ppm(os.path.join(b, "shot-1600.ppm"), picture(1, 48, 24), 48, 24)
+    with open(os.path.join(b, "summary.json"), "w", encoding="utf-8") as f:
+        json.dump({"status": "ok", "shots": {"verified": True, "taken": [
+            {"step": 1600, "status": "ok", "swap": 4490, "shown_status": "failed", "shown_why": "dropped"}]}}, f)
+    pa, pb = picture(3), picture(3)
+    pb[(5 * W + 7) * 3] ^= 0x10
+    write_ppm(os.path.join(a, "shot-1600-shown.ppm"), pa)
+    write_ppm(os.path.join(b, "shot-1600-shown.ppm"), pb)
+    code, text, _ = run(a, b)
+    expect(code == 2 and "48x24 in run B" in text and "-shown" not in text.split("error:")[0], f"front images: exit {code}:\n{text}")
+    code, text, result = run(a, b, "--shown", json_path=os.path.join(root, "s.json"))
+    expect(code == 0 and result and result["shots"][0]["step"] == 1600 and not result["shots"][0]["identical"],
+           f"--shown: exit {code}:\n{text}")
+    expect("warning: shot 1600: run B's picture as shown says failed (dropped)" in text, f"--shown status:\n{text}")
+    f = os.path.join(root, "F")
+    os.makedirs(f)
+    code, text, _ = run(f, f, "--shown")
+    expect(code == 2 and "no shot-<step>-shown.ppm" in text, f"--shown, no shots: exit {code}:\n{text}")
+
+
 case("identical", identical)
 case("one pixel off", one_pixel)
 case("a block off, and where", block)
 case("run-to-run noise", noise)
 case("not comparable", not_comparable)
 case("unverified shots", unverified)
+case("pictures as shown", shown)
 
 print("FAILED" if failures else "ok")
 sys.exit(1 if failures else 0)

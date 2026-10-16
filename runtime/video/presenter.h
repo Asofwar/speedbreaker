@@ -6,6 +6,7 @@
 // converted on the CPU and scaled into the window.
 #pragma once
 #include <cstdint>
+#include <functional>
 #include <future>
 #include <mutex>
 #include <vector>
@@ -202,6 +203,18 @@ namespace video
     // drawn. Empty when there is no game frame to capture (headless, before
     // the game's first frame, a swapchain that can't be read back).
     std::future<CapturedFrame> CaptureFrame();
+
+    // The timedemo's shots of the picture as shown (debug/bench.cpp,
+    // NFSMW_BENCH_SHOTS_SHOWN): any thread, before the call that hands over
+    // the frame to capture (SubmitFrontImage or SubmitFrontBuffer: the
+    // command processor, ahead of the shot's swap). That frame's picture as
+    // the window shows it, after all the post-processing (anti-aliasing,
+    // scaling, FSR 1, the tone), without the UI over it and without
+    // letterbox bars, as CaptureFrame's, goes to `done` on a thread of its
+    // own once the GPU has drawn it; nothing waits for the copy. Empty if
+    // the frame is never drawn (replaced by a newer one before the main
+    // thread took it), or there is no window or readable swapchain.
+    void CaptureNextFrame(std::function<void(CapturedFrame)> done);
 
     // SteamOS Game Mode (gamescope) and iOS: the window is always fullscreen
     // there.

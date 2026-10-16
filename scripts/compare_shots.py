@@ -41,6 +41,13 @@ another frame's) is compared anyway, with a warning.
 picture darkened, the pixels off by more than the threshold in magenta, the
 others that changed in green (brighter the more they changed).
 
+--shown compares the pictures as the window showed them instead
+(shot-<step>-shown.ppm, NFSMW_BENCH_SHOTS_SHOWN=1: after the presenter's
+anti-aliasing and upscaling, at the window's size): the way to compare runs
+at different internal resolutions (0.75x with FSR 1 against 1x), whose
+front images differ in size. Each run's "shown_status" is checked as
+"status" is.
+
 Exit: 0 every shot within the tolerance, 1 a shot beyond it, 2 the runs
 can't be compared (a picture missing from one run, other sizes, other
 swaps, a file that isn't a binary PPM).
@@ -62,6 +69,7 @@ PRESETS = {
     "exact": (0, 0.0, 0.0),       # identical pictures only
 }
 SHOT_NAME = re.compile(r"^shot-(\d+)\.ppm$")
+SHOWN_NAME = re.compile(r"^shot-(\d+)-shown\.ppm$")  # --shown
 DARKEN = bytes(v >> 2 for v in range(256))  # a diff picture's background: run A at a quarter
 
 
@@ -108,11 +116,11 @@ def run_folder(path):
     return os.path.dirname(os.path.abspath(path)) if os.path.isfile(path) else path
 
 
-def shots_in(folder):
-    """{step: path} of a run's shot-<step>.ppm files."""
+def shots_in(folder, shown=False):
+    """{step: path} of a run's shot-<step>.ppm files (shot-<step>-shown.ppm: --shown)."""
     found = {}
     for path in glob.glob(os.path.join(glob.escape(folder), "shot-*.ppm")):
-        m = SHOT_NAME.match(os.path.basename(path))
+        m = (SHOWN_NAME if shown else SHOT_NAME).match(os.path.basename(path))
         if m:
             found[int(m.group(1))] = path
     return found
@@ -210,6 +218,8 @@ def main(argv):
     parser.add_argument("--exact", action="store_true", help="identical pictures only: --threshold 0 --tolerance 0 --min-psnr 0")
     parser.add_argument("--diff", metavar="DIR", help="write diff-<step>.ppm there for each shot that differs")
     parser.add_argument("--json", metavar="PATH", help="also write the results there as JSON")
+    parser.add_argument("--shown", action="store_true",
+                        help="the pictures as the window showed them (shot-<step>-shown.ppm, NFSMW_BENCH_SHOTS_SHOWN=1)")
     args = parser.parse_args(argv)
     preset = "exact" if args.exact else "strict" if args.strict else "default"
     threshold, tolerance, min_psnr = PRESETS[preset]
@@ -219,11 +229,12 @@ def main(argv):
 
     folders = [run_folder(args.a), run_folder(args.b)]
     problems, warnings, results = [], [], []
-    found = [shots_in(f) for f in folders]
+    found = [shots_in(f, args.shown) for f in folders]
     meta = [summary_shots(f) for f in folders]
     steps = sorted(set(found[0]) | set(found[1]))
     if not steps:
-        problems.append(f"no shot-<step>.ppm in {folders[0]} or {folders[1]} (NFSMW_BENCH_SHOTS)")
+        problems.append(f"no shot-<step>-shown.ppm in {folders[0]} or {folders[1]} (NFSMW_BENCH_SHOTS_SHOWN=1)" if args.shown
+                        else f"no shot-<step>.ppm in {folders[0]} or {folders[1]} (NFSMW_BENCH_SHOTS)")
     for step in steps:
         missing = [side for side, f in zip("AB", found) if step not in f]
         if missing:
@@ -238,6 +249,10 @@ def main(argv):
             status = m.get(step, {}).get("status")
             if status and status != "ok":
                 warnings.append(f"shot {step}: run {side} says {status}" + (f" ({m[step]['why']})" if m[step].get("why") else ""))
+            shown = m.get(step, {}).get("shown_status")
+            if args.shown and shown and shown != "ok":
+                warnings.append(f"shot {step}: run {side}'s picture as shown says {shown}" +
+                                (f" ({m[step]['shown_why']})" if m[step].get("shown_why") else ""))
         try:
             wa, ha, pa = read_ppm(found[0][step])
             wb, hb, pb = read_ppm(found[1][step])

@@ -159,6 +159,7 @@ namespace bench
             std::string label;
             std::filesystem::path out;  // empty: the default under the logs
             std::vector<int64_t> shots; // NFSMW_BENCH_SHOTS, ascending
+            bool shotsShown = false;    // NFSMW_BENCH_SHOTS_SHOWN=1: each also as the window shows it
         };
 
         bool ParseInt(const char* text, int64_t& value)
@@ -209,6 +210,8 @@ namespace bench
                 if (!bad.empty())
                     fprintf(stderr, "[bench] NFSMW_BENCH_SHOTS: %s isn't a step count: left out\n", bad.c_str());
             }
+            if (const char* v = std::getenv("NFSMW_BENCH_SHOTS_SHOWN"))
+                c.shotsShown = v[0] == '1';
             return c;
         }
 
@@ -365,6 +368,12 @@ namespace bench
             bool ahead = false;        // the game had already made `swap` when it was named: the model failed
             State state = State::Waiting;
             std::string why;           // Failed: why
+            // NFSMW_BENCH_SHOTS_SHOWN: the frame as the window shows it
+            // (shot-<step>-shown.ppm), asked for before its swap (Copying:
+            // the presenter has it; Waiting: never asked).
+            State shown = State::Waiting;
+            uint32_t shownWidth = 0, shownHeight = 0;
+            std::string shownWhy;
         };
         std::mutex s_shotMutex;
         std::condition_variable s_shotChanged;  // a shot was written or failed
@@ -541,10 +550,47 @@ namespace bench
             s_shotChanged.notify_all();
         }
 
+        // NFSMW_BENCH_SHOTS_SHOWN: shot i's frame as the window showed it,
+        // from a presenter's thread (video::CaptureNextFrame), into
+        // shot-<step>-shown.ppm, or why not.
+        void WriteShown(size_t i, const video::CapturedFrame& frame)
+        {
+            int64_t step;
+            {
+                std::lock_guard lock(s_shotMutex);
+                step = s_shots[i].step;
+            }
+            std::string failed;
+            const std::filesystem::path path = s_outDir / shots::ShownFileName(step);
+            if (frame.rgb.empty() || frame.rgb.size() != size_t(frame.width) * frame.height * 3)
+                failed = "the presenter didn't draw its frame (replaced by a newer one before it was taken) or can't read its swapchain back";
+            else
+            {
+                std::error_code ec;
+                std::filesystem::create_directories(s_outDir, ec);
+                const std::string ppm = shots::PpmRgb(frame.rgb.data(), frame.width, frame.height);
+                failed = ec ? std::format("can't create {}: {}", s_outDir.string(), ec.message()) : vfs::WriteAtomically(path, ppm.data(), ppm.size());
+            }
+            {
+                std::lock_guard lock(s_shotMutex);
+                Shot& shot = s_shots[i];
+                shot.shown = failed.empty() ? Shot::State::Written : Shot::State::Failed;
+                shot.shownWidth = frame.width;
+                shot.shownHeight = frame.height;
+                shot.shownWhy = failed;
+                if (failed.empty())
+                    fprintf(stderr, "[bench] shot %lld as shown: %s (%ux%u)\n", (long long)step, path.c_str(), frame.width, frame.height);
+                else
+                    fprintf(stderr, "[bench] shot %lld as shown: %s\n", (long long)step, failed.c_str());
+            }
+            s_shotChanged.notify_all();
+        }
+
         // The report thread: waits (10 s at most) for every named shot to be
         // written or failed, so the report says what is on disk. The game
         // goes on meanwhile: a shot named in the window's last frames has its
-        // swap a few frames later.
+        // swap a few frames later. (And the shots as shown, which the
+        // presenter takes a frame or two after the swap.)
         void WaitForShots()
         {
             if (s_shots.empty())
@@ -552,7 +598,7 @@ namespace bench
             std::unique_lock lock(s_shotMutex);
             bool done = s_shotChanged.wait_for(lock, std::chrono::seconds(10), [] {
                 for (const Shot& shot : s_shots)
-                    if (shot.state == Shot::State::Queued || shot.state == Shot::State::Copying)
+                    if (shot.state == Shot::State::Queued || shot.state == Shot::State::Copying || shot.shown == Shot::State::Copying)
                         return false;
                 return true;
             });
@@ -733,6 +779,16 @@ namespace bench
                     json.Field("ahead", true);
                 if (!shot.why.empty())
                     json.Field("why", shot.why);
+                // NFSMW_BENCH_SHOTS_SHOWN: the same frame as the window showed it.
+                if (shot.shown != Shot::State::Waiting)
+                {
+                    json.Field("shown_status", shot.shown == Shot::State::Written ? "ok" : shot.shown == Shot::State::Failed ? "failed" : "pending");
+                    if (shot.shown == Shot::State::Written)
+                        json.Field("shown_file", shots::ShownFileName(shot.step)).Field("shown_width", shot.shownWidth)
+                            .Field("shown_height", shot.shownHeight);
+                    if (!shot.shownWhy.empty())
+                        json.Field("shown_why", shot.shownWhy);
+                }
                 json.End();
             }
             json.End().End();
@@ -1243,6 +1299,26 @@ namespace bench
             return;
         }
         renderer::ReadBackFrontImage([due](const uint8_t* rgba, uint32_t width, uint32_t height) { WriteShots(due, rgba, width, height); });
+    }
+
+    void BeforeShotSwap(uint64_t swap)
+    {
+        if (!GetConfig().shotsShown)
+            return;
+        // Asked for outside the lock: without a window the presenter answers
+        // at once, and WriteShown takes it.
+        std::vector<size_t> due;
+        {
+            std::lock_guard lock(s_shotMutex);
+            for (size_t i : s_shotQueue)
+                if (Shot& shot = s_shots[i]; shot.swap == swap && shot.shown == Shot::State::Waiting)
+                {
+                    shot.shown = Shot::State::Copying;
+                    due.push_back(i);
+                }
+        }
+        for (size_t i : due)
+            video::CaptureNextFrame([i](video::CapturedFrame frame) { WriteShown(i, frame); });
     }
 
     void OnSwap()

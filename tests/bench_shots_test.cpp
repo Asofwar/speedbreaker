@@ -133,6 +133,16 @@ namespace
         // A 1280x720 frame: 2764800 bytes of pixels after the header.
         std::vector<uint8_t> frame(size_t(1280) * 720 * 4, 0x80);
         CHECK(Ppm(frame.data(), 1280, 720, 1280 * 4).size() == strlen("P6\n1280 720\n255\n") + 2764800, "1280x720");
+
+        // The frame as shown (NFSMW_BENCH_SHOTS_SHOWN): its own file, RGB
+        // packed as it comes, header and all.
+        CHECK(ShownFileName(1600) == "shot-1600-shown.ppm", "%s", ShownFileName(1600).c_str());
+        CHECK(ShownFileName(0) != FileName(0), "the two files apart");
+        std::string shown = PpmRgb(pixels, 3, 2);
+        CHECK(shown.size() == strlen(header) + 18 && shown.compare(0, strlen(header), header) == 0 &&
+            memcmp(shown.data() + strlen(header), pixels, 18) == 0, "shown: %zu bytes", shown.size());
+        std::vector<uint8_t> deck(size_t(1280) * 800 * 3, 0x40);
+        CHECK(PpmRgb(deck.data(), 1280, 800).size() == strlen("P6\n1280 800\n255\n") + 3072000, "1280x800");
     }
 }
 

@@ -564,6 +564,10 @@ namespace gpu
                 // Presented from the GPU without waiting; frame dumps (and the
                 // headless case) take the CPU path, which needs the GPU idle.
                 static const bool dumping = std::getenv("NFSMW_DUMP_FRAMES") != nullptr;
+                // A timedemo shot's swap (NFSMW_BENCH_SHOTS_SHOWN): the
+                // presenter is asked for the frame as shown before it gets it.
+                if (uint64_t shot = bench::g_shotSwap.load(std::memory_order_relaxed); shot && s_frames + 1 >= shot) [[unlikely]]
+                    bench::BeforeShotSwap(s_frames + 1);
                 const bool gpuFront = !dumping && renderer::PresentFrontBuffer(&s_regs[0x4800], width, height);
                 if (!gpuFront)
                 {
