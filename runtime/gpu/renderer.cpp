@@ -9,6 +9,7 @@
 #include <debug/timeline.h>
 #include <unordered_set>
 #include "block_ranges.h"
+#include "cp_doorbell.h"
 #include "draw_state.h"
 #include "edge_bars.h"
 #include "front_ring.h"
@@ -1083,6 +1084,7 @@ namespace gpu::renderer
                         video::DeviceLost("vkGetFenceStatus (the renderer's completion thread)");
                     bool finished = status == VK_SUCCESS;
                     bool watching = false;
+                    const size_t written = done;
                     {
                         std::lock_guard lock(s_submitMutex);
                         while (!finished && done < sub.writes.size() && sub.writes[done].event &&
@@ -1090,6 +1092,10 @@ namespace gpu::renderer
                             { timeline::Mark(timeline::WriteByEvent); RunWrite(sub.writes[done++], 0); }
                         watching = done < sub.writes.size() && sub.writes[done].event;
                     }
+                    // A fence the command processor's WAIT_REG_MEM sleeps on
+                    // may be among them (gpu/cp_doorbell.h).
+                    if (done != written)
+                        g_cpDoorbell.Ring();
                     if (finished)
                         break;
                     if (watching)
@@ -1196,6 +1202,10 @@ namespace gpu::renderer
                     sub.inFlight = false;
                 }
                 s_submitCv.notify_all();
+                // The queue is shallower: an idle command processor submits
+                // what it has recorded (SubmitIfDue), and a WAIT_REG_MEM may
+                // pass on the writes just stored. Wake it if it sleeps.
+                g_cpDoorbell.Ring();
             }
         }
 
@@ -10006,6 +10016,11 @@ void main()
             SubmitRecorded(3);
     }
 
+    namespace
+    {
+        const int64_t s_submitAgeUs = [] { const char* v = std::getenv("NFSMW_SUBMIT_AGE_US"); return v ? int64_t(std::atoll(v)) : 2000; }();
+    }
+
     void SubmitIfDue()
     {
         // With fences published mid-buffer (events), batching more work per
@@ -10014,7 +10029,7 @@ void main()
         // queue is shallow, or when the recording has aged.
         // Eager writes: nothing waits on the recording, so keep the GPU fed.
         static const uint32_t depth = [] { const char* v = std::getenv("NFSMW_SUBMIT_DEPTH"); return v ? uint32_t(std::atoi(v)) : g_eagerWrites ? 2u : 1u; }();
-        static const int64_t ageUs = [] { const char* v = std::getenv("NFSMW_SUBMIT_AGE_US"); return v ? int64_t(std::atoll(v)) : 2000; }();
+        const int64_t ageUs = s_submitAgeUs;
         if (!s_vk || !s_recording)
             return;
         if (!s_fenceEvents)
@@ -10029,6 +10044,14 @@ void main()
         }
         if (inFlight < depth || std::chrono::steady_clock::now() - s_recordStart > std::chrono::microseconds(ageUs))
             SubmitRecorded(4);
+    }
+
+    std::chrono::steady_clock::time_point SubmitDueAt()
+    {
+        // (Without fence events SubmitIfDue submits at once: nothing waits.)
+        if (!s_vk || !s_recording || !s_fenceEvents)
+            return std::chrono::steady_clock::time_point::max();
+        return s_recordStart + std::chrono::microseconds(s_submitAgeUs + 1);
     }
 
     void Flush()

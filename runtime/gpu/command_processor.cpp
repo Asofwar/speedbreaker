@@ -18,6 +18,7 @@
 #include "renderer.h"
 #include "gpu_clock.h"
 #include "zpd_report.h"
+#include "cp_doorbell.h"
 #include <kernel/write_watch.h>
 #include <debug/timeline.h>
 #include <debug/bench.h>
@@ -175,6 +176,65 @@ namespace gpu
         std::unordered_map<uint32_t, PendingStore> s_pendingStores;  // by physical address
         uint64_t s_pendingSequence = 0;
         const bool s_selfWaits = [] { const char* v = std::getenv("NFSMW_SELF_WAITS"); return !v || v[0] != '0'; }();
+
+        // How this thread waits with nothing to do (gpu/cp_doorbell.h): it
+        // spins on yield() for a while, then sleeps on its doorbell, which
+        // whatever can end the wait rings. NFSMW_CP_DOORBELL=0 polls instead,
+        // as before: yields for 2 ms, then 100 us sleeps (and so does every
+        // platform but Linux).
+        const bool s_doorbell = [] {
+            const char* v = std::getenv("NFSMW_CP_DOORBELL");
+            return Doorbell::kBlocking && (!v || v[0] != '0');
+        }();
+        // Between batches the idle loop spins for 2 ms, as it did: the
+        // game's next kick mostly comes within 300 us, and the longer gaps
+        // are the frames whose game thread is late. A sleep there puts a
+        // wake-up and a cold core (see cp_doorbell.h) in front of the
+        // batches of frames that are slow already: sleeping after 500 us
+        // instead, the uncapped race's 1% low on the Steam Deck came out 3%
+        // lower (the same binary, the doorbell off and on). At 60 fps the
+        // idle loop takes ~0.1 ms of a frame: little to save. Only a longer
+        // idle (loading, menus, a paused game) sleeps. A WAIT_REG_MEM is
+        // mostly the wait for the vblank, 5-10 ms of a 60 fps frame, which
+        // only the vblank ends: it spins just long enough for a release
+        // already on its way.
+        constexpr auto kIdleSpin = std::chrono::milliseconds(2);
+        constexpr auto kRegMemSpin = std::chrono::microseconds(20);
+        // The safety net, for a store that nothing rings for: an idle sleep
+        // lasts at most 2 ms (and never past the recording's submit by age,
+        // renderer::SubmitDueAt); a WAIT_REG_MEM looks again after 100 us,
+        // then twice as long each time, up to every 1 ms.
+        constexpr auto kIdleSleepMax = std::chrono::milliseconds(2);
+        constexpr auto kRegMemSleepFirst = std::chrono::microseconds(100);
+        constexpr auto kRegMemSleepMax = std::chrono::milliseconds(1);
+
+        // NFSMW_LOG_CP_IDLE=1 (a diagnostic): every 600 swaps, how the
+        // doorbell's sleeps ended. "Not rung" counts the work or the passed
+        // wait that a timeout found with no ring since the sleep began: a
+        // store the doorbell misses, which only the safety net catches.
+        struct IdleStats
+        {
+            uint64_t idleSleeps = 0, idleRung = 0, idleNotRung = 0;
+            uint64_t regmemSleeps = 0, regmemRung = 0, regmemNotRung = 0;
+        };
+        IdleStats s_idleStats;  // this thread's
+        const bool s_logIdle = [] { const char* v = std::getenv("NFSMW_LOG_CP_IDLE"); return v && v[0] == '1'; }();
+        // The rings when the idle loop's last sleep timed out (none: it was
+        // rung, or found work before sleeping).
+        std::optional<uint32_t> s_idleTimedOutAt;
+
+        void LogIdle(uint64_t frame)
+        {
+            static IdleStats last;
+            const IdleStats& s = s_idleStats;
+            fprintf(stderr, "[gpu] doorbell, 600 swaps to swap %llu: idle sleeps %llu (%llu rung, %llu found work not rung), "
+                "WAIT_REG_MEM sleeps %llu (%llu rung, %llu passed not rung)%s\n", (unsigned long long)frame,
+                (unsigned long long)(s.idleSleeps - last.idleSleeps), (unsigned long long)(s.idleRung - last.idleRung),
+                (unsigned long long)(s.idleNotRung - last.idleNotRung), (unsigned long long)(s.regmemSleeps - last.regmemSleeps),
+                (unsigned long long)(s.regmemRung - last.regmemRung), (unsigned long long)(s.regmemNotRung - last.regmemNotRung),
+                s_doorbell ? "" : " (doorbell off: polling)");
+            last = s;
+        }
 
         uint64_t AddPending(uint32_t address, uint32_t value)
         {
@@ -487,6 +547,9 @@ namespace gpu
                     for (uint32_t n = 0; n < 6; n++)
                         if (cpuMask & (1u << n))
                             DispatchInterrupt(*guest, 1, n);
+                    // From the completion thread, the handler's stores may end
+                    // a WAIT_REG_MEM this thread sleeps in.
+                    g_cpDoorbell.Ring();
                 });
                 return true;
             }
@@ -515,6 +578,8 @@ namespace gpu
                 if (uint64_t shot = bench::g_shotSwap.load(std::memory_order_relaxed); shot && frame >= shot) [[unlikely]]
                     bench::OnShotSwap(frame, gpuFront);
                 renderer::OnSwap(frame);
+                if (s_logIdle && frame % 600 == 0)
+                    LogIdle(frame);
                 // Every 120 frames: frame rate and per-frame costs since the last line.
                 // Frame times are guest time (guesttime::NowNs: the host's
                 // on desktop), so a frame across a suspension isn't a hitch
@@ -702,21 +767,34 @@ namespace gpu
                 if (memory && s_selfWaits && !report::g_testHang.load(std::memory_order_relaxed))
                     if (auto pending = PendingValue(poll); pending && compare(info, *pending & mask, ref))
                         return true;
-                while (true)
-                {
-                    uint32_t value = memory ? LoadSwapped(poll) : s_regs[poll % REGISTER_COUNT];
+                auto current = [&] {
                     if (!memory && poll == REG_COHER_STATUS_HOST)
                     {
                         s_regs[poll] = 0;  // MakeCoherent: nothing to flush in a null GPU
-                        value = 0;
+                        return 0u;
                     }
-                    if (compare(info, value & mask, ref) && !report::g_testHang.load(std::memory_order_relaxed))
+                    return memory ? LoadSwapped(poll) : s_regs[poll % REGISTER_COUNT];
+                };
+                auto passes = [&](uint32_t value) {
+                    return compare(info, value & mask, ref) && !report::g_testHang.load(std::memory_order_relaxed);
+                };
+                // The doorbell's sleeps (see below): the spin's start, the
+                // next timeout, and the rings when a sleep timed out.
+                auto spinFrom = waitStart;
+                auto nextSleep = std::chrono::nanoseconds(kRegMemSleepFirst);
+                std::optional<uint32_t> timedOutAt;
+                while (true)
+                {
+                    uint32_t value = current();
+                    if (passes(value))
                     {
                         if (submitted)
                         {
                             timeline::Mark(timeline::RegMemEnd, value);
                             s_waitSince.store(0, std::memory_order_relaxed);
                         }
+                        if (timedOutAt && g_cpDoorbell.Rings() == *timedOutAt)
+                            s_idleStats.regmemNotRung++;
                         break;
                     }
                     // Deferred fence writes may be what the CPU is waiting for
@@ -745,6 +823,7 @@ namespace gpu
                         }
                         renderer::Submit();
                         waitTimer.emplace(renderer::CP_WAIT_REGMEM);
+                        spinFrom = std::chrono::steady_clock::now();
                         continue;
                     }
                     if (guesttime::Suspended() || guesttime::Epoch() != waitEpoch)
@@ -762,6 +841,8 @@ namespace gpu
                         waitEpoch = guesttime::Epoch();
                         waitTimer.emplace(renderer::CP_WAIT_REGMEM);
                         waitStart = std::chrono::steady_clock::now();
+                        spinFrom = waitStart;
+                        nextSleep = kRegMemSleepFirst;
                         reported = false;
                         s_waitSince.store(std::chrono::duration_cast<std::chrono::nanoseconds>(
                             waitStart.time_since_epoch()).count(), std::memory_order_release);
@@ -776,13 +857,43 @@ namespace gpu
                     }
                     // The guest's wait interval is a hint for hardware polling;
                     // sleeping whole milliseconds per poll added a millisecond
-                    // or more to every wait. Spin with yields for 2 ms, then
-                    // back off to short sleeps.
+                    // or more to every wait. Spin with yields for a moment, then
+                    // sleep on the doorbell: the vblank handler's store that
+                    // ends the wait for the vblank rings it, so that wait ends
+                    // within a wake-up of the vblank instead of within a 100 us
+                    // sleep. Without the doorbell: yields for 2 ms, then short
+                    // sleeps.
                     (void)wait;
-                    if (std::chrono::steady_clock::now() - waitStart < std::chrono::milliseconds(2))
+                    if (!s_doorbell)
+                    {
+                        if (std::chrono::steady_clock::now() - waitStart < std::chrono::milliseconds(2))
+                            std::this_thread::yield();
+                        else
+                            std::this_thread::sleep_for(std::chrono::microseconds(100));
+                        continue;
+                    }
+                    if (std::chrono::steady_clock::now() - spinFrom < kRegMemSpin)
+                    {
                         std::this_thread::yield();
+                        continue;
+                    }
+                    // Announced first, then looked at again: a ring from here
+                    // on cuts the sleep short, and a store before it is seen.
+                    uint32_t rings = g_cpDoorbell.Prepare();
+                    if (passes(current()) || guesttime::Suspended())
+                    {
+                        g_cpDoorbell.Cancel();
+                        continue;
+                    }
+                    s_idleStats.regmemSleeps++;
+                    if (g_cpDoorbell.Wait(rings, nextSleep))
+                    {
+                        s_idleStats.regmemRung++;
+                        timedOutAt.reset();
+                    }
                     else
-                        std::this_thread::sleep_for(std::chrono::microseconds(100));
+                        timedOutAt = rings;
+                    nextSleep = std::min<std::chrono::nanoseconds>(nextSleep * 2, kRegMemSleepMax);
                 }
                 return true;
             }
@@ -1065,6 +1176,39 @@ namespace gpu
             }
         }
 
+        // New commands in the ring: the game's write pointer (polled in the
+        // MMIO page, see command_processor.h) has moved past what was read.
+        bool RingHasWork(uint32_t primary, uint32_t writeIndex)
+        {
+            return primary != 0 && writeIndex != s_readIndex && writeIndex * 4 < s_primarySize;
+        }
+
+        // The idle loop's sleep on the doorbell: until a ring (a kick, a
+        // completion, a guest thread waiting on recorded work), the
+        // recording's submit by age, or the safety net's kIdleSleepMax.
+        void SleepUntilRung()
+        {
+            // Announced first, then looked at again: a kick from here on
+            // cuts the sleep short, and one before it is seen here.
+            uint32_t rings = g_cpDoorbell.Prepare();
+            if (RingHasWork(s_primaryBuffer, *MmioRegister(REG_CP_RB_WPTR)) || writewatch::g_submitRequested.load() ||
+                guesttime::Suspended())
+            {
+                g_cpDoorbell.Cancel();
+                return;
+            }
+            auto now = std::chrono::steady_clock::now();
+            auto until = std::min(now + kIdleSleepMax, renderer::SubmitDueAt());
+            s_idleStats.idleSleeps++;
+            if (g_cpDoorbell.Wait(rings, std::max<std::chrono::nanoseconds>(until - now, std::chrono::microseconds(20))))
+            {
+                s_idleStats.idleRung++;
+                s_idleTimedOutAt.reset();
+            }
+            else
+                s_idleTimedOutAt = rings;
+        }
+
         void Worker()
         {
 #ifdef __APPLE__
@@ -1088,11 +1232,12 @@ namespace gpu
             {
                 uint32_t primary = s_primaryBuffer;
                 uint32_t writeIndex = *MmioRegister(REG_CP_RB_WPTR);
-                if (primary == 0 || writeIndex == s_readIndex || writeIndex * 4 >= s_primarySize)
+                if (!RingHasWork(primary, writeIndex))
                 {
                     // Kicks come in bursts and the game often waits on their
                     // results: poll with yields for 2 ms after the last work,
-                    // then back off to short sleeps.
+                    // then sleep until the doorbell rings (without it, back
+                    // off to short sleeps).
                     // No new commands: whatever is recorded goes out now (the
                     // game may be waiting on a fence in it).
                     if (writewatch::g_submitRequested.exchange(false))
@@ -1106,12 +1251,17 @@ namespace gpu
                         lastWork = std::chrono::steady_clock::now();
                         continue;
                     }
-                    if (std::chrono::steady_clock::now() - lastWork < std::chrono::milliseconds(2))
+                    if (std::chrono::steady_clock::now() - lastWork < kIdleSpin)
                         std::this_thread::yield();
+                    else if (s_doorbell)
+                        SleepUntilRung();
                     else
                         std::this_thread::sleep_for(std::chrono::microseconds(100));
                     continue;
                 }
+                if (s_idleTimedOutAt && g_cpDoorbell.Rings() == *s_idleTimedOutAt)
+                    s_idleStats.idleNotRung++;
+                s_idleTimedOutAt.reset();
                 s_regs[REG_CP_RB_WPTR] = writeIndex;
                 Reader r{ Physical(primary), s_primarySize, s_readIndex * 4, writeIndex * 4 };
                 timeline::Mark(timeline::BatchBegin, (writeIndex - s_readIndex) & (s_primarySize / 4 - 1));
@@ -1213,6 +1363,10 @@ namespace gpu
                 s_counter++;
                 s_vblanks++;
                 DispatchInterrupt(thread.ppcContext, 0, 2);
+                // The game's handler clears D3D's presentation flag when the
+                // swap's vblank has come, which ends the command processor's
+                // WAIT_REG_MEM on it: wake it (gpu/cp_doorbell.h).
+                g_cpDoorbell.Ring();
                 timing.Add(fired - next, now() - fired);
                 auto status = clock.GetStatus();
                 if (status.locked != locked || status.slips != slips || ++count % 3600 == 0)
@@ -1246,6 +1400,7 @@ namespace gpu
         s_primaryBuffer = guestAddress & 0x1FFFFFFF;
         fprintf(stderr, "[gpu] ring buffer %08X, %u bytes\n", guestAddress, s_primarySize);
         StartOnce();
+        g_cpDoorbell.Ring();
     }
 
     void EnableReadPointerWriteBack(uint32_t guestAddress, uint32_t blockSizeLog2)
@@ -1293,4 +1448,27 @@ namespace gpu
         text += FormatHistory();
         return text;
     }
+}
+
+// The game's ring kicks. D3D stores the ring's new write pointer to
+// CP_RB_WPTR (0x7FC80714) in two functions, the recompiled code's only
+// stores to that address by name: sub_82596A00 sets it (with the device's
+// own copy), and sub_82596A20 appends indirect-buffer packets, sets it, then
+// calls the device's PIX hooks when it has any. After either the command
+// processor has new work: wake it if it sleeps (gpu/cp_doorbell.h). A kick
+// made some other way (D3D's register writes by index could reach it) is
+// still found, by the idle sleep's timeout; NFSMW_LOG_CP_IDLE=1 counts any
+// as "found work not rung".
+extern "C" PPC_FUNC(__imp__sub_82596A00);
+PPC_FUNC(sub_82596A00)
+{
+    __imp__sub_82596A00(ctx, base);
+    gpu::g_cpDoorbell.Ring();
+}
+
+extern "C" PPC_FUNC(__imp__sub_82596A20);
+PPC_FUNC(sub_82596A20)
+{
+    __imp__sub_82596A20(ctx, base);
+    gpu::g_cpDoorbell.Ring();
 }

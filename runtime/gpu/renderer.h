@@ -50,6 +50,10 @@ namespace gpu::renderer
     // Idle command processor: submit if the GPU queue is shallow or the
     // recording has aged (NFSMW_SUBMIT_DEPTH, NFSMW_SUBMIT_AGE_US).
     void SubmitIfDue();
+    // Command processor: when SubmitIfDue will submit the recording by its
+    // age alone (time_point::max(): nothing recorded). The other reason, a
+    // shallow queue, comes with a completion, which rings its doorbell.
+    std::chrono::steady_clock::time_point SubmitDueAt();
 
     // Submit recorded work and wait until the GPU has finished everything.
     void Flush();

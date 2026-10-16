@@ -92,6 +92,13 @@ sb_test(gpu_front_ring_test ARGS ${RT}/gpu/renderer.cpp ${RT}/video/presenter.cp
 # failed acquire never wrote); planted v0.1.4 lines must be caught.
 # renderer.cpp and presenter.cpp are read.
 sb_test(gpu_device_lost_test ARGS ${RT}/gpu/renderer.cpp ${RT}/video/presenter.cpp)
+# The command processor's doorbell (gpu/cp_doorbell.h, header only): a
+# waiter that announces itself, looks again and sleeps never misses a ring
+# (a stress run of hand-overs with a long timeout); command_processor.cpp,
+# renderer.cpp and write_watch.cpp are read to check they ring it where its
+# waits end (the vblank handler, the game's ring kicks, a completion, a
+# guest thread asking for a submit).
+sb_test(gpu_cp_doorbell_test ARGS ${RT}/gpu/command_processor.cpp ${RT}/gpu/renderer.cpp ${RT}/kernel/write_watch.cpp)
 # A saved pipeline cache from another GPU, driver or OS version, and the log
 # line that says so (gpu/pipeline_cache_header.h, header only).
 sb_test(pipeline_cache_header_test)
