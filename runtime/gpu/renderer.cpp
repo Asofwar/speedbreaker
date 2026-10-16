@@ -6698,6 +6698,12 @@ void main()
             RenderTarget* color = s_mv.color;
             RenderTarget* depth = s_mv.depth;
             const uint32_t outW = color->scale.x.Size(1280), outH = color->scale.y.Size(720);
+            if (color->width < outW || color->height < outH || depth->width < outW || depth->height < outH)
+            {
+                LogOnce(0x4D57, "[mv] scene targets smaller than %ux%u (colour %ux%u, depth %ux%u): no upscaler", outW, outH,
+                    color->width, color->height, depth->width, depth->height);
+                return;
+            }
             if (!s_mv.pipeline)
             {
                 VkSamplerCreateInfo sci{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
@@ -8667,7 +8673,10 @@ void main()
         // off a draw may mean to reach past its viewport: it keeps its pass.
         uint32_t adoptedColor = 0;  // colour targets attached for the pass only
         bool adoptedDepth = false;
-        if ((s_passMerge & 2) && s_passActive && (!depth || depth == s_passDepth))
+        // NFSMW_MV: a scene draw (decided on its own targets, before the
+        // merge: it attaches the velocity target itself, below).
+        const bool mvScene = s_mv.on && MvSceneDraw(edramMode, color, depth, false);
+        if (!mvScene && (s_passMerge & 2) && s_passActive && (!depth || depth == s_passDepth))
         {
             bool subset = true, same = depth == s_passDepth;
             for (int i = 0; i < 4; i++)
@@ -8722,8 +8731,11 @@ void main()
             }
         }
         // NFSMW_MV: a scene draw gets the velocity target as attachment 3,
-        // written unless it blends (gpu/motion_vectors.h).
-        const bool mvScene = s_mv.on && MvSceneDraw(edramMode, color, depth, adoptedColor || adoptedDepth);
+        // written unless it blends (gpu/motion_vectors.h). Any other draw
+        // into the scene's targets before its resolve (the sun's glow: colour
+        // only; depth-only draws) is drawn at the scene's size and jitter too.
+        const bool mvInScene = mvScene || (s_mv.on && s_mv.frame == s_frame && s_mv.draws && !s_mv.done &&
+            ((color[0] && color[0] == s_mv.color) || (depth && depth == s_mv.depth)));
         if (mvScene)
         {
             color[3] = &s_mv.velocity;
@@ -9491,7 +9503,7 @@ void main()
             VertexBarrierIfNeeded(layout.vsMasks, pc.indexAddress, pc.indexAddress ? count << (src.is32 ? 2 : 1) : 0);
         // NFSMW_MV_SCALE: the scene drawn into the top left of its targets
         // at that fraction (below, posScale), its scissor too.
-        if (mvScene && s_mv.scale != 1.0f)
+        if (mvInScene && s_mv.scale != 1.0f)
         {
             const float s = s_mv.scale;
             const int32_t sx0 = int32_t(std::floor(float(scissor.offset.x) * s)), sy0 = int32_t(std::floor(float(scissor.offset.y) * s));
@@ -9517,7 +9529,7 @@ void main()
         // corner (NDC' = (NDC + 1) s - 1) and shifted by the frame's jitter,
         // in host pixels of the target (render pixels); the motion vectors
         // are made from the positions before this.
-        if (mvScene)
+        if (mvInScene)
         {
             const float s = s_mv.scale;
             pc.posScale[0] *= s;
