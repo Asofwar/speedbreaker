@@ -384,13 +384,35 @@ Notes:
 - A profile from older code still works: the compiler leaves out the
   functions that changed since (a warning a file), so train again after
   large changes.
-- The default race's replay sometimes goes out of step where its intro
-  hands over to the race (`DIVERGENCE kind=checksum loop=4416 step=1520`),
-  most often with ThinLTO: in 8 of 22 runs of ThinLTO builds (7 of 17 with
-  PGO), 1 of 27 of the PGO builds without it, none of 37 of the usual build.
-  The diverged runs replayed the same frames up to there, so it is the
-  replay's timing, not what the code computes. Replay a diverged run again,
-  and give such builds more runs.
+- Until the stream hold ([Audio streams](#audio-streams)), the default
+  race's replay sometimes went out of step where its intro hands over to the
+  race (`DIVERGENCE kind=checksum loop=4416 step=1520`, or `loop=4415`), most
+  often with ThinLTO: in 8 of 22 runs of ThinLTO builds (7 of 17 with PGO),
+  1 of 27 of the PGO builds without it, none of 37 of the usual build. That
+  was the replay's timing, not what the code computes: a faster build moved
+  the frame in which the race's intro stream had its data.
+
+## Audio streams
+
+The Joylog holds what the game loads and when, but not its audio streams
+(speech, music, a race's intro track): the stream player reads them on
+threads of its own, as fast as the files come, and the game's code asks how
+much of a stream is in (`sub_821C8AD8`). A race's start waits on that: the
+default race starts its intro stream at loop 4412, waits for its first data,
+then starts the race, and its cars move two frames later. The frame in which
+the read had landed decided the frame the race started: in its capture
+4414, in a replay a frame either side now and then (the read landing during
+the 120 ms frame after the intro movie, or not), which the checksum caught
+at loop 4415 or 4416, the cars already moving or not yet.
+
+So in a timedemo, capture and replay alike, the game's main thread sees a
+stream it started without data for exactly two frames, then with it: data
+that came sooner waits, and data still on its way is waited for (3 s at
+most). The stream player's own threads see their streams as they are. Each
+stream leaves a line, e.g. `[timedemo] stream 2: started at loop 4412, its
+data at loop 4414 (2569 ms in; waited 0.0 ms)`; a wait above a few ms
+there is a slow read, and counts in that frame's time like any wait. Only a
+timedemo holds streams.
 
 ## Switches
 
@@ -496,6 +518,10 @@ In the run's folder (`NFSMW_BENCH_OUT`):
   and the game waits for them inside its frames. That time is `wait_ms`, kept
   apart from render time: if it grows, the run is limited by streaming, not
   by rendering.
+- **Audio streams** are held for two frames (see [Audio streams](#audio-streams)):
+  a capture made before the hold replays as long as each stream its game
+  logic waits on had its data two frames after it started (the default race
+  did).
 - **A crash while recording** loses up to the last 10 seconds of the log.
 - Timedemo runs keep a 1 MB log buffer in the game's memory: compare them
   with each other, not with normal play.
