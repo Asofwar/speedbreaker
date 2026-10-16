@@ -141,7 +141,11 @@ For good numbers:
   driving: for the race captured with the default input script, the intro
   ends about 1520 world steps after the race loads (`NFSMW_BENCH_FROM=1530`).
 - **`--warmup`** once per build before measuring: the first run after a new
-  build compiles shaders (the pipeline cache) and loads files cold. Its report
+  build compiles shaders (the pipeline cache) and loads files cold. It also
+  leaves the list of the pipelines it drew with (`pipeline_keys.bin`, beside
+  the pipeline cache), and every later run makes those while the game starts,
+  so a measured run creates none in the window (`pipelines.created` 0; without
+  the list, the default race created 19 while driving, every run). Its report
   goes to `~/sb-bench/runs/warmup/<label>/` and isn't compared.
 - **A and B in turns** (ABAB...), at least three each: a Steam Deck warms up
   and clocks down over consecutive runs, which would favour whichever side ran
@@ -185,10 +189,11 @@ Steam Deck's `python3` does).
    stops with an error naming the key and which runs have which value (exit
    2). `--allow mode.vsync` (any key) accepts a difference that is the point
    of the comparison; `--force` compares anyway. Warnings, not errors:
-   pipelines created or draws skipped in the window (a cold pipeline cache:
-   use `--warmup`), runs capped at the vblank, differing `NFSMW_*`
-   environment (often exactly what A and B compare), sound and pad settings,
-   systems, builds within one side, a display at another refresh rate.
+   pipelines created or draws skipped in the window (a cold pipeline cache,
+   or no pipeline key list yet: use `--warmup`), runs capped at the vblank,
+   differing `NFSMW_*` environment (often exactly what A and B compare), sound
+   and pad settings, systems, builds within one side, a display at another
+   refresh rate.
 2. **The table.** For each metric (timedemo fps, avg fps, 1% low, frame time
    p50/p95/p99/max, CP and GPU busy, waits for loading, hitches), the median
    and min..max of each side's runs and the change of the medians. The

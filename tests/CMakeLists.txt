@@ -95,6 +95,12 @@ sb_test(gpu_device_lost_test ARGS ${RT}/gpu/renderer.cpp ${RT}/video/presenter.c
 # A saved pipeline cache from another GPU, driver or OS version, and the log
 # line that says so (gpu/pipeline_cache_header.h, header only).
 sb_test(pipeline_cache_header_test)
+# The pipeline key list the renderer makes pipelines ahead from: its file
+# read back, or set aside when another build's, another GPU's, cut short or
+# corrupt, and the most recently used keys kept past its cap
+# (gpu/pipeline_keys.h, header only); renderer.cpp is read to check it notes
+# every pipeline it draws with and prewarms only what its Draw would make.
+sb_test(pipeline_keys_test ARGS ${RT}/gpu/renderer.cpp)
 sb_test(picture_fit_test SOURCES ${RT}/video/picture_fit.cpp)
 # Which Vulkan device the presenter draws with, and its log line
 # (video/gpu_choice.h, header only).

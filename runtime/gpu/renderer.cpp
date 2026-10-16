@@ -14,6 +14,7 @@
 #include "front_ring.h"
 #include "memory_plan.h"
 #include "pipeline_cache_header.h"
+#include "pipeline_keys.h"
 #include "shader_translator.h"
 #include "zpd_report.h"
 #include "depth24_glsl.h"
@@ -1441,6 +1442,10 @@ namespace gpu::renderer
             ShaderStage stage;
             uint64_t hash;
             TranslatedShader info;         // immutable once loaded
+            // The guest's words it was made from (guest order; none for the
+            // depth-only one): the pipeline key list keeps them, to make it
+            // again in a later session (gpu/pipeline_keys.h).
+            std::vector<uint32_t> words;
             std::mutex compileMutex;
             bool vertexCompiled = false;
             VkShaderModule module = VK_NULL_HANDLE;  // VS
@@ -1471,6 +1476,28 @@ namespace gpu::renderer
                 return slot.get();
             }();
             return ps;
+        }
+
+        // A guest shader made from its words (guest order) and kept in
+        // s_shaders under `hash` (pipeline_keys::ShaderHash of them): for
+        // LoadShader, and for the pipeline prewarm from the key list's words
+        // (the same words translate to the same shader).
+        Shader* MakeShader(uint32_t type, uint64_t hash, const uint32_t* words, uint32_t dwords)
+        {
+            auto& slot = s_shaders[hash];
+            slot = std::make_unique<Shader>();
+            slot->stage = type == 0 ? ShaderStage::Vertex : ShaderStage::Pixel;
+            slot->hash = hash;
+            slot->words.assign(words, words + dwords);
+            std::vector<uint32_t> ucode(dwords);
+            for (uint32_t i = 0; i < dwords; i++)
+                ucode[i] = __builtin_bswap32(words[i]);
+            slot->info = TranslateShader(slot->stage, ucode.data(), dwords);
+            if (!slot->info.ok)
+                fprintf(stderr, "[renderer] %s_%016llx: translation failed: %s\n", type == 0 ? "vs" : "ps",
+                    (unsigned long long)hash, slot->info.error.c_str());
+            // Compiled to SPIR-V with its first pipeline, on a pipeline worker.
+            return slot.get();
         }
 
         // IM_LOAD shaders by where they are (LoadShader). A dense frame loads
@@ -2582,6 +2609,12 @@ namespace gpu::renderer
             bool operator==(const PipelineKey& o) const { return memcmp(this, &o, sizeof(*this)) == 0; }
         };
         static_assert(sizeof(PipelineKey) == 80);
+        // The pipeline key list saves keys as their bytes, its shaders' hashes
+        // first (gpu/pipeline_keys.h): bump pipeline_keys::kFormat when a
+        // field here changes its place or meaning, so older lists are set
+        // aside instead of misread.
+        static_assert(sizeof(PipelineKey) == gpu::pipeline_keys::kKeyBytes && offsetof(PipelineKey, vs) == 0 &&
+            offsetof(PipelineKey, ps) == 8);
 
         struct PipelineKeyHash
         {
@@ -2595,7 +2628,14 @@ namespace gpu::renderer
                 return size_t(h);
             }
         };
-        std::unordered_map<PipelineKey, VkPipeline, PipelineKeyHash> s_pipelines;
+        struct ReadyPipeline
+        {
+            VkPipeline pipeline = VK_NULL_HANDLE;
+            // Made ahead from the key list and not drawn with yet: its first
+            // draw stamps its key as used this session (see the prewarm).
+            bool prewarmed = false;
+        };
+        std::unordered_map<PipelineKey, ReadyPipeline, PipelineKeyHash> s_pipelines;
 
         VkBlendFactor BlendFactor(uint32_t f)
         {
@@ -2784,8 +2824,20 @@ namespace gpu::renderer
         // 4; 0 compiles on the command processor). Settings > Advanced >
         // Asynchronous Shaders off (NFSMW_ASYNC_PIPELINES=0): always wait.
         // NFSMW_PIPELINE_LOG=1 logs each pipeline's timing.
+        // Pipelines earlier sessions used are made before a draw needs them
+        // (the prewarm, below): the workers take those only when no draw
+        // waits for one, and one a draw comes to wait for is queued again
+        // with the draws' (the first worker to take it builds it).
         struct PendingPipeline
         {
+            // What to build: set before it is queued, read-only afterwards.
+            PipelineKey key{};
+            VkPipelineLayout layout = VK_NULL_HANDLE;
+            Shader* vs = nullptr;
+            Shader* ps = nullptr;
+            bool prewarm = false;   // queued by the prewarm, ahead of any draw
+            bool promoted = false;  // a prewarm job a draw waits for, in the draws' queue too (command processor)
+            std::atomic<bool> claimed{ false };  // a worker has taken it (from either queue)
             std::mutex mutex;
             std::condition_variable cv;
             bool done = false;
@@ -2809,33 +2861,180 @@ namespace gpu::renderer
 
         std::mutex s_compileMutex;
         std::condition_variable s_compileCv;
-        std::deque<std::function<void()>> s_compileQueue;
+        // The jobs draws wait for, and the prewarm's, taken only when no
+        // draw waits for one and by all workers but one (with two or more),
+        // so a draw's compile never queues behind a prewarm compile (20-80
+        // ms each with a cold driver cache).
+        std::deque<std::shared_ptr<PendingPipeline>> s_compileQueue, s_prewarmQueue;
         uint32_t s_compileActive = 0;         // jobs running (under s_compileMutex)
+        uint32_t s_prewarmActive = 0;         // of them the prewarm queue's
+        const uint32_t s_prewarmWorkers = std::max(s_pipelineThreads, 2u) - 1;  // at most that many
         bool s_compileStopping = false;
+
+        void RunPipelineJob(PendingPipeline& job)
+        {
+            if (job.claimed.exchange(true))
+                return;  // a promoted prewarm job, built from its other queue
+            auto start = std::chrono::steady_clock::now();
+            VkPipeline pipeline = BuildPipeline(job.key, job.layout, *job.vs, *job.ps);
+            {
+                std::lock_guard lock(job.mutex);
+                job.pipeline = pipeline;
+                job.createMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+                job.done = true;
+            }
+            job.cv.notify_all();
+        }
 
         void CompileWorker()
         {
             SetHostThreadName("nfsmw-pipelines");
             hostcpu::LeaveReservedCore();  // started by the command processor
+            auto prewarmReady = [] { return !s_prewarmQueue.empty() && s_prewarmActive < s_prewarmWorkers; };
             while (true)
             {
-                std::function<void()> job;
+                std::shared_ptr<PendingPipeline> job;
+                bool prewarm;
                 {
                     std::unique_lock lock(s_compileMutex);
-                    s_compileCv.wait(lock, [] { return s_compileStopping || !s_compileQueue.empty(); });
+                    s_compileCv.wait(lock, [&] { return s_compileStopping || !s_compileQueue.empty() || prewarmReady(); });
                     if (s_compileStopping)
                         return;
-                    job = std::move(s_compileQueue.front());
-                    s_compileQueue.pop_front();
+                    prewarm = s_compileQueue.empty();
+                    auto& queue = prewarm ? s_prewarmQueue : s_compileQueue;
+                    job = std::move(queue.front());
+                    queue.pop_front();
                     s_compileActive++;
+                    s_prewarmActive += prewarm;
                 }
-                job();
+                RunPipelineJob(*job);
                 {
                     std::lock_guard lock(s_compileMutex);
                     s_compileActive--;
+                    s_prewarmActive -= prewarm;
                 }
                 s_compileCv.notify_all();
             }
+        }
+
+        // Starts making `key`'s pipeline (with `layout`, `vs` and `ps`) on the
+        // workers, or makes it now without them (NFSMW_PIPELINE_THREADS=0).
+        // Command processor; the job is s_pendingPipelines' until taken in.
+        std::shared_ptr<PendingPipeline> QueuePipeline(const PipelineKey& key, VkPipelineLayout layout, Shader* vs, Shader* ps, bool prewarm)
+        {
+            auto job = std::make_shared<PendingPipeline>();
+            job->key = key;
+            job->layout = layout;
+            job->vs = vs;
+            job->ps = ps;
+            job->prewarm = prewarm;
+            job->queuedFrame = s_frame;
+            s_pendingPipelines[key] = job;
+            if (s_pipelineThreads == 0)
+            {
+                double notAHitch = 0;  // (the prewarm's, at a swap: no draw waited)
+                HitchTimer hitchTimer(prewarm ? notAHitch : s_hitch.pipelineMs);
+                RunPipelineJob(*job);
+                return job;
+            }
+            static std::once_flag started;
+            std::call_once(started, [] {
+                for (uint32_t i = 0; i < s_pipelineThreads; i++)
+                    std::thread(CompileWorker).detach();
+            });
+            {
+                std::lock_guard lock(s_compileMutex);
+                (prewarm ? s_prewarmQueue : s_compileQueue).push_back(job);
+            }
+            s_compileCv.notify_all();
+            return job;
+        }
+
+        // A prewarm job a draw now waits for: queued with the draws' jobs too,
+        // unless a worker has it already.
+        void PromotePrewarmJob(const std::shared_ptr<PendingPipeline>& job)
+        {
+            if (!job->prewarm || job->promoted || job->claimed.load() || s_pipelineThreads == 0)
+                return;
+            job->promoted = true;
+            {
+                std::lock_guard lock(s_compileMutex);
+                s_compileQueue.push_back(job);
+            }
+            s_compileCv.notify_all();
+        }
+
+        // The pipeline key list (gpu/pipeline_keys.h): every pipeline this
+        // session draws with is noted, with its shaders' guest words, and the
+        // list is saved beside the pipeline cache (with it every 10 s when new
+        // pipelines appeared, and at exit), so the next session makes them
+        // ahead (the prewarm). Noted by the command processor, saved from
+        // other threads: s_keyListMutex. Off with the disk caches
+        // (NFSMW_SHADER_CACHE=0).
+        std::mutex s_keyListMutex;
+        gpu::pipeline_keys::Recorder s_keyList;  // under s_keyListMutex, as are the three below
+        bool s_keyListOn = false;                // set by Initialize (LoadPipelineKeys), on the command processor
+        uint32_t s_keyListVendor = 0, s_keyListDevice = 0;
+        std::mutex s_keyListSaveMutex;           // the background saver and the one at exit
+
+        std::filesystem::path PipelineKeysFile()
+        {
+            return GetCachePath() / "pipeline_keys.bin";
+        }
+
+        // A pipeline drawn with: added to the list when new (with its
+        // shaders' words), else stamped as used this session. Command
+        // processor; rare (once per pipeline a session).
+        void NotePipelineKey(const PipelineKey& key, const Shader* vs, const Shader* ps)
+        {
+            if (!s_keyListOn)  // (this thread set it)
+                return;
+            gpu::pipeline_keys::Key bytes;
+            std::memcpy(bytes.data(), &key, sizeof(key));
+            std::lock_guard lock(s_keyListMutex);
+            if (s_keyList.Note(bytes))
+                for (const Shader* s : { vs, ps })
+                    if (s)
+                        s_keyList.NoteShader(s->hash, uint32_t(s->stage), s->words);
+        }
+
+        // Any thread (the background saver, Shutdown).
+        void SavePipelineKeys()
+        {
+            std::lock_guard saveLock(s_keyListSaveMutex);
+            std::vector<uint8_t> data;
+            {
+                std::lock_guard lock(s_keyListMutex);
+                if (!s_keyListOn || !s_keyList.Dirty())
+                    return;
+                data = s_keyList.Save(s_keyListVendor, s_keyListDevice);
+            }
+            std::error_code ec;
+            std::filesystem::create_directories(GetCachePath(), ec);
+            std::filesystem::path file = PipelineKeysFile(), temp = file;
+            temp += ".tmp";
+            bool ok = false;
+            if (FILE* f = fopen(temp.c_str(), "wb"))
+            {
+                ok = fwrite(data.data(), 1, data.size(), f) == data.size();
+                ok = fclose(f) == 0 && ok;
+                if (ok)
+                    std::filesystem::rename(temp, file, ec);
+                ok = ok && !ec;
+                if (!ok)
+                    std::filesystem::remove(temp, ec);
+            }
+            if (!ok)
+            {
+                std::lock_guard lock(s_keyListMutex);
+                s_keyList.MarkUnsaved();  // (the next save tries again)
+            }
+        }
+
+        Shader* FindShader(uint64_t hash)
+        {
+            auto it = s_shaders.find(hash);
+            return it == s_shaders.end() ? nullptr : it->second.get();
         }
 
         // The pipeline for `key`; VK_NULL_HANDLE with `pending` set while a
@@ -2850,50 +3049,27 @@ namespace gpu::renderer
             auto it = s_pipelines.find(key);
             if (it != s_pipelines.end())
             {
+                if (it->second.prewarmed) [[unlikely]]
+                {
+                    // Its first draw: the key list keeps it as used this
+                    // session (the list keeps the most recently used).
+                    it->second.prewarmed = false;
+                    NotePipelineKey(key, FindShader(key.vs), FindShader(key.ps));
+                }
                 lastKey = key;
-                lastPipeline = it->second;
-                return it->second;
+                lastPipeline = it->second.pipeline;
+                return it->second.pipeline;
             }
             std::shared_ptr<PendingPipeline> job;
             if (auto p = s_pendingPipelines.find(key); p != s_pendingPipelines.end())
+            {
                 job = p->second;
+                PromotePrewarmJob(job);
+            }
             else
             {
                 s_hitch.pipelines++;
-                job = std::make_shared<PendingPipeline>();
-                job->queuedFrame = s_frame;
-                s_pendingPipelines[key] = job;
-                Shader* vs = s_shaders[key.vs].get();
-                Shader* ps = s_shaders[key.ps].get();
-                auto build = [job, key, layout, vs, ps] {
-                    auto start = std::chrono::steady_clock::now();
-                    VkPipeline pipeline = BuildPipeline(key, layout, *vs, *ps);
-                    {
-                        std::lock_guard lock(job->mutex);
-                        job->pipeline = pipeline;
-                        job->createMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-                        job->done = true;
-                    }
-                    job->cv.notify_all();
-                };
-                if (s_pipelineThreads == 0)
-                {
-                    HitchTimer hitchTimer(s_hitch.pipelineMs);
-                    build();
-                }
-                else
-                {
-                    static std::once_flag started;
-                    std::call_once(started, [] {
-                        for (uint32_t i = 0; i < s_pipelineThreads; i++)
-                            std::thread(CompileWorker).detach();
-                    });
-                    {
-                        std::lock_guard lock(s_compileMutex);
-                        s_compileQueue.push_back(std::move(build));
-                    }
-                    s_compileCv.notify_all();
-                }
+                job = QueuePipeline(key, layout, s_shaders[key.vs].get(), s_shaders[key.ps].get(), false);
             }
             {
                 HitchTimer hitchTimer(s_hitch.pipelineMs);
@@ -2925,14 +3101,250 @@ namespace gpu::renderer
                 }
             }
             if (s_logPipelines)
-                fprintf(stderr, "[pipeline] vs %016llx ps %016llx: %.1f ms to compile, ready %.1f ms and %llu frames after the first draw\n",
+                fprintf(stderr, "[pipeline] vs %016llx ps %016llx: %.1f ms to compile, ready %.1f ms and %llu frames after the first draw%s\n",
                     (unsigned long long)key.vs, (unsigned long long)key.ps, job->createMs,
                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - job->queued).count(),
-                    (unsigned long long)(s_frame - job->queuedFrame));
+                    (unsigned long long)(s_frame - job->queuedFrame), job->prewarm ? " (queued by the prewarm)" : "");
             s_stats.pipelines++;
-            s_pipelines[key] = job->pipeline;
+            s_pipelines[key] = { job->pipeline, false };
             s_pendingPipelines.erase(key);
+            if (job->pipeline)
+                NotePipelineKey(key, job->vs, job->ps);
             return job->pipeline;
+        }
+
+        // ---------------------------------------------------------------
+        // Pipeline prewarm
+        //
+        // The pipeline cache makes a pipeline cheaper to create, not created:
+        // every session still created each one when a draw first used it. The
+        // Deck's replayed race created 19 of its ~90 while driving, each with
+        // its shaders' translation on the command processor and the command
+        // processor waiting for the worker: the three frames that made them
+        // took 0.4-2.6 ms longer than with them made ahead, and the first
+        // frame after the race's intro 6 ms longer for its 25. After a driver
+        // update, or a build whose shaders translate differently, the cache
+        // is cold, and the draws are skipped for the 20-80 ms each takes. So
+        // the key list of the sessions before (gpu/pipeline_keys.h) is made
+        // again as the game starts: from the first swap on, a slice of each
+        // swap's command-processor time (kPrewarmSliceUs) translates the
+        // listed shaders from their words and queues the pipelines, in the
+        // order sessions first used them, and the workers make them when no
+        // draw waits for one (all workers but one: s_prewarmWorkers).
+        // Finished ones are taken in at the next swap, before any draw needs
+        // them; a draw that needs one first gets it as it would have anyway.
+        // Only keys this session's Draw can make are queued (dynamic state on
+        // or off, formats the device can render to). One line in the log
+        // says how many and how long. NFSMW_PIPELINE_PREWARM=0 makes nothing
+        // ahead (the list is still kept and saved).
+        constexpr int64_t kPrewarmSliceUs = 2000;
+        const bool s_prewarmOn = [] { const char* v = std::getenv("NFSMW_PIPELINE_PREWARM"); return !v || v[0] != '0'; }();
+
+        struct Prewarm
+        {
+            std::vector<PipelineKey> keys;  // to make, in the list's order
+            size_t next = 0;                // the next to queue
+            std::unordered_map<uint64_t, gpu::pipeline_keys::Shader> shaders;  // the list's words, by hash
+            std::vector<PipelineKey> queued;  // queued, not taken in yet
+            bool started = false, finished = true;
+            std::chrono::steady_clock::time_point start;
+            uint64_t startFrame = 0;
+            double translateMs = 0, compileMs = 0;
+            uint32_t listed = 0, translated = 0, made = 0, failed = 0, unusable = 0, drawnFirst = 0;
+        };
+        Prewarm s_prewarm;  // command processor
+
+        // A listed key's shader: the one this session has under its hash, or
+        // made from the list's words (when they hash to it).
+        Shader* PrewarmShader(uint64_t hash, uint32_t type)
+        {
+            const ShaderStage stage = type == 0 ? ShaderStage::Vertex : ShaderStage::Pixel;
+            if (type == 1 && hash == kDepthOnlyPsHash)
+                return DepthOnlyPixelShader();
+            if (Shader* s = FindShader(hash))
+                return s->stage == stage ? s : nullptr;
+            auto it = s_prewarm.shaders.find(hash);
+            if (it == s_prewarm.shaders.end() || it->second.type != type)
+                return nullptr;
+            const std::vector<uint32_t>& words = it->second.words;
+            if (gpu::pipeline_keys::ShaderHash(type, words.data(), words.size()) != hash)
+                return nullptr;
+            auto start = std::chrono::steady_clock::now();
+            Shader* s = MakeShader(type, hash, words.data(), uint32_t(words.size()));
+            s_prewarm.translateMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            s_prewarm.translated++;
+            return s;
+        }
+
+        // Whether this session's Draw makes keys like `key` and the device
+        // can render to its formats: the list may come from another
+        // configuration (CP_OPT_DYNAMIC_STATE on or off, NFSMW_DYNAMIC_STATE)
+        // or a driver that has changed.
+        bool PrewarmKeyUsable(const PipelineKey& key)
+        {
+            if (((key.raster >> 6) & 1) != uint32_t(s_dynamicState) || (key.raster >> 7) != 0 || key.pad != 0)
+                return false;
+            if (s_dynamicState && ((key.raster & 7) != 0 || key.depthControl != 0))
+                return false;
+            // Draw's topologies: point, line and triangle lists and strips,
+            // primitive restart only for strips.
+            if (key.topology > VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP || key.restart > 1 ||
+                (key.restart && key.topology != VK_PRIMITIVE_TOPOLOGY_LINE_STRIP && key.topology != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP))
+                return false;
+            if (key.colorMask >> 16)
+                return false;
+            auto features = [](uint32_t format) {
+                VkFormatProperties props{};
+                vkGetPhysicalDeviceFormatProperties(s_vk->physical, VkFormat(format), &props);
+                return props.optimalTilingFeatures;
+            };
+            for (int i = 0; i < 4; i++)
+            {
+                if (key.colorFormats[i] == 0)
+                {
+                    if (key.blend[i] != ~0u)
+                        return false;
+                    continue;
+                }
+                const VkFormatFeatureFlags need =
+                    VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | (key.blend[i] != ~0u ? VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT : 0);
+                if ((features(key.colorFormats[i]) & need) != need)
+                    return false;
+            }
+            if (key.depthFormat == 0)
+                return key.depthControl == 0;
+            return (features(key.depthFormat) & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0;
+        }
+
+        // Initialize: the key list from the last session, kept by s_keyList
+        // and, with the keys this configuration makes, by the prewarm.
+        void LoadPipelineKeys()
+        {
+            if (!s_shaderCacheEnabled)
+                return;
+            VkPhysicalDeviceProperties props;
+            vkGetPhysicalDeviceProperties(s_vk->physical, &props);
+            std::vector<uint8_t> data;
+            if (FILE* f = fopen(PipelineKeysFile().c_str(), "rb"))
+            {
+                fseek(f, 0, SEEK_END);
+                long size = ftell(f);
+                fseek(f, 0, SEEK_SET);
+                if (size > 0 && size <= (64l << 20))
+                {
+                    data.resize(size_t(size));
+                    if (fread(data.data(), 1, data.size(), f) != data.size())
+                        data.clear();
+                }
+                fclose(f);
+            }
+            gpu::pipeline_keys::Decoded decoded = gpu::pipeline_keys::Decode(data.data(), data.size(), props.vendorID, props.deviceID);
+            if (decoded.verdict == gpu::pipeline_keys::Verdict::OtherGpu || decoded.verdict == gpu::pipeline_keys::Verdict::Unreadable)
+                fprintf(stderr, "[renderer] pipeline key list set aside (%s): %s; it starts again\n",
+                    decoded.verdict == gpu::pipeline_keys::Verdict::OtherGpu ? "another GPU's" : "not readable", decoded.why.c_str());
+            gpu::pipeline_keys::List& list = decoded.list;
+            gpu::pipeline_keys::Prune(list, gpu::pipeline_keys::kMaxKeys);
+            Prewarm& p = s_prewarm;
+            p.listed = uint32_t(list.keys.size());
+            if (s_prewarmOn)
+            {
+                for (const gpu::pipeline_keys::Entry& e : list.keys)
+                {
+                    PipelineKey key;
+                    std::memcpy(&key, e.key.data(), sizeof(key));
+                    if (PrewarmKeyUsable(key))
+                        p.keys.push_back(key);
+                    else
+                        p.unusable++;
+                }
+                p.shaders = list.shaders;
+                p.finished = p.keys.empty();
+            }
+            if (p.listed)
+                fprintf(stderr, "[renderer] pipeline key list: %u pipelines and %zu shaders from %u sessions; %s\n", p.listed,
+                    list.shaders.size(), list.session,
+                    !s_prewarmOn ? "none made ahead (NFSMW_PIPELINE_PREWARM=0)"
+                                 : std::format("{} to make ahead ({} not for this configuration)", p.keys.size(), p.unusable).c_str());
+            std::lock_guard lock(s_keyListMutex);
+            s_keyListVendor = props.vendorID;
+            s_keyListDevice = props.deviceID;
+            s_keyList.Start(std::move(list));
+            s_keyListOn = true;
+        }
+
+        // At each swap until it is done (OnSwap): queue the next listed
+        // pipelines while this swap's slice lasts, and take in those the
+        // workers have made.
+        void PrewarmStep()
+        {
+            Prewarm& p = s_prewarm;
+            if (p.finished)
+                return;
+            auto now = std::chrono::steady_clock::now();
+            if (!p.started)
+            {
+                p.started = true;
+                p.start = now;
+                p.startFrame = s_frame;
+            }
+            const auto until = now + std::chrono::microseconds(kPrewarmSliceUs);
+            while (p.next < p.keys.size() && std::chrono::steady_clock::now() < until)
+            {
+                const PipelineKey& key = p.keys[p.next++];
+                if (s_pipelines.count(key) || s_pendingPipelines.count(key))
+                {
+                    p.drawnFirst++;  // a draw needed it first
+                    continue;
+                }
+                Shader* vs = PrewarmShader(key.vs, 0);
+                Shader* ps = PrewarmShader(key.ps, 1);
+                if (!vs || !ps || !vs->info.ok || !ps->info.ok)
+                {
+                    p.unusable++;
+                    continue;
+                }
+                QueuePipeline(key, GetTextureLayoutUncached(*vs, *ps).pipeline, vs, ps, true);
+                p.queued.push_back(key);
+            }
+            for (size_t i = 0; i < p.queued.size();)
+            {
+                auto it = s_pendingPipelines.find(p.queued[i]);
+                if (it == s_pendingPipelines.end())
+                    p.drawnFirst++;  // a draw waited for it and took it in (GetPipeline)
+                else
+                {
+                    std::shared_ptr<PendingPipeline> job = it->second;
+                    {
+                        std::lock_guard lock(job->mutex);
+                        if (!job->done)
+                        {
+                            i++;
+                            continue;
+                        }
+                    }
+                    p.compileMs += job->createMs;
+                    (job->pipeline ? p.made : p.failed)++;
+                    s_stats.pipelines++;
+                    s_pipelines[job->key] = { job->pipeline, job->pipeline != VK_NULL_HANDLE };
+                    s_pendingPipelines.erase(it);
+                }
+                p.queued[i] = p.queued.back();
+                p.queued.pop_back();
+            }
+            if (p.next < p.keys.size() || !p.queued.empty())
+                return;
+            p.finished = true;
+            const std::string where = s_pipelineThreads == 0 ? std::string("the command processor")
+                                                             : std::format("{} of the {} workers", s_prewarmWorkers, s_pipelineThreads);
+            fprintf(stderr, "[renderer] pipeline prewarm: %u of %zu made ahead, ready %.0f ms (%llu frames) after the first frame "
+                "(%u shaders translated in %.1f ms on the command processor, %.0f ms of compiles on %s); "
+                "%u drawn with first, %u not makeable, %u failed\n",
+                p.made, p.keys.size(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - p.start).count(),
+                (unsigned long long)(s_frame - p.startFrame), p.translated, p.translateMs, p.compileMs, where.c_str(), p.drawnFirst,
+                p.unusable, p.failed);
+            p.keys = {};
+            p.shaders = {};
+            p.queued = {};
         }
 
         // ---------------------------------------------------------------
@@ -7545,6 +7957,7 @@ void main()
 #endif
         glslang_initialize_process();
         CreatePipelineCache();
+        LoadPipelineKeys();
 
         VkCommandPoolCreateInfo cpci{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
         cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -7655,12 +8068,7 @@ void main()
     {
         if (!s_vk || dwords == 0 || type > 1)
             return;
-        auto hash = [type](const uint32_t* w, uint32_t n) {
-            uint64_t h = 0xCBF29CE484222325ull ^ type;
-            for (uint32_t i = 0; i < n; i++)
-                h = (h ^ w[i]) * 0x100000001B3ull;
-            return h;
-        };
+        auto hash = [type](const uint32_t* w, uint32_t n) { return gpu::pipeline_keys::ShaderHash(type, w, n); };
         ShaderCache& c = *s_shaderCache;
         ShaderCacheEntry* e = nullptr;
         if (c.on)
@@ -7696,21 +8104,11 @@ void main()
         }
         uint64_t h = hash(words, dwords);
         auto& slot = s_shaders[h];
-        if (!slot)
+        if (!slot)  // (the pipeline prewarm may have made it already, from the key list)
         {
             HitchTimer hitchTimer(s_hitch.shaderMs);
             s_hitch.shaders++;
-            slot = std::make_unique<Shader>();
-            slot->stage = type == 0 ? ShaderStage::Vertex : ShaderStage::Pixel;
-            slot->hash = h;
-            std::vector<uint32_t> ucode(dwords);
-            for (uint32_t i = 0; i < dwords; i++)
-                ucode[i] = __builtin_bswap32(words[i]);
-            slot->info = TranslateShader(slot->stage, ucode.data(), dwords);
-            if (!slot->info.ok)
-                fprintf(stderr, "[renderer] %s_%016llx: translation failed: %s\n", type == 0 ? "vs" : "ps",
-                    (unsigned long long)h, slot->info.error.c_str());
-            // Compiled to SPIR-V with its first pipeline, on a pipeline worker.
+            MakeShader(type, h, words, dwords);  // (into `slot`)
         }
         if (e)
             e->shader = slot.get();
@@ -10079,6 +10477,8 @@ void main()
         s_frame = frame;
         if (s_vk)
             TrimTextureCache();
+        if (s_vk)
+            PrewarmStep();  // (until the key list's pipelines are made)
         if (s_zpdOn)
             ZpdOnSwap(frame);
         if (s_logShadowMap)
@@ -10185,6 +10585,7 @@ void main()
                     SetHostThreadName("nfsmw-cachesave");
                     hostcpu::LeaveReservedCore();
                     SavePipelineCache();
+                    SavePipelineKeys();
                     saving = false;
                 }).detach();
         }
@@ -10253,11 +10654,13 @@ void main()
             // cache being saved); drop the queued ones.
             std::unique_lock lock(s_compileMutex);
             s_compileQueue.clear();
+            s_prewarmQueue.clear();
             s_compileCv.wait_for(lock, std::chrono::seconds(2), [] { return s_compileActive == 0; });
             s_compileStopping = true;
         }
         s_compileCv.notify_all();
         SavePipelineCache();
+        SavePipelineKeys();
         // A shot's copy still being read and written out (ReadBackFrontImage):
         // a moment for it, so its file is whole and its buffer freed.
         for (int i = 0; i < 200 && s_frontReadbacks.load(std::memory_order_relaxed) > 0; i++)
