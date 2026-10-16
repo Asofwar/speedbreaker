@@ -47,6 +47,7 @@
 #include <deque>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <thread>
 #include <sys/resource.h>
@@ -1234,14 +1235,18 @@ namespace gpu::renderer
             s_submitCv.wait(lock, [&] { return s_inFlight.empty() || s_submissions[s_inFlight.front()].number > number; });
         }
 
+        void WriteDeferredIn(uint32_t base, uint32_t size);
+
         // Shadow mode: bring the GPU's copy of [base, base + size) up to date
-        // before recording work that reads it.
+        // before recording work that reads it (deferred resolves' bytes there
+        // too: NFSMW_RESOLVE_DEFER).
         void EnsureShadow(uint32_t base, uint32_t size)
         {
             if (!s_shadowMode || size == 0)
                 return;
             base &= 0x1FFFFFFF;
             size = std::min<uint32_t>(size, uint32_t(kSharedSize) - base);
+            WriteDeferredIn(base, size);
             uint64_t key = uint64_t(base) << 32 | size;
             auto it = s_shadowSynced.find(key);
             if (it != s_shadowSynced.end() && !writewatch::RangeWrittenSince(base, size, it->second))
@@ -5415,7 +5420,9 @@ void main()
         // 0.75x 3/4, 0.625x 5/8), made at the first resolve that needs it (ResolvePipeline); [..][0][0] are the
         // two above. (Coalesced only up to a den y of 2: a group is two rows.)
         VkPipeline s_resolveDenPipelines[2][4][4] = {};
+        VkPipeline s_resolveTexturePipeline = VK_NULL_HANDLE;  // TEXTURE_ONLY (NFSMW_RESOLVE_DEFER; made at its first use)
         VkPipeline ResolvePipeline(bool coalesced, const gpu::RenderScale& scale);
+        void MakeResolvePipeline(bool coalesced, uint32_t denX, uint32_t denY, VkPipeline* out, bool textureOnly = false);
 
         // Coalesced scaled resolves: 2.8 -> 1.1 ms of scaled resolves a frame
         // on the Steam Machine (RADV), but 2.6-3.4 -> 4.1-4.4 ms on an M1 Pro
@@ -5481,7 +5488,11 @@ void main()
 
         const char* kResolveGlsl = R"(#version 460
 #extension GL_EXT_samplerless_texture_functions : require
+#ifdef TEXTURE_ONLY
+layout(local_size_x = 256) in;
+#else
 layout(local_size_x = 8, local_size_y = 8) in;
+#endif
 layout(std430, set = 0, binding = 0) buffer SharedMemory { uint g_mem[]; };)" GLSL_SHARED_MEMORY_WRITE R"(
 layout(set = 0, binding = 1) uniform texture2D src;
 layout(std430, set = 0, binding = 2) buffer ScaledPool { uint s_pool[]; };
@@ -5645,6 +5656,44 @@ shared uint g_samples[64 * 16];  // by block, then sample (up to 64 pixels' wort
 shared uint g_offsets[64];       // each block's samples in the pool; ~0u: none
 #endif
 
+#ifdef TEXTURE_ONLY
+// NFSMW_RESOLVE_DEFER: a 32-bit resolve at a whole scale, without scaled
+// memory, into its cached texture only (main() below writes its guest bytes
+// later, if anything reads them). The same texels as main(). A group a 32x32
+// tile of the destination, each thread four texels: those of the tile's
+// words t, t + 256, t + 512 and t + 768 (tiled2D's bits 2-11 taken apart: x
+// 0-1, y 0, x 2, the pipe, y 1-3, the bank: y 4). On the Steam Deck that
+// stored a 1600x1600 shadow map's texture in ~305 us where 8x8 groups of a
+// texel a thread took ~395.
+void main()
+{
+    uvec2 tile = (uvec2(p.origin) >> 5u) + gl_WorkGroupID.xy;
+    for (uint k = 0u; k < 4u; k++)
+    {
+        uint a = (gl_LocalInvocationIndex + k * 256u) << 2;
+        uint ly = ((a >> 4) & 1u) | (((a >> 8) & 7u) << 1) | (((a >> 11) & 1u) << 4);
+        uint lx = ((a >> 2) & 3u) | (((a >> 5) & 1u) << 2) | ((((a >> 6) & 3u) ^ (((ly >> 3) & 1u) << 1)) << 3);
+        uvec2 g = tile * 32u + uvec2(lx, ly) - uvec2(p.origin);  // (wraps below the origin: outside)
+        if (g.x >= p.size.x || g.y >= p.size.y)
+            continue;
+        uint x = uint(p.origin.x) + g.x, y = uint(p.origin.y) + g.y;
+#ifdef TEX_OFFSET
+        if (x + p.texX >= p.texWidth || y + p.texY >= p.texHeight)
+            continue;
+#else
+        if (x >= p.texWidth || y >= p.texHeight)
+            continue;
+#endif
+        uint v = swapWord(swapWord(pack32(px(g.x, g.y)), p.endian), p.texEndian);
+        uint o = p.texConvert == 4u ? floatBitsToUint(float(v >> 8) / 16777215.0) : v;
+#ifdef TEX_OFFSET
+        imageStore(t_image, ivec2(int(x + p.texX), int(y + p.texY)), uvec4(o, 0u, 0u, 0u));
+#else
+        imageStore(t_image, ivec2(int(x), int(y)), uvec4(o, 0u, 0u, 0u));
+#endif
+    }
+}
+#else
 void main()
 {
     uint bl = bppLog2(p.format);
@@ -5759,6 +5808,7 @@ void main()
 #endif
     }
 }
+#endif
 )";
 
         uint32_t ResolveBppLog2(uint32_t f)
@@ -6128,6 +6178,193 @@ void main()
                 p.srcBase, p.rect, p.frame, p.seconds }).detach();
         }
 
+        // NFSMW_RESOLVE_DEFER=1 (shadow mode; off by default): a depth resolve
+        // into a cached texture of exactly its surface (Resolve's exact
+        // fusion), at 1x, whose target the same resolve then clears whole,
+        // stores its texels into that texture only (TEXTURE_ONLY). Its guest
+        // bytes go into the shadow later, from the depth as resolved, and only
+        // if something reads them: GPU work (EnsureShadow), the CPU (a fault
+        // on its pages asks for them, see writewatch::DeferWrite), another
+        // resolve into part of them. The same resolve again (the next frame's)
+        // replaces them unwritten. The depth as resolved is the target's
+        // image: the record keeps it, and the target goes on in another of its
+        // format and size (the clear covers all of it). The race resolves the
+        // second of its two 1600x1600 sun shadow maps so each frame, and
+        // nothing reads its guest bytes (the first isn't: copy control 0x004,
+        // no clear, the second is drawn over its depth; 0x204 clears). On the
+        // Steam Deck, where the shadow is host memory, that resolve's dispatch
+        // took ~500 us, deferred ~305.
+        // NFSMW_RESOLVE_DEFER=2 (a check): that, and a thread of its own reads a
+        // page of a deferred resolve's guest bytes every second as the CPU
+        // would (a fault: the write watch asks for them and waits) and logs
+        // what it found ([defer-check]: words whose stencil byte isn't 0 were
+        // never a depth resolve's).
+        const int s_resolveDeferMode = [] { const char* v = std::getenv("NFSMW_RESOLVE_DEFER"); return v ? std::clamp(std::atoi(v), 0, 2) : 0; }();
+        const bool s_resolveDefer = s_resolveDeferMode != 0;
+        struct DeferCheckRange { uint32_t base, bytes, endian; };
+        std::mutex s_deferCheckMutex;
+        std::vector<DeferCheckRange> s_deferCheckRanges;  // the destinations deferred so far (8 at most)
+        void DeferCheck()
+        {
+            SetHostThreadName("nfsmw-defercheck");
+            hostcpu::LeaveReservedCore();
+            for (uint32_t round = 0;; round++)
+            {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                DeferCheckRange c;
+                {
+                    std::lock_guard lock(s_deferCheckMutex);
+                    c = s_deferCheckRanges[round % s_deferCheckRanges.size()];
+                }
+                // A page from the middle of the range: the shadow map's caster
+                // area is there more often than its edges.
+                uint32_t base = (c.base + c.bytes / 2) & ~4095u;
+                auto start = std::chrono::steady_clock::now();
+                uint32_t words[1024];
+                for (uint32_t i = 0; i < 1024; i++)
+                    words[i] = *reinterpret_cast<volatile const uint32_t*>(s_sharedHost + base + i * 4);
+                double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+                uint32_t stencil = 0, farWords = 0;  // (not "far": <windows.h> defines it as nothing)
+                for (uint32_t w : words)
+                {
+                    uint32_t d = GpuSwap(w, c.endian >= 4 ? 2 : c.endian);
+                    stencil += (d & 0xFF) != 0;
+                    farWords += (d >> 8) == 0xFFFFFF;
+                }
+                fprintf(stderr, "[defer-check] read %08X in %.2f ms: %u of 1024 words far, %u with a stencil byte%s\n", base, ms,
+                    farWords, stencil, stencil ? " (NOT a depth resolve's bytes)" : "");
+            }
+        }
+        struct DeferredResolve
+        {
+            uint32_t rangeBase, rangeBytes;  // the guest bytes it owes (DeferWrite'd)
+            ResolveConstants rc;             // as resolved
+            Image image;                      // the target's image as resolved
+            VkImageView sampleView;           // its depth aspect
+            VkFormat format;                  // the target's format and size
+            uint32_t width, height;
+        };
+        std::vector<DeferredResolve> s_deferredResolves;
+        constexpr size_t kMaxDeferred = 4;  // more: the oldest is written
+        // Images of depth targets that went into records and came back, for the
+        // next target of their format and size that needs one.
+        struct SpareTarget
+        {
+            Image image;
+            VkImageView sampleView;
+            VkFormat format;
+            uint32_t width, height;
+        };
+        std::vector<SpareTarget> s_spareTargets;
+        // Resolves deferred; replaced unwritten; written for GPU work, for the
+        // CPU, for want of room (any thread reads them at exit).
+        std::atomic<uint64_t> s_deferredCount{ 0 }, s_deferReplaced{ 0 }, s_deferForGpu{ 0 }, s_deferForCpu{ 0 }, s_deferForRoom{ 0 };
+
+        // Records deferred resolve `i`'s guest bytes (the main resolve shader
+        // from its depth, guest memory only) and takes it off the list; its
+        // image becomes a spare.
+        void WriteDeferred(size_t i)
+        {
+            DeferredResolve d = s_deferredResolves[i];
+            s_deferredResolves.erase(s_deferredResolves.begin() + ptrdiff_t(i));
+            EndPass();
+            Begin();
+            ResolveConstants rc = d.rc;
+            rc.texWrite = 0;
+            VkDescriptorImageInfo ii{ VK_NULL_HANDLE, d.sampleView, VK_IMAGE_LAYOUT_GENERAL };
+            VkDescriptorImageInfo ti{ VK_NULL_HANDLE, s_dummyStorage.view, VK_IMAGE_LAYOUT_GENERAL };
+            VkDescriptorBufferInfo pool = DummyStorage(s_scaled.pool);
+            VkDescriptorBufferInfo table = DummyStorage(s_scaled.table);
+            VkWriteDescriptorSet w[8]{};
+            w[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 0, 0, 1,
+                VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &s_sharedInfo[0], nullptr };
+            w[1] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 1, 0, 1,
+                VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &ii, nullptr, nullptr };
+            w[2] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 2, 0, 1,
+                VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &pool, nullptr };
+            w[3] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 3, 0, 1,
+                VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &table, nullptr };
+            w[4] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 4, 0, 1,
+                VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ti, nullptr, nullptr };
+            ComputeWorkRecorded();
+            if (s_profiling)
+                ProfileCompute(std::format("deferred resolve {}x{} to {:08X}: its guest bytes", rc.width, rc.height, rc.destBase).c_str());
+            vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_resolvePipeline);  // (1x only are deferred)
+            s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_resolveLayout, 0, AddSharedParts(w, 5), w);
+            vkCmdPushConstants(s_cmd, s_resolveLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, s_resolvePush, &rc);
+            vkCmdDispatch(s_cmd, (rc.width + 7) / 8, (rc.height + 7) / 8, 1);
+            ResolveBarrier(d.rangeBase, d.rangeBytes, 0);
+            ProfileComputeEnd();
+            // Guarded as the resolve's own write would have been (its pages
+            // stayed GPU-owned), and only then no longer owed: a CPU access
+            // waiting for it (WaitForDeferred) waits for this write next.
+            GuardGpu(d.rangeBase, d.rangeBytes, true, "resolve");
+            writewatch::MarkGpuOwned(d.rangeBase, d.rangeBytes);
+            writewatch::DeferredWritten(d.rangeBase, d.rangeBytes);
+            s_spareTargets.push_back({ d.image, d.sampleView, d.format, d.width, d.height });
+            LogOnce(0x3300, "deferred resolve to %08X (%ux%u) written: something reads its guest bytes", rc.destBase, rc.width, rc.height);
+        }
+
+        // Before work that reads guest bytes [base, base + size): the deferred
+        // resolves owing any of them write them.
+        void WriteDeferredIn(uint32_t base, uint32_t size)
+        {
+            for (size_t i = s_deferredResolves.size(); i-- > 0;)
+            {
+                const DeferredResolve& d = s_deferredResolves[i];
+                if (uint64_t(d.rangeBase) < uint64_t(base) + size && uint64_t(base) < uint64_t(d.rangeBase) + d.rangeBytes)
+                {
+                    s_deferForGpu++;
+                    WriteDeferred(i);
+                }
+            }
+        }
+
+        // A CPU access waits for deferred bytes (writewatch::g_writeDeferred):
+        // all are written (which pages it wants isn't known here).
+        void WriteDeferredForCpu()
+        {
+            if (!writewatch::g_writeDeferred.exchange(false))
+                return;
+            while (!s_deferredResolves.empty())
+            {
+                s_deferForCpu++;
+                WriteDeferred(s_deferredResolves.size() - 1);
+            }
+        }
+
+        // The target goes on in another image of its format and size (a spare,
+        // or a new one); its old one is returned. Undefined contents: the
+        // caller's clear covers all of it.
+        std::pair<Image, VkImageView> SwapTargetImage(RenderTarget& rt)
+        {
+            std::pair<Image, VkImageView> old{ rt.image, rt.sampleView };
+            auto it = std::find_if(s_spareTargets.begin(), s_spareTargets.end(), [&](const SpareTarget& s) {
+                return s.format == rt.vkFormat && s.width == rt.width && s.height == rt.height;
+            });
+            if (it != s_spareTargets.end())
+            {
+                rt.image = it->image;
+                rt.sampleView = it->sampleView;
+                s_spareTargets.erase(it);
+                return old;
+            }
+            const VkImageAspectFlags aspect = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+            rt.image = CreateImage(VK_IMAGE_TYPE_2D, rt.vkFormat, { rt.width, rt.height, 1 }, 1, VK_IMAGE_USAGE_SAMPLED_BIT |
+                VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                VK_IMAGE_VIEW_TYPE_2D, aspect);
+            VkImageViewCreateInfo vci{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+            vci.image = rt.image.image;
+            vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            vci.format = rt.vkFormat;
+            vci.subresourceRange = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
+            Check(vkCreateImageView(s_dev, &vci, nullptr, &rt.sampleView), "vkCreateImageView(depth)");
+            EndPass();
+            Begin();  // (the resolve may have submitted: SubmitIfStarving)
+            ToGeneral(rt.image.image, aspect, 1);
+            return old;
+        }
+
         void Resolve()
         {
             s_stats.resolves++;
@@ -6240,6 +6477,24 @@ void main()
             {
                 auto [extentStart, extentEnd] = ResolveExtent(r, (destPitch.copy_dest_pitch + 31) & ~31u, ResolveBppLog2(format));
                 uint32_t rangeBase = (destBase & 0x1FFFFFFF) + extentStart, rangeBytes = extentEnd - extentStart;
+                // NFSMW_RESOLVE_DEFER: a deferred resolve of these very bytes
+                // (the same destination and rectangle, 32-bit: the next
+                // frame's) is replaced unwritten. Its pages stay owed until
+                // this one's write is guarded or owed itself (below), so a CPU
+                // access in between waits for one of them.
+                std::optional<DeferredResolve> replaced;
+                if (ResolveFormatSupported(format) && ResolveBppLog2(format) == 2)
+                    for (size_t i = 0; i < s_deferredResolves.size(); i++)
+                    {
+                        const ResolveConstants& o = s_deferredResolves[i].rc;
+                        if (o.destBase == (destBase & 0x1FFFFFFF) && o.destPitch == ((destPitch.copy_dest_pitch + 31) & ~31u) &&
+                            o.originX == r.x0 && o.originY == r.y0 && o.width == uint32_t(r.x1 - r.x0) && o.height == uint32_t(r.y1 - r.y0))
+                        {
+                            replaced = s_deferredResolves[i];
+                            s_deferredResolves.erase(s_deferredResolves.begin() + ptrdiff_t(i));
+                            break;
+                        }
+                    }
                 // Shadow mode: pages the resolve covers only in part keep
                 // the CPU's latest data around it.
                 EnsureShadow(rangeBase, rangeBytes);
@@ -6549,20 +6804,31 @@ void main()
                         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ti, nullptr, nullptr };
                     ComputeWorkRecorded();
                     bool coalesced = scaledWrite && s_scaled.coalesce && ScaledCoalesceFits(source->scale);  // 32x2 pixels a group
+                    // NFSMW_RESOLVE_DEFER (see s_resolveDefer): the texture
+                    // only, now. The target must come out of this resolve
+                    // cleared whole (it goes on in another image).
+                    const bool defer = s_resolveDefer && s_shadowMode && depthSource && fused && !partial && !scaledWrite && bl == 2 &&
+                        source->scale.IsOne() && copyControl.depth_clear_enable && !s_logShadowMap && r.x0 + shiftX <= 0 &&
+                        r.y0 + shiftY <= 0 && r.x1 + shiftX >= int32_t(source->guestWidth) && r.y1 + shiftY >= int32_t(source->guestHeight);
+                    if (defer && !s_resolveTexturePipeline)
+                        MakeResolvePipeline(false, 1, 1, &s_resolveTexturePipeline, true);
                     if (s_profiling)
                     {
                         char desc[160];
-                        snprintf(desc, sizeof(desc), "resolve %ux%u@%d,%d p%u fmt %u to %08X %s%s%s", rc.width, rc.height, rc.originX,
+                        snprintf(desc, sizeof(desc), "resolve %ux%u@%d,%d p%u fmt %u to %08X %s%s%s%s", rc.width, rc.height, rc.originX,
                             rc.originY, pitch, format, rc.destBase, depthSource ? "depth " : "",
                             scaledWrite ? std::format("scaled {}", gpu::ScaleName(source->scale)).c_str()
-                            : !source->scale.IsOne() ? "1x (from a scaled target)" : "1x", fused ? " fused" : "");
+                            : !source->scale.IsOne() ? "1x (from a scaled target)" : "1x", fused ? " fused" : "",
+                            defer ? ", texture only (deferred)" : "");
                         ProfileCompute(desc);
                     }
-                    vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ResolvePipeline(coalesced, source->scale));
+                    vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, defer ? s_resolveTexturePipeline : ResolvePipeline(coalesced, source->scale));
                     s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_resolveLayout, 0, AddSharedParts(w, 5), w);
                     vkCmdPushConstants(s_cmd, s_resolveLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, s_resolvePush, &rc);
                     uint32_t perWord = bl >= 2 ? 1 : (4 >> bl);
-                    if (!(s_exp & 2))
+                    if (!(s_exp & 2) && defer)  // a group a 32x32 tile of the destination
+                        vkCmdDispatch(s_cmd, ((r.x1 - 1) >> 5) - (r.x0 >> 5) + 1, ((r.y1 - 1) >> 5) - (r.y0 >> 5) + 1, 1);
+                    else if (!(s_exp & 2))
                         vkCmdDispatch(s_cmd, coalesced ? (rc.width + 31) / 32 : (rc.width / perWord + 7) / 8,
                             coalesced ? (rc.height + 1) / 2 : (rc.height + 7) / 8, 1);
                     // Below 1x a scaled resolve's barrier is a 1x one's: its
@@ -6634,8 +6900,41 @@ void main()
                         for (uint32_t q : siblings)
                             s_scaled.pageSeq[q] = writewatch::WriteSequence(q << 12, 4096);
                     }
+                    // Deferred: its bytes owed first, so that no CPU access
+                    // finds the pages guarded and not owed.
+                    if (defer)
+                        writewatch::DeferWrite(rangeBase, rangeBytes);
                     GuardGpu(rangeBase, rangeBytes, true, "resolve");
                     writewatch::MarkGpuOwned(rangeBase, rangeBytes);
+                    if (replaced)
+                    {
+                        s_deferReplaced++;
+                        writewatch::DeferredWritten(replaced->rangeBase, replaced->rangeBytes);
+                        s_spareTargets.push_back({ replaced->image, replaced->sampleView, replaced->format, replaced->width, replaced->height });
+                    }
+                    if (defer)
+                    {
+                        if (s_deferredResolves.size() >= kMaxDeferred)
+                        {
+                            s_deferForRoom++;
+                            WriteDeferred(0);
+                        }
+                        auto [image, view] = SwapTargetImage(*source);
+                        s_deferredResolves.push_back({ rangeBase, rangeBytes, rc, image, view, source->vkFormat, source->width, source->height });
+                        s_deferredCount++;
+                        if (s_resolveDeferMode == 2)
+                        {
+                            std::lock_guard lock(s_deferCheckMutex);
+                            bool first = s_deferCheckRanges.empty();
+                            if (s_deferCheckRanges.size() < 8 && std::none_of(s_deferCheckRanges.begin(), s_deferCheckRanges.end(),
+                                [&](const DeferCheckRange& c) { return c.base == rangeBase; }))
+                                s_deferCheckRanges.push_back({ rangeBase, rangeBytes, rc.endian });
+                            if (first)
+                                std::thread(DeferCheck).detach();
+                        }
+                        LogOnce(0x3200, "resolves into cached textures defer their guest bytes (NFSMW_RESOLVE_DEFER; the first: %ux%u depth "
+                            "at %08X)", rc.width, rc.height, rc.destBase);
+                    }
                 }
             }
 
@@ -7240,11 +7539,12 @@ void main()
         }
 
         // The resolve shader for sources whose scale has these denominators
-        // (1, 2, 4 or 8 each; the shader's SB_DEN_X, SB_DEN_Y), into `out`.
-        void MakeResolvePipeline(bool coalesced, uint32_t denX, uint32_t denY, VkPipeline* out)
+        // (1, 2, 4 or 8 each; the shader's SB_DEN_X, SB_DEN_Y), into `out`;
+        // `textureOnly`: its TEXTURE_ONLY variant (whole scales).
+        void MakeResolvePipeline(bool coalesced, uint32_t denX, uint32_t denY, VkPipeline* out, bool textureOnly)
         {
             std::string log;
-            std::string preamble = coalesced ? "#define COALESCED\n" : "";
+            std::string preamble = coalesced ? "#define COALESCED\n" : textureOnly ? "#define TEXTURE_ONLY\n" : "";
             if (s_resolvePush != offsetof(ResolveConstants, texX))
                 preamble += "#define TEX_OFFSET\n";
             if (denX != 1)
@@ -10336,14 +10636,17 @@ void main()
         if (s_submitAfterDraw)
         {
             s_submitAfterDraw = false;
+            WriteDeferredForCpu();
             SubmitRecorded(8);
         }
     }
 
     void Submit()
     {
-        if (s_vk)
-            SubmitRecorded(2);
+        if (!s_vk)
+            return;
+        WriteDeferredForCpu();  // (a CPU access may be what asks for this submit)
+        SubmitRecorded(2);
     }
 
     void SubmitIfIdle()
@@ -11038,6 +11341,15 @@ void main()
         s_compileCv.notify_all();
         SavePipelineCache();
         SavePipelineKeys();
+        if (s_resolveDefer)
+        {
+            auto ds = writewatch::GetDeferStats();
+            fprintf(stderr, "[renderer] deferred resolves (NFSMW_RESOLVE_DEFER): %llu, replaced unwritten %llu, written for GPU work %llu, "
+                "for the CPU %llu, for room %llu; CPU accesses that waited %llu, stale read-backs %llu\n",
+                (unsigned long long)s_deferredCount.load(), (unsigned long long)s_deferReplaced.load(), (unsigned long long)s_deferForGpu.load(),
+                (unsigned long long)s_deferForCpu.load(), (unsigned long long)s_deferForRoom.load(), (unsigned long long)ds.waits,
+                (unsigned long long)ds.staleReadbacks);
+        }
         // A shot's copy still being read and written out (ReadBackFrontImage):
         // a moment for it, so its file is whole and its buffer freed.
         for (int i = 0; i < 200 && s_frontReadbacks.load(std::memory_order_relaxed) > 0; i++)

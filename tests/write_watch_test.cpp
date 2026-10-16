@@ -701,6 +701,112 @@ static void RepeatedFault(Quad h)
     CHECK(!writewatch::HandleFault(g_memory.base + 0x10000, true), "a fault outside physical memory was taken");
 }
 
+// Shadow mode, NFSMW_RESOLVE_DEFER: a resolve's guest bytes still owed
+// (DeferWrite). A CPU access to its page asks for them (g_writeDeferred) and
+// waits until the "command processor" has recorded their write (Serve: into
+// the shadow at once, guarded with a later submission, then DeferredWritten),
+// then for that submission (which the GPU completes only after a while), and
+// reads the shadow's bytes back. A host write (BeforeHostWrite) waits the
+// same way. A GPU thread can't wait for itself: it reads the page back as it
+// is (counted stale), and the page stays owed for the others.
+static void DeferredWrite(Quad h, uint64_t& submission)
+{
+    printf("accesses to pages whose resolve bytes are owed\n");
+    uint8_t* shadow = static_cast<uint8_t*>(mmap(nullptr, kPhysicalSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0));
+    CHECK(shadow != MAP_FAILED, "no shadow mapping");
+    if (shadow == MAP_FAILED)
+        return;
+    writewatch::EnableShadow(shadow);
+    const uint32_t size = uint32_t(s_hostPage);
+    auto owe = [&](uint32_t page) {
+        uint64_t resolve = ++submission;
+        writewatch::DeferWrite(page, size);
+        writewatch::GpuWrite(page, size, resolve, "resolve");
+        writewatch::MarkGpuOwned(page, size);
+        Complete(resolve);  // (the texture's store: done)
+        GpuAnswers(resolve);  // (nothing newer completes until Serve says so)
+    };
+    // The command processor for one owed page: when asked, its write (the
+    // shadow filled with `value`) in submission `write`, which the GPU
+    // completes 2 ms later.
+    struct Served
+    {
+        std::thread thread;
+        std::atomic<int> asked{ 0 };
+        std::atomic<bool> answered{ false }, stop{ false };
+    };
+    auto serve = [&](Served& s, uint32_t page, uint8_t value, uint64_t write) {
+        s.thread = std::thread([&s, page, value, write, shadow, size] {
+            while (!s.stop.load())
+            {
+                if (writewatch::g_writeDeferred.exchange(false) && s.asked++ == 0)  // (a waiter asks until it is recorded: once)
+                {
+                    memset(shadow + page, value, size);
+                    writewatch::GpuWrite(page, size, write, "resolve");
+                    writewatch::MarkGpuOwned(page, size);
+                    writewatch::DeferredWritten(page, size);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    s.answered.store(true);
+                    GpuAnswers(write);
+                }
+                std::this_thread::sleep_for(std::chrono::microseconds(20));
+            }
+        });
+    };
+
+    // A load.
+    owe(h.j());
+    auto before = writewatch::GetDeferStats();
+    Served s1;
+    serve(s1, h.j(), 0x5A, ++submission);
+    uint8_t v = *reinterpret_cast<volatile uint8_t*>(Guest(h.j()) + 100);
+    bool answered = s1.answered.load();
+    s1.stop.store(true);
+    s1.thread.join();
+    auto after = writewatch::GetDeferStats();
+    CHECK(s1.asked.load() >= 1, "the write was never asked for");
+    CHECK(v == 0x5A, "the load read %02X, not the deferred write's 5A", v);
+    CHECK(answered, "the load didn't wait for the deferred write's submission");
+    CHECK(after.waits == before.waits + 1, "%llu waits, want 1", (unsigned long long)(after.waits - before.waits));
+    CHECK(after.staleReadbacks == before.staleReadbacks, "a stale read-back");
+
+    // A host write (a file read into guest memory): the same wait first.
+    owe(h.k());
+    Served s2;
+    serve(s2, h.k(), 0x77, ++submission);
+    writewatch::BeforeHostWrite(Guest(h.k()), 64);
+    answered = s2.answered.load();
+    s2.stop.store(true);
+    s2.thread.join();
+    auto host = writewatch::GetDeferStats();
+    CHECK(answered, "the host write didn't wait for the deferred write's submission");
+    CHECK(Guest(h.k())[100] == 0x77, "the host-written page holds %02X past the write, not the deferred write's 77", Guest(h.k())[100]);
+    CHECK(host.waits == after.waits + 1, "%llu waits, want 1", (unsigned long long)(host.waits - after.waits));
+
+    // A GPU thread's load: no wait, the shadow as it is. The page stays owed:
+    // a load after it still waits for the write.
+    owe(h.l());
+    memset(shadow + h.l(), 0x33, size);
+    uint8_t g = 0;
+    std::thread([&] {
+        writewatch::t_gpuThread = true;
+        g = *reinterpret_cast<volatile uint8_t*>(Guest(h.l()) + 100);
+    }).join();
+    auto gpu = writewatch::GetDeferStats();
+    CHECK(g == 0x33, "the GPU thread read %02X, want the shadow's 33", g);
+    CHECK(gpu.staleReadbacks == host.staleReadbacks + 1, "%llu stale read-backs, want 1", (unsigned long long)(gpu.staleReadbacks - host.staleReadbacks));
+    CHECK(gpu.waits == host.waits, "a GPU thread waited");
+    writewatch::Rearm();  // (the GPU thread's access opened the page until the next submission)
+    Served s3;
+    serve(s3, h.l(), 0x44, ++submission);
+    uint8_t w = *reinterpret_cast<volatile uint8_t*>(Guest(h.l()) + 100);
+    s3.stop.store(true);
+    s3.thread.join();
+    CHECK(w == 0x44, "a load after the GPU thread's read %02X, not the deferred write's 44", w);
+    CHECK(writewatch::GetDeferStats().waits == gpu.waits + 1, "the load after the GPU thread's didn't wait");
+    writewatch::EnableShadow(nullptr);
+}
+
 static int Run()
 {
     s_subpages = Stats().subpages;
@@ -731,6 +837,7 @@ static int Run()
     UntileAndGpuWrite({ page += 0x10000 }, submission);
     UntileBehindRead({ page += 0x10000 }, submission);
     RepeatedFault({ page += 0x10000 });
+    DeferredWrite({ page += 0x10000 }, submission);  // (last: it turns shadow mode on and off)
     s_gpuQuit.store(true);
     gpu.join();
     printf(g_failures ? "%d failure(s)\n" : "all passed\n", g_failures);

@@ -830,6 +830,12 @@ namespace gpu
                         spinFrom = std::chrono::steady_clock::now();
                         continue;
                     }
+                    // A guest thread waiting on the GPU meanwhile: what it
+                    // waits for may be recorded only now (a deferred resolve's
+                    // guest bytes, NFSMW_RESOLVE_DEFER), and it may be what
+                    // stores the value this waits for.
+                    if (writewatch::g_submitRequested.exchange(false))
+                        renderer::Submit();
                     if (guesttime::Suspended() || guesttime::Epoch() != waitEpoch)
                     {
                         // What it waits for comes from game threads or the

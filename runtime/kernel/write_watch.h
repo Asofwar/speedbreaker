@@ -164,6 +164,23 @@ namespace writewatch
     // is stale until a CPU access reads them back (after the write completes).
     void MarkGpuOwned(uint32_t physical, uint32_t size);
     bool AnyGpuOwned(uint32_t physical, uint32_t size);
+    // Shadow mode, NFSMW_RESOLVE_DEFER (renderer): a resolve into the range
+    // (GPU-owned and guarded as any) whose guest bytes the renderer writes
+    // into the shadow only when something reads them. A CPU access to its
+    // pages asks for that write (g_writeDeferred and g_submitRequested) and
+    // waits until it is recorded (DeferredWritten, after the write's own
+    // GpuWrite guard), then for the write as for any resolve. Counted per
+    // host page, so ranges sharing one stack up. The command processor's
+    // threads can't wait for themselves: they read such a page back stale
+    // (counted: GetDeferStats().staleReadbacks).
+    void DeferWrite(uint32_t physical, uint32_t size);
+    void DeferredWritten(uint32_t physical, uint32_t size);
+    extern std::atomic<bool> g_writeDeferred;  // a CPU access waits for a deferred write (the renderer clears it)
+    struct DeferStats
+    {
+        uint64_t waits = 0, staleReadbacks = 0;
+    };
+    DeferStats GetDeferStats();
 
     // Totals so far, for the [perf] line and hitch reports (protects: mprotect
     // calls, and their time on all threads; hostWriteBytes: file reads into

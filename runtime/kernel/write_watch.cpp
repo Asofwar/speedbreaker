@@ -13,6 +13,7 @@
 namespace writewatch
 {
     std::atomic<bool> g_submitRequested{ false };
+    std::atomic<bool> g_writeDeferred{ false };
     thread_local bool t_gpuThread = false;
     std::atomic<uint32_t> g_snapsOpen{ 0 };
 
@@ -66,6 +67,10 @@ namespace writewatch
         uint8_t* s_shadow = nullptr;
         std::unique_ptr<std::atomic<uint64_t>[]> s_shadowSeq;
         std::unique_ptr<std::atomic<uint8_t>[]> s_gpuOwned;
+        // Per host page, the resolves whose shadow bytes there are still to
+        // be written (DeferWrite); any such page is GPU-owned too.
+        std::unique_ptr<std::atomic<uint8_t>[]> s_deferred;
+        std::atomic<uint64_t> s_deferredWaits{ 0 }, s_deferredStale{ 0 };
         // Highest write sequence per 256 KB block: clean ranges are skipped
         // without looking at their pages.
         constexpr uint32_t kBlockShift = 18;
@@ -444,9 +449,10 @@ namespace writewatch
         uint8_t WantedProt(uint32_t page)
         {
             // Shadow mode: GPU reads use the copy, so only GPU-written pages
-            // (stale here) and write tracking need protection.
+            // (stale here; or owed, DeferWrite, even after a GPU thread read
+            // one back) and write tracking need protection.
             if (s_shadow)
-                return s_gpuOwned[page].load() ? 2 : s_watched[page].load() ? 1 : 0;
+                return s_gpuOwned[page].load() || s_deferred[page].load() ? 2 : s_watched[page].load() ? 1 : 0;
             uint64_t completed = s_completed.load();
             uint8_t prot = s_watched[page].load() ? 1 : 0;
             for (uint32_t i = 0, sub = page * s_subsPerPage; i < s_subsPerPage; i++, sub++)
@@ -466,6 +472,8 @@ namespace writewatch
         {
             if (!s_shadow || !s_gpuOwned[page].load())
                 return;
+            if (s_deferred[page].load(std::memory_order_acquire))
+                s_deferredStale.fetch_add(1, std::memory_order_relaxed);  // (a GPU thread's: see DeferWrite)
             SetProt(page, 0);
             memcpy(GuestPage(page), s_shadow + (uint64_t(page) << s_pageShift), s_pageSize);
             s_readbackBytes += s_pageSize;
@@ -764,6 +772,23 @@ namespace writewatch
             return done;
         }
 
+        // A CPU access to a host page whose shadow bytes a resolve still owes
+        // (DeferWrite): ask the command processor to record that write (the
+        // renderer does at its next submit) and wait until it has. Its GPU
+        // write then guards the page as any resolve's: wait for it next.
+        void WaitForDeferred(uint32_t page)
+        {
+            s_deferredWaits.fetch_add(1, std::memory_order_relaxed);
+            while (s_deferred[page].load(std::memory_order_acquire))
+            {
+                g_writeDeferred.store(true);
+                g_submitRequested.store(true);
+                gpu::g_cpDoorbell.Ring();
+                struct timespec ts{ 0, guesttime::g_state.suspended.load(std::memory_order_relaxed) ? 1'000'000 : 20'000 };
+                nanosleep(&ts, nullptr);
+            }
+        }
+
         void Guard(uint32_t physical, uint32_t size, uint64_t submission, bool write, const char* tag, bool untile = false)
         {
             if (!s_pageCount || size == 0)
@@ -821,10 +846,12 @@ namespace writewatch
             s_written[i].store(0);
         s_shadowSeq.reset(new std::atomic<uint64_t>[s_pageCount]);
         s_gpuOwned.reset(new std::atomic<uint8_t>[s_pageCount]);
+        s_deferred.reset(new std::atomic<uint8_t>[s_pageCount]);
         for (uint32_t i = 0; i < s_pageCount; i++)
         {
             s_shadowSeq[i].store(0);
             s_gpuOwned[i].store(0);
+            s_deferred[i].store(0);
         }
         s_blockWritten.reset(new std::atomic<uint64_t>[kPhysicalSize >> kBlockShift]);
         s_blockGpuWrite.reset(new std::atomic<uint64_t>[kPhysicalSize >> kBlockShift]);
@@ -981,9 +1008,27 @@ namespace writewatch
         if (start < 0 || end < start)
             return;
         s_hostWriteBytes += size;
-        for (int64_t sub = start >> kSubShift; sub <= end >> kSubShift; sub++)
-            WaitForGpu(uint32_t(sub), true);
-        std::lock_guard lock(s_protectMutex);
+        // Owed resolve bytes (DeferWrite) first: their write, then as below.
+        // Looked at again under the lock (one may be owed meanwhile).
+        auto owed = [&] {
+            if (s_shadow && !t_gpuThread)
+                for (int64_t page = start >> s_pageShift; page <= end >> s_pageShift; page++)
+                    if (s_deferred[page].load(std::memory_order_acquire))
+                        return int64_t(page);
+            return int64_t(-1);
+        };
+        std::unique_lock lock(s_protectMutex, std::defer_lock);
+        while (true)
+        {
+            for (int64_t page; (page = owed()) >= 0;)
+                WaitForDeferred(uint32_t(page));
+            for (int64_t sub = start >> kSubShift; sub <= end >> kSubShift; sub++)
+                WaitForGpu(uint32_t(sub), true);
+            lock.lock();
+            if (owed() < 0)
+                break;
+            lock.unlock();
+        }
         ProtectRun run;
         for (int64_t page = start >> s_pageShift; page <= end >> s_pageShift; page++)
         {
@@ -1055,6 +1100,14 @@ namespace writewatch
                 // is a fallback): the guest page's guard is dropped.
                 s_gpuRead[sub].store(0);
                 s_gpuWrite[sub].store(0);
+            }
+            // A resolve's write still to be recorded (DeferWrite): ask for it
+            // and wait, then go on as for any resolve's.
+            if (s_shadow && !t_gpuThread && s_deferred[page].load(std::memory_order_acquire))
+            {
+                lock.unlock();
+                WaitForDeferred(page);
+                continue;
             }
             if (s_shadow && s_gpuOwned[page].load())
             {
@@ -1358,6 +1411,32 @@ namespace writewatch
             if (s_gpuOwned[page].load())
                 return true;
         return false;
+    }
+
+    void DeferWrite(uint32_t physical, uint32_t size)
+    {
+        if (!s_shadow || !s_pageCount || size == 0)
+            return;
+        uint64_t start = physical & (kPhysicalSize - 1);
+        uint64_t end = std::min<uint64_t>(kPhysicalSize, start + size);
+        for (uint64_t page = start >> s_pageShift; page <= (end - 1) >> s_pageShift; page++)
+            s_deferred[page].fetch_add(1);
+    }
+
+    void DeferredWritten(uint32_t physical, uint32_t size)
+    {
+        if (!s_shadow || !s_pageCount || size == 0)
+            return;
+        uint64_t start = physical & (kPhysicalSize - 1);
+        uint64_t end = std::min<uint64_t>(kPhysicalSize, start + size);
+        // (Release: a waiter that sees the count drop sees the write's guard.)
+        for (uint64_t page = start >> s_pageShift; page <= (end - 1) >> s_pageShift; page++)
+            s_deferred[page].fetch_sub(1, std::memory_order_release);
+    }
+
+    DeferStats GetDeferStats()
+    {
+        return { s_deferredWaits.load(), s_deferredStale.load() };
     }
 
     GuardStats GetGuardStats()
