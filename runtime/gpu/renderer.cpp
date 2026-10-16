@@ -14,6 +14,7 @@
 #include "edge_bars.h"
 #include "front_ring.h"
 #include "memory_plan.h"
+#include "motion_vectors.h"
 #include "pipeline_cache_header.h"
 #include "pipeline_keys.h"
 #include "shader_translator.h"
@@ -23,6 +24,7 @@
 #include "poly_offset.h"
 #include "render_scale.h"
 #include "shared_memory_glsl.h"
+#include "taau_glsl.h"
 #include "texture_budget.h"
 #include "texture_formats.h"
 #include "vertex_snapshot.h"
@@ -912,6 +914,9 @@ namespace gpu::renderer
         bool s_drawUsesLoggedTexture = false;
         bool s_drawScaled = false;  // the current draw renders into scaled targets (internal resolution)
         bool s_logDrawsNow = false;
+        // NFSMW_MV_DUMP=<frame>[,<frames>]: that frame's draws and resolves (Draw, Resolve).
+        bool s_mvDumpNow = false;
+        uint32_t s_mvDumpDraws = 0;
         std::string s_loggedTextureFetch;
         uint32_t s_drawsSinceCheck = 0;
         bool s_submitAfterDraw = false;  // mid-batch submit to a starving GPU (eager writes)
@@ -1459,6 +1464,8 @@ namespace gpu::renderer
             std::mutex compileMutex;
             bool vertexCompiled = false;
             VkShaderModule module = VK_NULL_HANDLE;  // VS
+            bool mvCompiled = false;                 // VS, NFSMW_MV: the motion vector variant (MV defined)
+            VkShaderModule mvModule = VK_NULL_HANDLE;
             // PS variants by (colour outputs, interpolator inputs, alpha test).
             std::unordered_map<uint32_t, VkShaderModule> variants;
         };
@@ -1763,25 +1770,28 @@ namespace gpu::renderer
         // A pixel shader variant: colour outputs only for bound attachments
         // (Metal rejects others), inputs only for interpolators the vertex
         // shader writes, and the alpha test compiled in only when enabled.
-        VkShaderModule VertexModule(Shader& vs)
+        VkShaderModule VertexModule(Shader& vs, bool mv = false)
         {
             std::lock_guard lock(vs.compileMutex);
-            if (!vs.vertexCompiled)
+            bool& compiled = mv ? vs.mvCompiled : vs.vertexCompiled;
+            VkShaderModule& module = mv ? vs.mvModule : vs.module;
+            if (!compiled)
             {
-                vs.vertexCompiled = true;
+                compiled = true;
                 std::string log;
-                auto spirv = CompileGlsl(vs.info.glsl, GLSLANG_STAGE_VERTEX, log);
+                auto spirv = CompileGlsl(vs.info.glsl, GLSLANG_STAGE_VERTEX, log, mv ? "#define MV\n" : "");
                 if (spirv.empty())
-                    fprintf(stderr, "[renderer] vs_%016llx: GLSL compile failed:\n%s\n", (unsigned long long)vs.hash, log.c_str());
+                    fprintf(stderr, "[renderer] vs_%016llx%s: GLSL compile failed:\n%s\n", (unsigned long long)vs.hash, mv ? " (MV)" : "", log.c_str());
                 else
-                    vs.module = CreateModule(spirv);
+                    module = CreateModule(spirv);
             }
-            return vs.module;
+            return module;
         }
 
-        VkShaderModule PixelVariant(Shader& ps, uint32_t outputs, uint32_t inputs, bool alphaTest)
+        // `mv` (NFSMW_MV): colour output 3 is the motion vector (MV_OUT).
+        VkShaderModule PixelVariant(Shader& ps, uint32_t outputs, uint32_t inputs, bool alphaTest, bool mv = false)
         {
-            uint32_t key = (outputs & 0xF) | ((inputs & 0xFFFF) << 4) | (alphaTest ? 1u << 20 : 0);
+            uint32_t key = (outputs & 0xF) | ((inputs & 0xFFFF) << 4) | (alphaTest ? 1u << 20 : 0) | (mv ? 1u << 21 : 0);
             std::lock_guard lock(ps.compileMutex);
             auto it = ps.variants.find(key);
             if (it != ps.variants.end())
@@ -1795,6 +1805,8 @@ namespace gpu::renderer
                     preamble += std::format("#define IN{}\n", i);
             if (alphaTest)
                 preamble += "#define ALPHA_TEST\n";
+            if (mv)
+                preamble += "#define MV_OUT 3\n";
             std::string log;
             auto spirv = CompileGlsl(ps.info.glsl, GLSLANG_STAGE_FRAGMENT, log, preamble);
             VkShaderModule module = VK_NULL_HANDLE;
@@ -1927,6 +1939,78 @@ namespace gpu::renderer
             bool wholeArea = false;
         };
         std::unordered_map<uint64_t, std::unique_ptr<RenderTarget>> s_targets;
+
+        // NFSMW_MV=1: motion vectors, jitter and the prototype temporal
+        // upscaler (gpu/motion_vectors.h, gpu/taau_glsl.h). Off by default;
+        // without it nothing below runs. The scene is the 1280x720 view
+        // (RGBA8 colour at pitch 1280, a depth target, viewport scale 640 x
+        // -360) up to its first tile resolve: the shadow maps, the road
+        // reflection and the environment cube come before it, the game's
+        // post-processing (bloom, the colour treatment) and the HUD after.
+        struct MotionVectors
+        {
+            bool on = false;
+            float scale = 1.0f;     // NFSMW_MV_SCALE: the scene's render size, a fraction of 1280x720 (0.5..1)
+            uint32_t mode = 0;      // NFSMW_MV_MODE: 0 the draws' vectors, 1 the camera's (depth), 2 none
+            bool jitter = true;     // NFSMW_MV_JITTER=0: no jitter
+            bool taau = true;       // NFSMW_MV_TAAU=0: no upscaler (the scene as drawn: vectors, jitter and size only)
+            bool debug = false;     // NFSMW_MV_DEBUG=1: the vectors as colours instead of the picture
+            bool clip = true;       // NFSMW_MV_CLIP=0: the history unclipped (to see what the vectors alone do)
+            float feedback = 0.9f;  // NFSMW_MV_FEEDBACK: the history's weight
+            uint32_t phases = 8;    // NFSMW_MV_PHASES: jitter phases
+            bool log = false;       // NFSMW_MV_LOG=1: a line per frame
+            // This frame (s_frame `frame`).
+            uint64_t frame = ~0ull, lastScene = ~0ull;
+            bool done = false;      // its scene was resolved (the upscaler ran)
+            uint32_t draws = 0, matched = 0, unmatched = 0, translucent = 0;
+            double maxDistance = 0;
+            RenderTarget* color = nullptr;
+            RenderTarget* depth = nullptr;
+            float jx = 0, jy = 0;   // render pixels
+            gpu::mv::DrawHistory history;
+            gpu::mv::CameraVote vote;
+            gpu::mv::Mat4 vpPrev;
+            bool havePrev = false;
+            // Resources.
+            RenderTarget velocity{};  // R16G16_SFLOAT, not in s_targets: only the scene's passes attach it
+            bool velocityMade = false;
+            Image taaHistory[2], out, depthTemp;
+            uint32_t historyIndex = 0, outW = 0, outH = 0;
+            bool historyValid = false;
+            VkSampler sampler = VK_NULL_HANDLE;
+            VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
+            VkPipelineLayout layout = VK_NULL_HANDLE;
+            VkPipeline pipeline = VK_NULL_HANDLE;
+        } s_mv;
+        void MvFinishScene();
+        const bool s_mvConfigured = [] {
+            const char* v = std::getenv("NFSMW_MV");
+            s_mv.on = v && v[0] == '1';
+            if (const char* s = std::getenv("NFSMW_MV_SCALE"))
+                s_mv.scale = std::clamp(float(std::atof(s)), 0.5f, 1.0f);
+            if (const char* s = std::getenv("NFSMW_MV_MODE"))
+                s_mv.mode = strcmp(s, "camera") == 0 ? 1u : strcmp(s, "none") == 0 ? 2u : 0u;
+            if (const char* s = std::getenv("NFSMW_MV_JITTER"))
+                s_mv.jitter = s[0] != '0';
+            if (const char* s = std::getenv("NFSMW_MV_TAAU"))
+                s_mv.taau = s[0] != '0';
+            if (const char* s = std::getenv("NFSMW_MV_DEBUG"))
+                s_mv.debug = s[0] == '1';
+            if (const char* s = std::getenv("NFSMW_MV_CLIP"))
+                s_mv.clip = s[0] != '0';
+            if (const char* s = std::getenv("NFSMW_MV_FEEDBACK"))
+                s_mv.feedback = std::clamp(float(std::atof(s)), 0.0f, 0.98f);
+            if (const char* s = std::getenv("NFSMW_MV_PHASES"))
+                s_mv.phases = uint32_t(std::clamp(std::atoi(s), 1, 64));
+            else
+                s_mv.phases = uint32_t(std::lround(8.0f / (s_mv.scale * s_mv.scale)));
+            s_mv.log = std::getenv("NFSMW_MV_LOG") != nullptr;
+            if (s_mv.on)
+                fprintf(stderr, "[mv] motion vectors on: render scale %.3f, vectors %s, jitter %s (%u phases), upscaler %s%s\n", s_mv.scale,
+                    s_mv.mode == 0 ? "per draw" : s_mv.mode == 1 ? "camera only" : "none", s_mv.jitter ? "on" : "off", s_mv.phases,
+                    s_mv.taau ? "on" : "off", s_mv.debug ? " (debug: vectors shown)" : "");
+            return true;
+        }();
 
         VkFormat ColorFormat(uint32_t format)
         {
@@ -2687,7 +2771,9 @@ namespace gpu::renderer
         // locked modules and the (internally synchronized) pipeline cache.
         VkPipeline BuildPipeline(const PipelineKey& key, VkPipelineLayout layout, Shader& vs, Shader& ps)
         {
-            VkShaderModule vsModule = VertexModule(vs);
+            // key.pad bit 0 (NFSMW_MV): the motion vector variants, attachment 3 the vectors.
+            const bool mv = key.pad & 1;
+            VkShaderModule vsModule = VertexModule(vs, mv);
             if (!vsModule)
                 return VK_NULL_HANDLE;
             VkPipelineShaderStageCreateInfo stages[2]{};
@@ -2697,9 +2783,11 @@ namespace gpu::renderer
             for (int i = 0; i < 4; i++)
                 if (key.colorFormats[i] != 0)
                     outputs |= 1u << i;
+            if (mv)
+                outputs &= 7u;
             uint32_t psRegs = std::min(16u, ps.info.registerCount);
             uint32_t inputs = vs.info.interpolatorMask & ((1u << psRegs) - 1);
-            VkShaderModule psModule = PixelVariant(ps, outputs, inputs, (key.raster >> 5) & 1);
+            VkShaderModule psModule = PixelVariant(ps, outputs, inputs, (key.raster >> 5) & 1, mv);
             if (!psModule)
                 return VK_NULL_HANDLE;
             stages[1] = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT,
@@ -6014,6 +6102,15 @@ void main()
                 : uint32_t(destInfo.copy_dest_format);
             bool copy = copyControl.copy_command == xenos::CopyCommand::kRaw ||
                 copyControl.copy_command == xenos::CopyCommand::kConvert;
+            // NFSMW_MV: the scene's first resolve, of its colour or depth:
+            // the scene is complete, the upscaler writes its output first.
+            if (s_mv.on && !s_mv.done && s_mv.frame == s_frame && s_mv.draws && (source == s_mv.color || source == s_mv.depth))
+                MvFinishScene();
+            if (s_mvDumpNow)
+                fprintf(stderr, "[mvdump] resolve after d%u: %s b%u f%u p%u rect (%d,%d)-(%d,%d) -> %08X fmt %u pitch %u h %u copy %u clear%s%s\n",
+                    s_mvDumpDraws, depthSource ? "depth" : "color", source->base, source->format, pitch, r.x0, r.y0, r.x1, r.y1, destBase,
+                    format, uint32_t(destPitch.copy_dest_pitch), uint32_t(destPitch.copy_dest_height), uint32_t(copy),
+                    copyControl.color_clear_enable ? " c" : "", copyControl.depth_clear_enable ? " d" : "");
             if (copy && destBase != 0)
             {
                 auto [extentStart, extentEnd] = ResolveExtent(r, (destPitch.copy_dest_pitch + 31) & ~31u, ResolveBppLog2(format));
@@ -6417,6 +6514,316 @@ void main()
                 module, "main", nullptr };
             cpci.layout = layout;
             Check(vkCreateComputePipelines(s_dev, s_pipelineCache, 1, &cpci, nullptr, &pipeline), "compute pipeline");
+        }
+
+        // ---------------------------------------------------------------
+        // NFSMW_MV (s_mv): the scene's draws, their previous constants and
+        // the upscaler at the scene's end.
+
+        // The velocity target, at least the size of the scene's pass (its
+        // colour and depth targets' common size); it only grows (the race and
+        // the menus use depth targets of other heights), and a larger one
+        // leaves the pass's extent as it was (the attachments' smallest).
+        void MvEnsureVelocity(RenderTarget* color, RenderTarget* depth)
+        {
+            RenderTarget& v = s_mv.velocity;
+            uint32_t w = std::min(color->width, depth->width), h = std::min(color->height, depth->height);
+            uint32_t gw = std::min(color->guestWidth, depth->guestWidth), gh = std::min(color->guestHeight, depth->guestHeight);
+            if (s_mv.velocityMade && v.width >= w && v.height >= h && v.scale == color->scale)
+                return;
+            if (s_mv.velocityMade && v.scale == color->scale)
+            {
+                w = std::max(w, v.width);
+                h = std::max(h, v.height);
+                gw = std::max(gw, v.guestWidth);
+                gh = std::max(gh, v.guestHeight);
+            }
+            EndPass();
+            if (s_mv.velocityMade)
+            {
+                Flush();
+                DestroyImage(v.image);
+            }
+            v = RenderTarget{};
+            v.base = 0xFFFF;  // (no EDRAM base: never resolved, never in s_targets)
+            v.pitch = color->pitch;
+            v.guestWidth = gw;
+            v.guestHeight = gh;
+            v.scale = color->scale;
+            v.width = w;
+            v.height = h;
+            v.vkFormat = VK_FORMAT_R16G16_SFLOAT;
+            v.image = CreateImage(VK_IMAGE_TYPE_2D, v.vkFormat, { w, h, 1 }, 1,
+                VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+                VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT);
+            v.sampleView = v.image.view;
+            Begin();
+            ToGeneral(v.image.image, VK_IMAGE_ASPECT_COLOR_BIT, 1);
+            FullBarrier();
+            s_mv.velocityMade = true;
+            fprintf(stderr, "[mv] velocity target %ux%u\n", w, h);
+        }
+
+        // Whether this draw is one of the scene's (see s_mv); the first of a
+        // frame starts the frame's state. Called with the draw's targets.
+        bool MvSceneDraw(xenos::EdramMode edramMode, RenderTarget* const color[4], RenderTarget* depth, bool adopted)
+        {
+            if (edramMode != xenos::EdramMode::kColorDepth || adopted || !depth || !color[0] || color[1] || color[2] || color[3])
+                return false;
+            if (color[0]->pitch != 1280 || depth->pitch != 1280 || color[0]->vkFormat != VK_FORMAT_R8G8B8A8_UNORM)
+                return false;
+            if ((Reg<reg::PA_CL_VTE_CNTL>().value & 0xF) != 0xF || RegF(XE_GPU_REG_PA_CL_VPORT_XSCALE) != 640.0f ||
+                RegF(XE_GPU_REG_PA_CL_VPORT_YSCALE) != -360.0f)
+                return false;
+            const TranslatedShader& vi = s_vs->info;
+            if (!(vi.positionConsts[0] | vi.positionConsts[1] | vi.positionConsts[2] | vi.positionConsts[3]))
+                return false;
+            if (s_mv.frame != s_frame)
+            {
+                // A new frame. Its history and camera follow the last scene's
+                // only when that was the frame before.
+                const bool follows = s_mv.lastScene != ~0ull && s_mv.lastScene + 1 == s_frame;
+                s_mv.history.NextFrame();
+                if (!follows)
+                {
+                    s_mv.history.NextFrame();
+                    s_mv.havePrev = false;
+                    s_mv.historyValid = false;
+                }
+                s_mv.frame = s_mv.lastScene = s_frame;
+                s_mv.done = false;
+                s_mv.draws = s_mv.matched = s_mv.unmatched = s_mv.translucent = 0;
+                s_mv.maxDistance = 0;
+                s_mv.vote.Clear();
+                s_mv.jx = s_mv.jy = 0.0f;
+                if (s_mv.jitter)
+                    gpu::mv::Jitter(s_frame, s_mv.phases, s_mv.jx, s_mv.jy);
+            }
+            if (s_mv.done || (s_mv.draws && (color[0] != s_mv.color || depth != s_mv.depth)))
+                return false;
+            MvEnsureVelocity(color[0], depth);
+            if (s_mv.draws == 0)
+            {
+                s_mv.color = color[0];
+                s_mv.depth = depth;
+                // No vector yet: x 32768 (the upscaler then uses the camera's).
+                VkClearValue none{};
+                none.color.float32[0] = 32768.0f;
+                s_pendingClears.push_back({ &s_mv.velocity, { { 0, 0 }, { s_mv.velocity.width, s_mv.velocity.height } }, none });
+            }
+            s_mv.draws++;
+            return true;
+        }
+
+        // This scene draw's previous position constants (DrawHistory, keyed by
+        // the shader, its vertex buffers and indices), and its constants as the
+        // vertex shader reads them (packed or the whole file) with those
+        // replaced: `block`, in vec4s. False when the previous frame had no
+        // such draw. Records this draw's constants for the next frame and its
+        // matrix for the camera's vote.
+        bool MvPreviousConstants(uint32_t indexBase, uint32_t count, uint32_t prim, std::vector<float>& block)
+        {
+            const TranslatedShader& vi = s_vs->info;
+            uint64_t key = s_vs->hash * 0x9E3779B97F4A7C15ull;
+            auto mix = [&](uint64_t v) { key = (key ^ v) * 0x100000001B3ull; };
+            mix(indexBase);
+            mix(count);
+            mix(prim);
+            for (const vsnap::FetchUse& u : vi.vertexFetches)
+                mix(s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + u.constant * 2] & 0x1FFFFFFCu);
+            float cone[64 * 4];
+            uint32_t indices[64], n = 0;
+            for (uint32_t k = 0; k < 256 && n < 64; k++)
+                if ((vi.positionConsts[k >> 6] >> (k & 63)) & 1)
+                {
+                    memcpy(cone + n * 4, &s_regs[XE_GPU_REG_SHADER_CONSTANT_000_X + k * 4], 16);
+                    indices[n++] = k;
+                }
+            // The view-projection's vote: the first four, when they are a block.
+            if (n >= 4 && indices[3] == indices[0] + 3)
+                s_mv.vote.Add(cone);
+            float distance = 0;
+            const float* prev = s_mv.history.Previous(key, cone, n, &distance);
+            s_mv.history.Record(key, cone, n);
+            if (!prev)
+                return false;
+            s_mv.maxDistance = std::max(s_mv.maxDistance, double(distance));
+            // The constants as the shader reads them.
+            const bool packed = vi.constPacked;
+            block.clear();
+            uint32_t c = 0;
+            for (uint32_t k = 0; k < 256; k++)
+            {
+                if (packed && !((vi.constUsed[k >> 6] >> (k & 63)) & 1))
+                    continue;
+                const float* v = reinterpret_cast<const float*>(&s_regs[XE_GPU_REG_SHADER_CONSTANT_000_X + k * 4]);
+                while (c < n && indices[c] < k)
+                    c++;
+                if (c < n && indices[c] == k)
+                    v = prev + c * 4;
+                block.insert(block.end(), v, v + 4);
+            }
+            return true;
+        }
+
+        // The scene is complete (its first tile resolve, before it reads):
+        // the camera's matrices for the next frame, and the upscaler, which
+        // writes the output into the scene's colour target.
+        void MvFinishScene()
+        {
+            s_mv.done = true;
+            gpu::mv::Mat4 vp, camera, inverse;
+            for (int i = 0; i < 4; i++)
+                camera.at(i, i) = 1.0f;
+            uint32_t votes = 0, total = 0;
+            const bool haveVp = s_mv.vote.Winner(vp, votes, total);
+            const bool haveCamera = haveVp && s_mv.havePrev && gpu::mv::Invert(vp, inverse);
+            if (haveCamera)
+                camera = gpu::mv::Multiply(s_mv.vpPrev, inverse);
+            if (haveVp)
+            {
+                s_mv.vpPrev = vp;
+                s_mv.havePrev = true;
+            }
+            if (s_mv.log)
+                fprintf(stderr, "[mv] frame %llu: %u scene draws, %u matched, %u not, %u translucent (max distance %.3g); camera %u of %u votes%s; jitter %.3f %.3f\n",
+                    (unsigned long long)s_frame, s_mv.draws, s_mv.matched, s_mv.unmatched, s_mv.translucent, s_mv.maxDistance, votes, total,
+                    haveCamera ? "" : " (no previous)", s_mv.jx, s_mv.jy);
+            if (!s_mv.taau)
+                return;
+            RenderTarget* color = s_mv.color;
+            RenderTarget* depth = s_mv.depth;
+            const uint32_t outW = color->scale.x.Size(1280), outH = color->scale.y.Size(720);
+            if (!s_mv.pipeline)
+            {
+                VkSamplerCreateInfo sci{ VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO };
+                sci.magFilter = sci.minFilter = VK_FILTER_LINEAR;
+                sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+                Check(vkCreateSampler(s_dev, &sci, nullptr, &s_mv.sampler), "mv sampler");
+                VkDescriptorSetLayoutBinding b[6] = {
+                    { 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+                    { 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+                    { 2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+                    { 3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+                    { 4, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+                    { 5, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+                };
+                CreateComputePipeline(gpu::kTaauGlsl, b, 6, 96, s_mv.setLayout, s_mv.layout, s_mv.pipeline);
+            }
+            if (s_mv.outW != outW || s_mv.outH != outH)
+            {
+                EndPass();
+                if (s_mv.outW)
+                {
+                    Flush();
+                    DestroyImage(s_mv.taaHistory[0]);
+                    DestroyImage(s_mv.taaHistory[1]);
+                    DestroyImage(s_mv.out);
+                    if (s_mv.depthTemp.image)
+                        DestroyImage(s_mv.depthTemp);
+                    s_mv.depthTemp = {};
+                }
+                for (Image& h : s_mv.taaHistory)
+                    h = CreateImage(VK_IMAGE_TYPE_2D, VK_FORMAT_R16G16B16A16_SFLOAT, { outW, outH, 1 }, 1,
+                        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT);
+                s_mv.out = CreateImage(VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM, { outW, outH, 1 }, 1,
+                    VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT);
+                Begin();
+                for (Image* i : { &s_mv.taaHistory[0], &s_mv.taaHistory[1], &s_mv.out })
+                    ToGeneral(i->image, VK_IMAGE_ASPECT_COLOR_BIT, 1);
+                s_mv.outW = outW;
+                s_mv.outH = outH;
+                s_mv.historyValid = false;
+                fprintf(stderr, "[mv] upscaler: render %.0fx%.0f -> %ux%u\n", outW * s_mv.scale, outH * s_mv.scale, outW, outH);
+            }
+            EndPass();
+            Begin();
+            FlushPendingClears(&s_mv.velocity);
+            FullBarrier();
+            struct
+            {
+                float camera[16];
+                float jitter[2], renderSize[2], outSize[2];
+                uint32_t flags;
+                float feedback;
+            } p{};
+            static_assert(sizeof(p) == 96);
+            for (int r = 0; r < 4; r++)
+                for (int c = 0; c < 4; c++)
+                    p.camera[c * 4 + r] = camera.at(r, c);
+            p.jitter[0] = s_mv.jx;
+            p.jitter[1] = s_mv.jy;
+            p.renderSize[0] = float(outW) * s_mv.scale;
+            p.renderSize[1] = float(outH) * s_mv.scale;
+            p.outSize[0] = float(outW);
+            p.outSize[1] = float(outH);
+            p.flags = s_mv.mode | (s_mv.historyValid ? 0u : 4u) | (s_mv.debug ? 8u : 0u) | (s_mv.clip ? 0u : 16u);
+            p.feedback = s_mv.feedback;
+            const uint32_t prev = s_mv.historyIndex, next = prev ^ 1;
+            VkDescriptorImageInfo ii[6] = {
+                { s_mv.sampler, color->sampleView, VK_IMAGE_LAYOUT_GENERAL },
+                { s_mv.sampler, depth->sampleView, VK_IMAGE_LAYOUT_GENERAL },
+                { s_mv.sampler, s_mv.velocity.sampleView, VK_IMAGE_LAYOUT_GENERAL },
+                { s_mv.sampler, s_mv.taaHistory[prev].view, VK_IMAGE_LAYOUT_GENERAL },
+                { VK_NULL_HANDLE, s_mv.taaHistory[next].view, VK_IMAGE_LAYOUT_GENERAL },
+                { VK_NULL_HANDLE, s_mv.out.view, VK_IMAGE_LAYOUT_GENERAL },
+            };
+            VkWriteDescriptorSet w[6];
+            for (uint32_t i = 0; i < 6; i++)
+                w[i] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, i, 0, 1,
+                    i < 4 ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ii[i], nullptr, nullptr };
+            ComputeWorkRecorded();
+            vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_mv.pipeline);
+            s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_mv.layout, 0, 6, w);
+            vkCmdPushConstants(s_cmd, s_mv.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p), &p);
+            vkCmdDispatch(s_cmd, (outW + 7) / 8, (outH + 7) / 8, 1);
+            FullBarrier();
+            VkImageCopy region{};
+            region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+            region.extent = { outW, outH, 1 };
+            vkCmdCopyImage(s_cmd, s_mv.out.image, VK_IMAGE_LAYOUT_GENERAL, color->image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+            // Below 1x the depth too: the game's composite reads the scene's
+            // depth resolve (its depth effects). Nearest, through a copy (a
+            // blit can't overlap itself).
+            if (s_mv.scale != 1.0f)
+            {
+                if (!s_mv.depthTemp.image)
+                {
+                    VkFormatProperties fp;
+                    vkGetPhysicalDeviceFormatProperties(s_vk->physical, depth->vkFormat, &fp);
+                    const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
+                    if ((fp.optimalTilingFeatures & need) != need)
+                        LogOnce(0x4D56, "[mv] depth blits not supported: the scene's depth stays at the render size");
+                    else
+                    {
+                        s_mv.depthTemp = CreateImage(VK_IMAGE_TYPE_2D, depth->vkFormat, { outW, outH, 1 }, 1,
+                            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_VIEW_TYPE_2D,
+                            VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
+                        ToGeneral(s_mv.depthTemp.image, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT, 1);
+                    }
+                }
+                if (s_mv.depthTemp.image)
+                {
+                    const VkImageAspectFlags aspects = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+                    VkImageBlit blit{};
+                    blit.srcSubresource = { aspects, 0, 0, 1 };
+                    blit.dstSubresource = { aspects, 0, 0, 1 };
+                    blit.srcOffsets[1] = { int32_t(std::lround(outW * s_mv.scale)), int32_t(std::lround(outH * s_mv.scale)), 1 };
+                    blit.dstOffsets[1] = { int32_t(outW), int32_t(outH), 1 };
+                    vkCmdBlitImage(s_cmd, depth->image.image, VK_IMAGE_LAYOUT_GENERAL, s_mv.depthTemp.image, VK_IMAGE_LAYOUT_GENERAL, 1, &blit,
+                        VK_FILTER_NEAREST);
+                    FullBarrier();
+                    VkImageCopy back{};
+                    back.srcSubresource = { aspects, 0, 0, 1 };
+                    back.dstSubresource = { aspects, 0, 0, 1 };
+                    back.extent = { outW, outH, 1 };
+                    vkCmdCopyImage(s_cmd, s_mv.depthTemp.image, VK_IMAGE_LAYOUT_GENERAL, depth->image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &back);
+                }
+            }
+            FullBarrier();
+            s_mv.historyIndex = next;
+            s_mv.historyValid = true;
         }
 
         // Scaled memory's GPU side (see ScaledMemory): made on the first
@@ -8305,6 +8712,17 @@ void main()
                     adoptedDepth ? (adoptedColor ? "colour and depth" : "depth") : "colour");
             }
         }
+        // NFSMW_MV: a scene draw gets the velocity target as attachment 3,
+        // written unless it blends (gpu/motion_vectors.h).
+        const bool mvScene = s_mv.on && MvSceneDraw(edramMode, color, depth, adoptedColor || adoptedDepth);
+        if (mvScene)
+        {
+            color[3] = &s_mv.velocity;
+            if ((s_regs[XE_GPU_REG_RB_BLENDCONTROL0] & 0x1FFF1FFF) == 0x00010001)
+                writeMask |= 0x3u << 12;
+            else
+                s_mv.translucent++;
+        }
         // Before the textures are looked up: a draw into scaled targets
         // samples scaled textures (every attachment shares the pitch, so the scale).
         s_drawScaled = false;
@@ -8504,6 +8922,11 @@ void main()
                 key.blend[i] = bc;
         }
         key.colorMask = writeMask;  // (none for adopted targets)
+        if (mvScene)
+        {
+            key.blend[3] = ~0u;
+            key.pad = 1;
+        }
         if (depth)
         {
             key.depthFormat = depth->vkFormat;
@@ -8700,13 +9123,25 @@ void main()
         // were 9 KB an upload, ~2,500 uploads a frame into the BAR ring.
         const Shader* constLayoutVs = s_vs->info.constPacked ? s_vs : nullptr;
         const Shader* constLayoutPs = s_ps->info.constPacked ? s_ps : nullptr;
+        // NFSMW_MV: a scene draw's vertex shader constants with the previous
+        // frame's position constants, for its second run (pc.vfRedirect[0][3]:
+        // their word in the ring; ~0u none), placed before the snapshots.
+        static std::vector<float> mvBlock;
+        bool mvMatched = false;
+        if (mvScene)
+        {
+            mvMatched = MvPreviousConstants(src.indexed ? src.base : 0, count, uint32_t(initiator.prim_type), mvBlock);
+            (mvMatched ? s_mv.matched : s_mv.unmatched)++;
+            pc.vfRedirect[0][3] = ~0u;
+        }
+        const VkDeviceSize mvBytes = mvMatched ? (VkDeviceSize(mvBlock.size()) * 4 + 255) & ~VkDeviceSize(255) : 0;
         while (true)
         {
             bool uploadConstants = g_constantsDirty.load(std::memory_order_relaxed) ||
                 s_lastConstantsSubmission != s_submissionCounter || !s_recording ||
                 constLayoutVs != s_lastConstLayoutVs || constLayoutPs != s_lastConstLayoutPs;
             VkDeviceSize need = (uploadConstants ? kConstantsSize : 0) + (useIndices ? 256 + indexBytes : 0) +
-                (copyCount ? 256 + copyBytes : 0);
+                (copyCount ? 256 + copyBytes : 0) + (mvBytes ? 256 + mvBytes : 0);
             if (need == 0)
                 break;
             uint64_t before = s_submissionCounter;
@@ -8807,6 +9242,12 @@ void main()
                     }
                 }
             }
+            const VkDeviceSize afterIndices = (at + (uploadConstants ? kConstantsSize : 0) + (useIndices ? 256 + indexBytes : 0) + 255) & ~VkDeviceSize(255);
+            if (mvBytes)
+            {
+                memcpy(s_ringHost + afterIndices, mvBlock.data(), mvBlock.size() * 4);
+                pc.vfRedirect[0][3] = uint32_t(afterIndices >> 2);
+            }
             if (copyCount)
             {
                 // As the shader sees them (+ VGT_INDX_OFFSET, pc.indexOffset).
@@ -8817,7 +9258,7 @@ void main()
                 // wrong (compare the frames with a run without: timedemo
                 // shots, docs/timedemo.md).
                 static const bool poison = std::getenv("NFSMW_CP_OPT_VERIFY") != nullptr;
-                VkDeviceSize snapshot = (at + (uploadConstants ? kConstantsSize : 0) + (useIndices ? 256 + indexBytes : 0) + 255) & ~VkDeviceSize(255);
+                VkDeviceSize snapshot = afterIndices + mvBytes;
                 for (uint32_t i = 0; i < copyCount; i++)
                 {
                     const vsnap::Span span = vsnap::Needed(copies[i].use, vertices, copies[i].size);
@@ -9039,6 +9480,17 @@ void main()
         }
         if (s_passBarrier >= 2)
             VertexBarrierIfNeeded(layout.vsMasks, pc.indexAddress, pc.indexAddress ? count << (src.is32 ? 2 : 1) : 0);
+        // NFSMW_MV_SCALE: the scene drawn into the top left of its targets
+        // at that fraction (below, posScale), its scissor too.
+        if (mvScene && s_mv.scale != 1.0f)
+        {
+            const float s = s_mv.scale;
+            const int32_t sx0 = int32_t(std::floor(float(scissor.offset.x) * s)), sy0 = int32_t(std::floor(float(scissor.offset.y) * s));
+            const int32_t sx1 = int32_t(std::ceil(float(scissor.offset.x + int32_t(scissor.extent.width)) * s));
+            const int32_t sy1 = int32_t(std::ceil(float(scissor.offset.y + int32_t(scissor.extent.height)) * s));
+            scissor = { { sx0, sy0 }, { uint32_t(sx1 - sx0), uint32_t(sy1 - sy0) } };
+            drawScissor = scissor;
+        }
         BeginPass(color, depth, scissor);
         if (s_profiling && !s_passInfos.empty())
         {
@@ -9052,6 +9504,18 @@ void main()
         pc.posScale[2] = 2.0f * ox / w - 1.0f;
         pc.posScale[3] = 2.0f * oy / h - 1.0f;
         pc.flags = 1u | (vte.vtx_w0_fmt ? 2u : 0u) | (vte.vtx_xy_fmt ? 4u : 0u) | (vte.vtx_z_fmt ? 8u : 0u);
+        // NFSMW_MV: the scene's draws scaled about the target's top left
+        // corner (NDC' = (NDC + 1) s - 1) and shifted by the frame's jitter,
+        // in host pixels of the target (render pixels); the motion vectors
+        // are made from the positions before this.
+        if (mvScene)
+        {
+            const float s = s_mv.scale;
+            pc.posScale[0] *= s;
+            pc.posScale[1] *= s;
+            pc.posScale[2] = pc.posScale[2] * s + (s - 1.0f) + 2.0f * s_mv.jx / (w * scaleX);
+            pc.posScale[3] = pc.posScale[3] * s + (s - 1.0f) + 2.0f * s_mv.jy / (h * scaleY);
+        }
         // Ultrawide (game/ultrawide): the 16:9 guest frame is stretched to the
         // screen and the front-end (HUD and menu) matrix is narrowed by s to
         // match. Full-screen front-end layers (fades to black, the dims behind
@@ -9640,6 +10104,43 @@ void main()
                 last = line;
                 repeats = 0;
             }
+        }
+        // NFSMW_MV_DUMP=<frame>: every draw of that frame with the constants
+        // its position depends on (motion vector research, gpu/motion_vectors).
+        if (s_mvDumpNow)
+        {
+            static uint32_t index = 0;
+            if (s_mvDumpDraws == 0)
+                index = 0;
+            s_mvDumpDraws++;
+            std::string line = std::format("[mvdump] d{} f{} mode{} prim{} n{} vs_{:016x} ps_{:016x}", index++, s_frame,
+                uint32_t(edramMode), uint32_t(initiator.prim_type), count, s_vs->hash, s_ps->hash);
+            for (int i = 0; i < 4; i++)
+                if (color[i])
+                    line += std::format(" c{}=b{}f{}p{}{}", i, color[i]->base, color[i]->format, color[i]->pitch, (adoptedColor >> i) & 1 ? "a" : "");
+            if (depth)
+                line += std::format(" z=b{}f{} zc{:08X}", depth->base, depth->format, depthControl.value);
+            line += std::format(" msaa{} vp s({:.1f},{:.1f},{:.4f}) o({:.1f},{:.1f},{:.4f}) vte{:03X} wm{:04X} bl{:08X}",
+                uint32_t(surface.msaa_samples), sx, sy, sz, ox, oy, oz, vte.value & 0xFFF, writeMask, s_regs[XE_GPU_REG_RB_BLENDCONTROL0]);
+            for (const vsnap::FetchUse& u : s_vs->info.vertexFetches)
+                line += std::format(" vf{}:{:08X}", u.constant, s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + u.constant * 2] & 0x1FFFFFFCu);
+            for (uint32_t n = 0; n < 32; n++)
+                if ((s_ps->info.texture2DMask | s_ps->info.texture3DMask | s_ps->info.textureCubeMask) & (1u << n))
+                    line += std::format(" t{}:{:08X}", n, (s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + n * 6 + 1] & 0x1FFFF000u));
+            line += " pos[";
+            for (uint32_t k = 0; k < 256; k++)
+                if ((s_vs->info.positionConsts[k >> 6] >> (k & 63)) & 1)
+                    line += std::format("{} ", k);
+            line += s_vs->info.positionRelative ? "rel]" : "]";
+            fprintf(stderr, "%s\n", line.c_str());
+            // The constants the position reads, row by row.
+            for (uint32_t k = 0; k < 256; k++)
+                if ((s_vs->info.positionConsts[k >> 6] >> (k & 63)) & 1)
+                {
+                    float v[4];
+                    memcpy(v, &s_regs[XE_GPU_REG_SHADER_CONSTANT_000_X + k * 4], sizeof(v));
+                    fprintf(stderr, "[mvdump]   c%u = %.6g %.6g %.6g %.6g\n", k, v[0], v[1], v[2], v[3]);
+                }
         }
         pc.vsConstBase = 0;
         pc.psConstBase = 256;
@@ -10506,6 +11007,19 @@ void main()
             writewatch::SetWriterFrame(frame);
         }
         s_frame = frame;
+        {
+            static const std::pair<uint64_t, uint64_t> dump = [] {
+                const char* v = std::getenv("NFSMW_MV_DUMP");
+                unsigned long long from = ~0ull, n = 1;
+                if (v)
+                    sscanf(v, "%llu,%llu", &from, &n);
+                return std::pair<uint64_t, uint64_t>{ from, n };
+            }();
+            if (s_mvDumpNow)
+                fprintf(stderr, "[mvdump] end of frame %llu: %u draws\n", (unsigned long long)frame - 1, s_mvDumpDraws);
+            s_mvDumpNow = frame >= dump.first && frame - dump.first < dump.second;
+            s_mvDumpDraws = 0;
+        }
         if (s_vk)
             TrimTextureCache();
         if (s_vk)

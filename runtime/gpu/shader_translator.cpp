@@ -142,6 +142,131 @@ float xmul(float a, float b)
             // Previous vfetch_full, for vfetch_mini.
             VertexFetchInstruction lastFullFetch{};
 
+            // Which float constants each register component depends on
+            // (vertex shaders: TranslatedShader::positionConsts).
+            struct Influence
+            {
+                uint64_t c[4] = {};
+                bool rel = false;
+                void Add(const Influence& o)
+                {
+                    for (int q = 0; q < 4; q++)
+                        c[q] |= o.c[q];
+                    rel = rel || o.rel;
+                }
+            };
+            std::vector<std::array<Influence, 4>> regInfluence = std::vector<std::array<Influence, 4>>(128);
+            Influence psInfluence;
+
+            std::array<Influence, 4> SourceInfluence(const AluInstruction& op, uint32_t i)
+            {
+                std::array<Influence, 4> r{};
+                uint32_t reg = op.src_reg(i), sw = op.src_swizzle(i);
+                for (uint32_t c = 0; c < 4; c++)
+                {
+                    uint32_t comp = AluInstruction::GetSwizzledComponentIndex(sw, c);
+                    if (op.src_is_temp(i))
+                    {
+                        uint32_t t = AluInstruction::src_temp_reg(reg);
+                        if (t < regInfluence.size())
+                            r[c] = regInfluence[t][comp];
+                    }
+                    else if (op.src_const_is_addressed(i))
+                        r[c].rel = true;
+                    else if (reg < 256)
+                        r[c].c[reg >> 6] |= 1ull << (reg & 63);
+                }
+                return r;
+            }
+
+            // After the instruction's code: what its results depend on.
+            void TrackInfluence(const AluInstruction& op, uint32_t vecMask, uint32_t scaMask, uint32_t zeroMask, uint32_t oneMask)
+            {
+                if (stage != ShaderStage::Vertex)
+                    return;
+                const auto& vinfo = GetAluVectorOpcodeInfo(op.vector_opcode());
+                std::array<Influence, 4> vec{};
+                std::array<Influence, 4> src[3];
+                uint32_t n = 0;
+                for (uint32_t i = 1; i <= 3; i++)
+                    if (vinfo.GetOperandCount() >= i)
+                        src[n++] = SourceInfluence(op, i);
+                switch (op.vector_opcode())
+                {
+                case AluVectorOpcode::kDp4:
+                case AluVectorOpcode::kDp3:
+                case AluVectorOpcode::kDp2Add:
+                case AluVectorOpcode::kCube:
+                case AluVectorOpcode::kMax4:
+                case AluVectorOpcode::kDst:
+                {
+                    Influence all;
+                    for (uint32_t k = 0; k < n; k++)
+                        for (auto& x : src[k])
+                            all.Add(x);
+                    vec.fill(all);
+                    break;
+                }
+                default:
+                    for (uint32_t k = 0; k < n; k++)
+                        for (int c = 0; c < 4; c++)
+                            vec[c].Add(src[k][c]);
+                }
+                Influence sca = psInfluence;
+                if (GetAluScalarOpcodeInfo(op.scalar_opcode()).operand_count > 0)
+                {
+                    std::array<Influence, 4> s3 = SourceInfluence(op, 3);
+                    for (auto& x : s3)
+                        sca.Add(x);
+                    switch (op.scalar_opcode())
+                    {
+                    case AluScalarOpcode::kMulsc0: case AluScalarOpcode::kMulsc1:
+                    case AluScalarOpcode::kAddsc0: case AluScalarOpcode::kAddsc1:
+                    case AluScalarOpcode::kSubsc0: case AluScalarOpcode::kSubsc1:
+                    {
+                        uint32_t t = op.scalar_const_reg_op_src_temp_reg();
+                        if (t < regInfluence.size())
+                            for (auto& x : regInfluence[t])
+                                sca.Add(x);
+                        break;
+                    }
+                    default:
+                        break;
+                    }
+                }
+                if (op.scalar_opcode() != AluScalarOpcode::kRetainPrev)
+                    psInfluence = sca;
+                if (op.is_export())
+                {
+                    if (op.vector_dest() != 62)
+                        return;
+                    for (uint32_t c = 0; c < 4; c++)
+                    {
+                        const Influence* w = (vecMask & (1u << c)) ? &vec[c] : (scaMask & (1u << c)) ? &sca : nullptr;
+                        if (!w)
+                            continue;
+                        for (int q = 0; q < 4; q++)
+                            out.positionConsts[q] |= w->c[q];
+                        out.positionRelative = out.positionRelative || w->rel;
+                    }
+                    return;
+                }
+                auto store = [&](uint32_t dest, bool relative, uint32_t mask, const Influence& (*pick)(const std::array<Influence, 4>&, const Influence&, int),
+                                 const std::array<Influence, 4>& v, const Influence& s) {
+                    if (relative || dest >= regInfluence.size())
+                        return;
+                    for (int c = 0; c < 4; c++)
+                        if (mask & (1u << c))
+                            regInfluence[dest][c] = pick(v, s, c);
+                };
+                store(op.vector_dest(), op.is_vector_dest_relative(), vecMask,
+                    [](const std::array<Influence, 4>& v, const Influence&, int c) -> const Influence& { return v[c]; }, vec, sca);
+                store(op.scalar_dest(), op.is_scalar_dest_relative(), scaMask,
+                    [](const std::array<Influence, 4>&, const Influence& s, int) -> const Influence& { return s; }, vec, sca);
+                (void)zeroMask;
+                (void)oneMask;
+            }
+
             // Whether an instruction emitted so far may write r0.x, the
             // vertex index as a vertex shader starts (runVertex): a fetch
             // indexed by r0.x after none did reads the vertex's own element
@@ -209,6 +334,10 @@ float xmul(float a, float b)
                 {
                     // Resolved to a packed slot (or kept) once all reads are known.
                     out.constUsed[index >> 6] |= 1ull << (index & 63);
+                    // Vertex shaders through CV(): the motion vector variant
+                    // reads the previous frame's constants on its second run.
+                    if (stage == ShaderStage::Vertex)
+                        return std::format("CV(@CK{}@)", index);
                     return std::format("u.c[{} + @CK{}@]", ConstBase(), index);
                 }
                 if (addressing == 0)
@@ -510,6 +639,7 @@ float xmul(float a, float b)
                     indent--;
                     Line("}");
                 }
+                TrackInfluence(op, vecMask, scaMask, zeroMask, oneMask);
             }
 
             // Destination swizzle for fetches: 3 bits per component.
@@ -520,6 +650,10 @@ float xmul(float a, float b)
                     if (((swizzle >> (3 * c)) & 7) != 7)
                         written |= 1u << c;
                 NoteWrite(dest, destRelative, written);
+                if (!destRelative && dest < regInfluence.size())
+                    for (uint32_t c = 0; c < 4; c++)
+                        if (written & (1u << c))
+                            regInfluence[dest][c] = {};
                 std::string dst = Reg(dest, destRelative);
                 for (uint32_t c = 0; c < 4; c++)
                 {
@@ -1119,6 +1253,12 @@ vec3 cubeDirection(vec3 c)
             for (int i = 0; i < 4; i++)
                 g += std::format("#ifdef OUT{0}\nlayout(location = {0}) out vec4 o_c{0};\n#endif\n", i);
             g += "vec4 o_color[4];\n";
+            // MV_OUT=<n> (the motion vector variant, NFSMW_MV): colour output
+            // n gets the pixel's motion since the previous frame, in guest
+            // NDC (previous - current), from the vertex shader's positions;
+            // x 32768 where the draw had no previous position.
+            g += "#ifdef MV_OUT\nlayout(location = 16) in vec4 i_mvCur;\nlayout(location = 17) in vec4 i_mvPrev;\n"
+                 "layout(location = MV_OUT) out vec4 o_mv;\n#endif\n";
         }
         // Registers and machine state are globals so helpers can update them.
         g += "vec4 r[R_COUNT];\nbool p0 = false;\nint a0 = 0;\nint aL = 0;\nfloat ps = 0.0;\nfloat texLod = 0.0;\n";
@@ -1128,13 +1268,36 @@ vec3 cubeDirection(vec3 c)
         else
             g += "vec4 o_depth = vec4(0.0);\nbool killed = false;\n";
         g += kStateHelpers;
+        if (stage == ShaderStage::Vertex)
+        {
+            // MV (the motion vector variant, NFSMW_MV): main() runs the
+            // shader twice, the second time with the previous frame's
+            // constants for this draw, which the host put in the ring at
+            // pc.vfRedirect[0].w (in words; ~0u: none, one run).
+            g += R"(
+#ifdef MV
+uint g_mvPass = 0u;
+vec4 CV(uint i)
+{
+    if (g_mvPass == 0u)
+        return u.c[pc.vsConstBase + i];
+    uint o = pc.vfRedirect[0].w + i * 4u;
+    return uintBitsToFloat(uvec4(g_ring[o], g_ring[o + 1u], g_ring[o + 2u], g_ring[o + 3u]));
+}
+layout(location = 16) out vec4 o_mvCur;
+layout(location = 17) out vec4 o_mvPrev;
+#else
+#define CV(i) u.c[pc.vsConstBase + (i)]
+#endif
+)";
+        }
         g += std::format(R"(
 vec4 constRel(int index, int rel)
 {{
     int i = index + rel;
-    return (i < 0 || i > 255) ? vec4(0.0) : u.c[{} + uint(i)];
+    return (i < 0 || i > 255) ? vec4(0.0) : {};
 }}
-)", stage == ShaderStage::Vertex ? "pc.vsConstBase" : "pc.psConstBase");
+)", stage == ShaderStage::Vertex ? "CV(uint(i))" : "u.c[pc.psConstBase + uint(i)]");
         if (stage == ShaderStage::Pixel)
             g += "vec4 killv(bool c) { if (c) killed = true; return vec4(0.0); }\nfloat kills(bool c) { if (c) killed = true; return 0.0; }\n";
         else
@@ -1195,6 +1358,16 @@ void main()
     }
     vec4 pos = vec4(0.0), pos0 = vec4(0.0);
     vec4 it[16], it0[16];
+#ifdef MV
+    // Run 0 is the draw; run 1 (with the previous frame's constants) only
+    // gives the position the vertex had then. One call site still.
+    vec4 mvPos[2] = vec4[2](vec4(0.0), vec4(0.0, 0.0, 0.0, 1.0));
+    vec4 itCur[16];
+    uint mvRuns = pc.vfRedirect[0].w == 0xFFFFFFFFu ? 1u : 2u;
+    for (uint mvp = 0u; mvp < mvRuns; mvp++)
+    {
+    g_mvPass = mvp;
+#endif
     for (uint c = 0u; c < count; c++)
     {
         runVertex(first + c);
@@ -1213,11 +1386,26 @@ void main()
             for (int i = 0; i < 16; i++) it[i] = it[i] + o_interpT[i] - it0[i];
         }
     }
+#ifdef MV
+    mvPos[mvp] = pos;
+    if (mvp == 0u) itCur = it;
+    }
+    pos = mvPos[0];
+    it = itCur;
+#endif
 @@VS_OUTPUTS@@    // PA_CL_VTE_CNTL formats (as Xenia): bit 1 W is not 1/W, bit 2 XY were
     // already divided by W, bit 3 Z was.
     if ((pc.flags & 2u) == 0u) pos.w = 1.0 / pos.w;
     if ((pc.flags & 4u) != 0u) pos.xy *= pos.w;
     if ((pc.flags & 8u) != 0u) pos.z *= pos.w;
+#ifdef MV
+    // Guest clip positions, before the host transform (and its jitter).
+    vec4 prev = mvPos[1];
+    if ((pc.flags & 2u) == 0u) prev.w = 1.0 / prev.w;
+    if ((pc.flags & 4u) != 0u) prev.xy *= prev.w;
+    o_mvCur = pos;
+    o_mvPrev = mvRuns == 2u ? prev : vec4(0.0);
+#endif
     if ((pc.flags & 1u) != 0u)
     {
         // Guest viewport transform folded into the shader: guest clip space
@@ -1260,6 +1448,10 @@ void main()
 #endif
 #ifdef OUT3
     o_c3 = o_color[3];
+#endif
+#ifdef MV_OUT
+    o_mv = i_mvPrev.w == 0.0 ? vec4(32768.0, 0.0, 0.0, 0.0)
+        : vec4(i_mvPrev.xy / i_mvPrev.w - i_mvCur.xy / i_mvCur.w, 0.0, 1.0);
 #endif
 }
 )";

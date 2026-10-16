@@ -52,6 +52,13 @@ namespace gpu
         uint64_t constUsed[4] = {};
         bool constRelative = false;
         bool constPacked = false;
+        // Vertex shaders: the float constants (absolute indices 0..255) the
+        // position output depends on through any chain of ALU operations,
+        // in the order the program is written (loops not followed), and
+        // whether one of them is read relative to a0/aL (a bone palette).
+        // The motion vectors (NFSMW_MV) find the draw's transform in them.
+        uint64_t positionConsts[4] = {};
+        bool positionRelative = false;
     };
 
     // NFSMW_CP_OPT bit 8 (on by default): translate shaders with packed constants.

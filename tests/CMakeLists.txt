@@ -149,6 +149,8 @@ sb_test(swapchain_policy_test SOURCES ${RT}/video/swapchain_policy.cpp)
 # pointer-keyed matrix cache and the hook's resend (game/front_end_matrix.h,
 # header only; the "EVENT HANDLER" label above the boot PSA).
 sb_test(front_end_matrix_test)
+# The motion vector prototype's CPU side (gpu/motion_vectors.h, NFSMW_MV).
+sb_test(motion_vectors_test)
 # Settings > Display > Fullscreen against the window's own state
 # (video/fullscreen_policy.h, header only): the green button and other system
 # changes never change the saved setting, the menu does; presenter.cpp is read
