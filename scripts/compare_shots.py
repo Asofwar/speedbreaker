@@ -14,22 +14,23 @@ the differing pixels lie in, and the tiles of an 8x8 grid that hold most of
 them: where in the picture, and how much. A shot passes when no more than
 --tolerance percent of its pixels differ and its PSNR reaches --min-psnr.
 
-Two runs of one build don't draw quite the same pictures, and how far apart
-they are depends on the pace. On a Steam Deck (the default race, 7 shots):
-- uncapped runs (NFSMW_TIMEDEMO_UNCAPPED=1, as measured; five) differed by
-  small amounts over much of the picture (up to 43% of the pixels), worst
-  in the sky and bright areas: a colour value by 49 at most between two
-  uncapped runs (61 against a capped one), at worst 1167 pixels (0.13%) by
-  more than 32, PSNR 37.4 dB at the lowest (33.6 against a capped run);
-- capped runs (at the vblank's pace; two) were nearly the same: two shots
-  of seven identical, the rest off by 3 at most, PSNR 55.8 dB or more.
-So the defaults (--threshold 64 --tolerance 0.05 --min-psnr 30) pass
-uncapped runs' noise and fail what a broken draw does: a missing, misplaced
+A replay draws its pictures the same at any pace (the exposure and the
+clouds, which took from the timing, wait and hold still in a replay). On a
+Steam Deck (the default race, 7 shots):
+- uncapped against uncapped (NFSMW_TIMEDEMO_UNCAPPED=1, as measured), the
+  usual build against its ThinLTO and PGO build: two shots identical, the
+  rest off by 1 at most, PSNR 86.9 dB or more;
+- capped against uncapped, one build: one identical, the rest off by 2 at
+  most but for a spot off by 11 (0.31% of the pixels), PSNR 57.1 dB or more.
+So --strict (--threshold 8 --tolerance 0.01 --min-psnr 50) works for any
+pace and catches subtle changes. The defaults (--threshold 64 --tolerance
+0.05 --min-psnr 30) fail only what a broken draw does: a missing, misplaced
 or wrongly textured object (hundreds of pixels far off), or the whole
-picture off by 8 levels or more (PSNR under 30 dB). --strict (--threshold 8
---tolerance 0.01 --min-psnr 50) is for capped runs, and catches subtle
-changes too. --exact passes identical pictures only. --threshold,
---tolerance and --min-psnr, when given, override the preset's.
+picture off by 8 levels or more (PSNR under 30 dB); they are for runs made
+before the exposure's wait and the clouds' hold, whose uncapped pictures
+differed by up to 49 levels (PSNR 37.4 dB). --exact passes identical
+pictures only. --threshold, --tolerance and --min-psnr, when given,
+override the preset's.
 
 The runs' summary.json say which swap each picture is (the "shots" list):
 pictures of different swaps are different frames, and comparing them would
@@ -57,8 +58,8 @@ import sys
 GRID = 8  # the tiles, GRID x GRID, that say where differences are
 # The gates (see the top): threshold, tolerance (% of pixels), PSNR floor (dB).
 PRESETS = {
-    "default": (64, 0.05, 30.0),  # uncapped runs, as measured
-    "strict": (8, 0.01, 50.0),    # capped runs
+    "default": (64, 0.05, 30.0),  # a broken draw (runs before the exposure wait and the cloud hold)
+    "strict": (8, 0.01, 50.0),    # subtle changes, at any pace
     "exact": (0, 0.0, 0.0),       # identical pictures only
 }
 SHOT_NAME = re.compile(r"^shot-(\d+)\.ppm$")
@@ -206,7 +207,7 @@ def main(argv):
     parser.add_argument("--threshold", type=int, default=None, metavar="N",
                         help="a pixel differs when a colour value differs by more than N (64)")
     parser.add_argument("--min-psnr", type=float, default=None, metavar="DB", help="the PSNR (dB) each shot must reach (30; 0: none)")
-    parser.add_argument("--strict", action="store_true", help="for capped runs: --threshold 8 --tolerance 0.01 --min-psnr 50")
+    parser.add_argument("--strict", action="store_true", help="subtle changes too, at any pace: --threshold 8 --tolerance 0.01 --min-psnr 50")
     parser.add_argument("--exact", action="store_true", help="identical pictures only: --threshold 0 --tolerance 0 --min-psnr 0")
     parser.add_argument("--diff", metavar="DIR", help="write diff-<step>.ppm there for each shot that differs")
     parser.add_argument("--json", metavar="PATH", help="also write the results there as JSON")
