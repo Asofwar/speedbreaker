@@ -686,12 +686,18 @@ namespace gpu::renderer
         VkQueryPool s_timestamps = VK_NULL_HANDLE;  // NFSMW_GPU_TIMING=1 (each costs a blit encoder on MoltenVK)
         double s_timestampPeriod = 1.0;
 
-        // NFSMW_PASS_PROFILE=<frame>: time every render pass of one frame and
-        // print them (targets, area, draws, GPU us). 256 passes max. The
-        // compute work between them is timed too, each dispatch with its
-        // barrier as an entry of its own (ProfileCompute: a resolve, a
-        // texture's load, the scaled memory's, the front buffer).
+        // NFSMW_PASS_PROFILE=<frame>[,<frames>]: time every render pass of one
+        // frame (or of that many from it, each printed) and print them
+        // (targets, area, draws, GPU us). 256 passes max. The compute work
+        // between them is timed too, each dispatch with its barrier as an
+        // entry of its own (ProfileCompute: a resolve, a texture's load, the
+        // scaled memory's, the front buffer).
         const int s_profileFrame = [] { const char* v = std::getenv("NFSMW_PASS_PROFILE"); return v ? std::atoi(v) : -1; }();
+        const int s_profileFrames = [] {
+            const char* v = std::getenv("NFSMW_PASS_PROFILE");
+            const char* comma = v ? std::strchr(v, ',') : nullptr;
+            return comma ? std::max(std::atoi(comma + 1), 1) : 1;
+        }();
         VkQueryPool s_passQueries = VK_NULL_HANDLE;
         // Per profiled pass, also what was recorded in the gap before it:
         // resolves, texture uploads, submissions, guest memory synced to the
@@ -10968,13 +10974,16 @@ void main()
         }
         if (!s_vk || s_profileFrame < 0)
             return;
-        if (frame == uint64_t(s_profileFrame))
-        {
+        auto startProfile = [] {
             s_profiling = true;
             s_passInfos.clear();
             s_gapLast = { s_stats.resolves, s_stats.uploads, s_stats.submits, writewatch::GetGuardStats().uploadBytes };
             s_passQueryNext = 0;
             s_passEndPending = false;
+        };
+        if (frame == uint64_t(s_profileFrame))
+        {
+            startProfile();
             return;
         }
         if (!s_profiling)
@@ -10986,7 +10995,7 @@ void main()
         // where a submission waited).
         double total = 0, between = 0;
         uint64_t lastEnd = 0;
-        fprintf(stderr, "[profile] frame %d: %zu passes\n", s_profileFrame, s_passInfos.size());
+        fprintf(stderr, "[profile] frame %llu: %zu passes\n", (unsigned long long)(frame - 1), s_passInfos.size());
         for (const PassInfo& pi : s_passInfos)
         {
             uint64_t ts[2] = {};
@@ -11001,6 +11010,8 @@ void main()
                 us, pi.draws, gap, pi.resolves, pi.uploads, pi.submits, (unsigned long long)pi.shadowKB, pi.desc.c_str());
         }
         fprintf(stderr, "[profile] total %.1f us in passes, %.1f us between them\n", total, between);
+        if (frame < uint64_t(s_profileFrame) + uint64_t(s_profileFrames))
+            startProfile();
     }
 
     std::vector<uint32_t> CompileShader(const std::string& glsl, int stage, std::string& log)
