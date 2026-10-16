@@ -274,15 +274,16 @@ def phase_video():
     bracket(p, 'bright_2', [('video.brightness', 2, '+2')], [('video.brightness', -2, '0')])
     bracket(p, 'gamma_off', [('video.xbox_display_gamma', -1, 'Off')], [('video.xbox_display_gamma', 1, 'On')])
     # Restart options: changed, the picture as before; put back (the running
-    # values again), as before too.
+    # values again), as before too. (Internal Resolution: 1x is four presses
+    # past Auto, after 0.5x, 0.625x and 0.75x.)
     bracket(p, 'restart', [('video.mipmaps', 1, 'Off', 'at the next launch'),
-                           ('video.internal_resolution', 1, '1x (720p)', 'at the next launch')],
-            [('video.mipmaps', 1, 'On', 'applied now'), ('video.internal_resolution', -1, 'Auto', 'applied now')])
+                           ('video.internal_resolution', 4, '1x (720p)', 'at the next launch')],
+            [('video.mipmaps', 1, 'On', 'applied now'), ('video.internal_resolution', -4, 'Auto', 'applied now')])
     # Stored for the next launch (the relaunch phases): Mipmaps off, both marked.
     p.change('video.mipmaps', 1, 'Off', 'at the next launch')
-    p.change('video.internal_resolution', 1, '1x (720p)', 'at the next launch')
+    p.change('video.internal_resolution', 4, '1x (720p)', 'at the next launch')
     p.shot('menu_restart')  # RESTART on both rows
-    p.change('video.internal_resolution', -1, 'Auto', 'applied now')
+    p.change('video.internal_resolution', -4, 'Auto', 'applied now')
     p.close()
     bracket(p, 'overlay_on', [('advanced.performance_overlay', 1, 'On')], [('advanced.performance_overlay', -1, 'Off')], 2.0)
     # V-Sync off for a while in a scene the game draws at 60 fps: the present
@@ -335,7 +336,7 @@ def phase_relaunch2():
     p.shot('base0')
     p.wait(1.0)
     p.shot('base1')
-    p.change('video.internal_resolution', 1, '1x (720p)', 'at the next launch')
+    p.change('video.internal_resolution', 4, '1x (720p)', 'at the next launch')
     p.close()
     p.shot('end')
     return dict(script=script, keys=p, secs=p.t + 3)

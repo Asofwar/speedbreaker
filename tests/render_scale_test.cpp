@@ -1,26 +1,35 @@
 // Tests for gpu/render_scale.h: the internal resolution as a ratio, 1.5x
-// (3/2) beside the whole scales. From the repo root:
+// (3/2) beside the whole scales, and below 1x 3/4, 5/8 and 1/2. From the
+// repo root:
 //   clang++ -std=c++20 -O2 -Iruntime tests/render_scale_test.cpp -o build/render_scale_test
 //   build/render_scale_test runtime/gpu/renderer.cpp
 // SB_SCALE_FUNCTIONS is the code the shaders compile (GLSL_SCALE_CODE), run
 // here as C++. Checked:
 //   - whole scales give exactly the arithmetic from before 1.5x (edges g x s,
 //     a texel's samples at word x s + j x sx + i), so 2x and 3x don't move;
+//     and the block functions at a den of 1 or 2 exactly those from before
+//     0.75x (every word), so 1.5x doesn't move either;
 //   - at 3/2: edges, ownership (every host pixel one guest owner), the box
 //     filter's weights, the depth sample, the inverse of an edge;
+//   - below 1x the same rules: block edges exact, every host pixel one owner
+//     and no guest pixel two, the weights, the depth sample, 1280x720 at
+//     960x540, 800x450 and 640x360;
 //   - the scaled memory's layout: every host sample of a page one word of
 //     its slot, and a surface resolved in strips and side-by-side halves
 //     (as the game resolves its scene) read back by the texture and
 //     front-buffer untiles sample for sample, also from a texture that
 //     starts at a page inside it, through both resolve paths (per thread
-//     and coalesced, modelled as the shader does them);
-//   - NFSMW_RENDER_SCALE's parse and the settings' half steps;
+//     and coalesced, modelled as the shader does them; coalesced only where
+//     the renderer coalesces: blocks of two rows at most, never below 1x);
+//   - NFSMW_RENDER_SCALE's parse and the settings' half steps and eighths;
 //   - with renderer.cpp's path (ctest passes it): the shaders that read or
 //     write the scaled memory splice the shared code in.
 // Planted bugs this catches (each tried): sbBlockIndex keeping bit 2,
 // sbHostEdge rounding to nearest, sbOwner off by one, sbOverlap's upper
 // bound one pixel short, a coalesced group's block index taken from the
-// pixel (not the word), the untile's block corner not multiplied by den.
+// pixel (not the word), the untile's block corner not multiplied by den;
+// below 1x: sbSubMask naming word bit 4 for x's bit 2 (it is 3), sbSubY
+// dropping y's bit 2 at 8, sbDropBit's order lowest first.
 #include <gpu/render_scale.h>
 
 #include <cstdio>
@@ -41,7 +50,29 @@ static int g_failures = 0;
 static gpu::ScaleGlsl G;  // the shaders' functions
 
 static const AxisScale kHalf{ 3, 2 };
-static const AxisScale kAxes[] = { { 1, 1 }, { 3, 2 }, { 2, 1 }, { 3, 1 }, { 4, 1 } };
+static const AxisScale kAxes[] = { { 1, 1 }, { 3, 2 }, { 2, 1 }, { 3, 1 }, { 4, 1 }, { 3, 4 }, { 5, 8 }, { 1, 2 } };
+// Below 1x: 0.75x, 0.625x, 0.5x.
+static const AxisScale kBelow[] = { { 3, 4 }, { 5, 8 }, { 1, 2 } };
+
+// The block functions as they were before 0.75x (dens of 1 or 2 only).
+static uint32_t OldBlockIndex(uint32_t w, uint32_t denX, uint32_t denY)
+{
+    if (denY == 2)
+        w = (w & 3) | ((w >> 3) << 2);
+    if (denX == 2)
+        w = w >> 1;
+    return w;
+}
+static uint32_t OldBlockWord(uint32_t b, uint32_t denX, uint32_t denY)
+{
+    if (denX == 2)
+        b = b << 1;
+    if (denY == 2)
+        b = (b & 3) | ((b >> 2) << 3);
+    return b;
+}
+static uint32_t OldSubX(uint32_t w, uint32_t denX) { return denX == 2 ? (w & 1) : 0; }
+static uint32_t OldSubY(uint32_t w, uint32_t denY) { return denY == 2 ? ((w >> 2) & 1) : 0; }
 
 // renderer.cpp's Tiled2D (Xenos 2D tiling), as its shaders' tiled2D.
 static uint32_t Tiled2D(uint32_t x, uint32_t y, uint32_t pitch, uint32_t bppLog2)
@@ -78,6 +109,100 @@ static void TestWholeScalesUnchanged()
                     for (uint32_t i = 0; i < sx; i++)
                         CHECK(G.sbSampleWord(w, i, j, sx, sy, 1, 1) == w * sx * sy + j * sx + i, "%ux%u: word %u sample %u,%u", sx, sy, w, i, j);
         }
+    // 1.5x's (and the whole scales') blocks as before 0.75x, word for word.
+    for (uint32_t dx : { 1u, 2u })
+        for (uint32_t dy : { 1u, 2u })
+            for (uint32_t w = 0; w < 1024; w++)
+            {
+                CHECK(G.sbBlockIndex(w, dx, dy) == OldBlockIndex(w, dx, dy), "den %ux%u: word %u block %u, was %u", dx, dy, w,
+                    G.sbBlockIndex(w, dx, dy), OldBlockIndex(w, dx, dy));
+                CHECK(G.sbBlockWord(w, dx, dy) == OldBlockWord(w, dx, dy), "den %ux%u: block %u word %u, was %u", dx, dy, w,
+                    G.sbBlockWord(w, dx, dy), OldBlockWord(w, dx, dy));
+                CHECK(G.sbSubX(w, dx) == OldSubX(w, dx) && G.sbSubY(w, dy) == OldSubY(w, dy), "den %ux%u: word %u sub %u,%u, was %u,%u", dx,
+                    dy, w, G.sbSubX(w, dx), G.sbSubY(w, dy), OldSubX(w, dx), OldSubY(w, dy));
+            }
+}
+
+// Below 1x (3/4, 5/8, 1/2): the same rules as at 3/2, with blocks of den
+// guest pixels holding num host ones.
+static void TestBelowAxis()
+{
+    printf("below 1x: edges, ownership, weights, depth sample\n");
+    for (const AxisScale& a : kBelow)
+    {
+        const uint32_t n = a.num, d = a.den;
+        // Block edges land exactly; the host edges inside a block on the
+        // floor; GuestEdge gives back the first guest edge with that host edge.
+        for (uint32_t g = 0; g < 4096; g++)
+        {
+            uint32_t e = G.sbHostEdge(g, n, d);
+            CHECK(g % d != 0 || e * d == g * n, "%u/%u: block edge %u -> %u", n, d, g, e);
+            CHECK(e * d <= g * n && (e + 1) * d > g * n, "%u/%u: edge %u -> %u, not the floor", n, d, g, e);
+            uint32_t back = G.sbGuestEdge(e, n, d);
+            CHECK(back <= g && G.sbHostEdge(back, n, d) == e && (back == 0 || G.sbHostEdge(back - 1, n, d) < e), "%u/%u: edge %u -> %u -> %u", n,
+                d, g, e, back);
+            CHECK(G.sbHostSize(g, n, d) == (g * n + d - 1) / d, "%u/%u: size %u", n, d, g);
+        }
+        // Every host pixel has one owner, which owns it alone; a guest pixel
+        // owns one host pixel or none, and a block's num of its den own one.
+        for (uint32_t h = 0; h < 4096; h++)
+        {
+            uint32_t g = G.sbOwner(h, n, d);
+            CHECK(G.sbHostEdge(g, n, d) <= h && h < G.sbHostEdge(g + 1, n, d), "%u/%u: host %u: owner %u spans %u..%u", n, d, h, g,
+                G.sbHostEdge(g, n, d), G.sbHostEdge(g + 1, n, d));
+        }
+        for (uint32_t b = 0; b < 64; b++)
+        {
+            uint32_t owners = 0;
+            for (uint32_t s = 0; s < d; s++)
+            {
+                uint32_t g = b * d + s, span = G.sbHostEdge(g + 1, n, d) - G.sbHostEdge(g, n, d);
+                CHECK(span <= 1, "%u/%u: guest %u owns %u host pixels", n, d, g, span);
+                owners += span;
+            }
+            CHECK(owners == n, "%u/%u: block %u has %u owned host pixels", n, d, b, owners);
+        }
+        // Box weights: num a guest pixel, den a host pixel.
+        for (uint32_t g = 0; g < 512; g++)
+        {
+            uint32_t sum = 0;
+            for (uint32_t h = 0; h < 512; h++)
+                sum += G.sbOverlap(g, h, n, d);
+            CHECK(sum == n, "%u/%u: guest %u weighs %u", n, d, g, sum);
+            uint32_t lo = G.sbHostEdge(g, n, d), hi = G.sbHostSize(g + 1, n, d);
+            for (uint32_t h = 0; h < 512; h++)
+                CHECK((G.sbOverlap(g, h, n, d) != 0) == (h >= lo && h < hi), "%u/%u: guest %u host %u: weight %u outside %u..%u", n, d, g,
+                    h, G.sbOverlap(g, h, n, d), lo, hi);
+        }
+        for (uint32_t h = 0; h < 256; h++)
+        {
+            uint32_t sum = 0;
+            for (uint32_t g = 0; g < 1024; g++)
+                sum += G.sbOverlap(g, h, n, d);
+            CHECK(sum == d, "%u/%u: host %u spread %u", n, d, h, sum);
+        }
+        // The depth sample: the host pixel holding the guest pixel's centre.
+        for (uint32_t g = 0; g < 4096; g++)
+        {
+            uint32_t h = G.sbCenterHost(g, n, d);
+            double centre = (g + 0.5) * double(n) / double(d);
+            CHECK(double(h) <= centre && centre < double(h + 1), "%u/%u: depth sample of %u is %u (centre %.3f)", n, d, g, h, centre);
+        }
+        // Rectangles sharing a guest edge share the host edge.
+        for (uint32_t cut = 0; cut <= 1280; cut++)
+            CHECK(G.sbHostEdge(cut, n, d) - G.sbHostEdge(0, n, d) + G.sbHostEdge(1280, n, d) - G.sbHostEdge(cut, n, d) ==
+                G.sbHostEdge(1280, n, d), "%u/%u: cut %u", n, d, cut);
+    }
+    CHECK(G.sbHostEdge(1280, 3, 4) == 960 && G.sbHostEdge(720, 3, 4) == 540, "3/4: 1280x720 -> %ux%u", G.sbHostEdge(1280, 3, 4),
+        G.sbHostEdge(720, 3, 4));
+    CHECK(G.sbHostEdge(1280, 5, 8) == 800 && G.sbHostEdge(720, 5, 8) == 450, "5/8: 1280x720 -> %ux%u", G.sbHostEdge(1280, 5, 8),
+        G.sbHostEdge(720, 5, 8));
+    CHECK(G.sbHostEdge(1280, 1, 2) == 640 && G.sbHostEdge(720, 1, 2) == 360, "1/2: 1280x720 -> %ux%u", G.sbHostEdge(1280, 1, 2),
+        G.sbHostEdge(720, 1, 2));
+    // 3/4's weights: a block's guest pixels read 3 of host 0; 1 of 0 and 2
+    // of 1; 2 of 1 and 1 of 2; 3 of 2.
+    CHECK(G.sbOverlap(0, 0, 3, 4) == 3 && G.sbOverlap(1, 0, 3, 4) == 1 && G.sbOverlap(1, 1, 3, 4) == 2 && G.sbOverlap(2, 1, 3, 4) == 2 &&
+        G.sbOverlap(2, 2, 3, 4) == 1 && G.sbOverlap(3, 2, 3, 4) == 3, "3/4 weights");
 }
 
 static void TestHalfAxis()
@@ -192,7 +317,7 @@ static void TestSlotLayout()
             {
                 uint32_t subX = G.sbSubX(w, ax.den), subY = G.sbSubY(w, ay.den);
                 uint32_t b = G.sbBlockIndex(w, ax.den, ay.den);
-                CHECK(G.sbBlockWord(b, ax.den, ay.den) == (w & ~(ax.den == 2 ? 1u : 0u) & ~(ay.den == 2 ? 4u : 0u)), "%s: word %u block %u",
+                CHECK(G.sbBlockWord(b, ax.den, ay.den) == (w & ~G.sbSubMask(ax.den, ay.den)), "%s: word %u block %u",
                     gpu::ScaleName(r).c_str(), w, b);
                 for (uint32_t j = G.sbHostEdge(subY, ay.num, ay.den); j < G.sbHostEdge(subY + 1, ay.num, ay.den); j++)
                     for (uint32_t i = G.sbHostEdge(subX, ax.num, ax.den); i < G.sbHostEdge(subX + 1, ax.num, ax.den); i++)
@@ -210,23 +335,81 @@ static void TestSlotLayout()
             CHECK(bad == 0, "%s: %u slot words not written exactly once", gpu::ScaleName(r).c_str(), bad);
         }
     // The block's texels are the words its sub bits name: at 3/2 a 2x2 block
-    // at even x, y of a tiled surface is one block, whatever the pitch.
-    for (uint32_t pitch : { 640u, 1280u, 1600u, 288u })
-        for (uint32_t y = 0; y < 64; y += 2)
-            for (uint32_t x = 0; x < pitch && x < 256; x += 2)
-            {
-                uint32_t a = Tiled2D(x, y, pitch, 2);
-                uint32_t w = (a & 4095) >> 2, page = a >> 12;
-                uint32_t b = G.sbBlockIndex(w, 2, 2);
-                for (uint32_t dy = 0; dy < 2; dy++)
-                    for (uint32_t dx = 0; dx < 2; dx++)
+    // at even x, y of a tiled surface is one block, whatever the pitch; below
+    // 1x a 4x4 or 8x8 one (or 2x2 at 1/2) at multiples of den, likewise.
+    for (uint32_t dx0 : { 1u, 2u, 4u, 8u })
+        for (uint32_t dy0 : { 1u, 2u, 4u, 8u })
+            for (uint32_t pitch : { 640u, 1280u, 1600u, 288u })
+                for (uint32_t y = 0; y < 64; y += dy0)
+                    for (uint32_t x = 0; x < pitch && x < 256; x += dx0)
                     {
-                        uint32_t t = Tiled2D(x + dx, y + dy, pitch, 2), tw = (t & 4095) >> 2;
-                        CHECK((t >> 12) == page && G.sbBlockIndex(tw, 2, 2) == b && G.sbSubX(tw, 2) == dx && G.sbSubY(tw, 2) == dy,
-                            "pitch %u texel %u,%u: page %u block %u sub %u,%u (block %u at %u,%u)", pitch, x + dx, y + dy, t >> 12,
-                            G.sbBlockIndex(tw, 2, 2), G.sbSubX(tw, 2), G.sbSubY(tw, 2), b, x, y);
+                        uint32_t a = Tiled2D(x, y, pitch, 2);
+                        uint32_t w = (a & 4095) >> 2, page = a >> 12;
+                        uint32_t b = G.sbBlockIndex(w, dx0, dy0);
+                        CHECK(G.sbSubX(w, dx0) == 0 && G.sbSubY(w, dy0) == 0 && G.sbBlockWord(b, dx0, dy0) == w,
+                            "den %ux%u pitch %u block at %u,%u: word %u sub %u,%u, block %u's word %u", dx0, dy0, pitch, x, y, w,
+                            G.sbSubX(w, dx0), G.sbSubY(w, dy0), b, G.sbBlockWord(b, dx0, dy0));
+                        for (uint32_t dy = 0; dy < dy0; dy++)
+                            for (uint32_t dx = 0; dx < dx0; dx++)
+                            {
+                                uint32_t t = Tiled2D(x + dx, y + dy, pitch, 2), tw = (t & 4095) >> 2;
+                                CHECK((t >> 12) == page && G.sbBlockIndex(tw, dx0, dy0) == b && G.sbSubX(tw, dx0) == dx &&
+                                    G.sbSubY(tw, dy0) == dy, "den %ux%u pitch %u texel %u,%u: page %u block %u sub %u,%u (block %u at %u,%u)",
+                                    dx0, dy0, pitch, x + dx, y + dy, t >> 12, G.sbBlockIndex(tw, dx0, dy0), G.sbSubX(tw, dx0),
+                                    G.sbSubY(tw, dy0), b, x, y);
+                            }
                     }
-            }
+    // The sub-texel bits are the ones the tiling moves within a block (x's
+    // bits 0, 1, 2 and y's 0, 1, 2), read off Tiled2D itself.
+    for (uint32_t dx0 : { 1u, 2u, 4u, 8u })
+        for (uint32_t dy0 : { 1u, 2u, 4u, 8u })
+        {
+            uint32_t moved = 0;
+            for (uint32_t dy = 0; dy < dy0; dy++)
+                for (uint32_t dx = 0; dx < dx0; dx++)
+                    moved |= ((Tiled2D(dx, dy, 1280, 2) ^ Tiled2D(0, 0, 1280, 2)) & 4095) >> 2;
+            CHECK(G.sbSubMask(dx0, dy0) == moved, "den %ux%u: sub mask %03X, the tiling moves %03X", dx0, dy0, G.sbSubMask(dx0, dy0), moved);
+        }
+}
+
+// The 1x copy below 1x (renderer.cpp's pxFraction): each guest pixel the
+// host pixel holding its centre (sbCenterHost), as for depth. A step at a
+// block's edge stays exact, a flat picture stays flat, and every host pixel
+// of a whole block is some guest pixel's (none is lost; at 1/2 each is two
+// columns' and two rows').
+static void TestCenterBelow()
+{
+    printf("below 1x: the 1x copy, centre samples\n");
+    for (const AxisScale& a : kBelow)
+    {
+        const uint32_t n = a.num, d = a.den, W = 64, H = 16;
+        const uint32_t HW = G.sbHostEdge(W, n, d), HH = G.sbHostEdge(H, n, d);
+        auto sample = [&](const std::vector<double>& host, uint32_t gx, uint32_t gy) {
+            return host[G.sbCenterHost(gy, n, d) * HW + G.sbCenterHost(gx, n, d)];
+        };
+        std::vector<double> host(HW * HH);
+        for (uint32_t edge : { 8u, 24u, 40u })  // block edges at every den
+        {
+            for (uint32_t j = 0; j < HH; j++)
+                for (uint32_t i = 0; i < HW; i++)
+                    host[j * HW + i] = i < G.sbHostEdge(edge, n, d) ? 0.25 : 0.75;
+            for (uint32_t g = 0; g < W; g++)
+                CHECK(sample(host, g, 1) == (g < edge ? 0.25 : 0.75), "%u/%u: step at %u: guest %u reads %.4f", n, d, edge, g,
+                    sample(host, g, 1));
+        }
+        std::vector<uint32_t> taken(HW, 0);
+        for (uint32_t g = 0; g < W; g++)
+        {
+            uint32_t h = G.sbCenterHost(g, n, d);
+            CHECK(h < HW && h >= G.sbHostEdge(g, n, d) && h < G.sbHostSize(g + 1, n, d), "%u/%u: guest %u reads host %u", n, d, g, h);
+            if (h < HW)
+                taken[h]++;
+        }
+        uint32_t lost = 0;
+        for (uint32_t h = 0; h < HW; h++)
+            lost += taken[h] == 0;
+        CHECK(lost == 0, "%u/%u: %u host columns no guest pixel reads", n, d, lost);
+    }
 }
 
 // The scaled memory, modelled: a page table and a pool of slots.
@@ -323,9 +506,14 @@ static void TestRoundTrip()
     printf("scaled memory: resolved in strips and halves, read back sample for sample\n");
     const uint32_t W = 1280, H = 720, pitch = 1280;
     for (const RenderScale& r : { RenderScale{ kHalf, kHalf }, RenderScale{ kHalf, { 1, 1 } }, RenderScale{ { 2, 1 }, kHalf },
-             RenderScale::Whole(2, 2), RenderScale::Whole(3, 2) })
+             RenderScale::Whole(2, 2), RenderScale::Whole(3, 2), RenderScale{ { 3, 4 }, { 3, 4 } }, RenderScale{ { 5, 8 }, { 5, 8 } },
+             RenderScale{ { 1, 2 }, { 1, 2 } }, RenderScale{ { 3, 4 }, { 1, 1 } }, RenderScale{ { 5, 8 }, { 1, 2 } } })
         for (bool coalesced : { false, true })
         {
+            // (Coalesced only where the renderer coalesces: ScaledCoalesceFits,
+            // blocks of two rows at most, and not below 1x.)
+            if (coalesced && (r.y.den > 2 || r.Below()))
+                continue;
             const uint32_t HW = r.x.Size(W), HH = r.y.Size(H);
             std::vector<uint32_t> src(size_t(HW) * HH);
             for (uint32_t j = 0; j < HH; j++)
@@ -362,7 +550,7 @@ static void TestRoundTrip()
 
 static void TestParse()
 {
-    printf("NFSMW_RENDER_SCALE and the setting's half steps\n");
+    printf("NFSMW_RENDER_SCALE and the setting's half steps and eighths\n");
     struct Case { const char* text; bool ok; RenderScale want; };
     const Case cases[] = {
         { "1", true, RenderScale::Whole(1, 1) },
@@ -380,6 +568,18 @@ static void TestParse()
         { "2x", false, {} },
         { "1.5y2", false, {} },
         { "", false, {} },
+        // Below 1x: the three offered, as fractions in lowest terms.
+        { "0.75", true, { { 3, 4 }, { 3, 4 } } },
+        { "0.625", true, { { 5, 8 }, { 5, 8 } } },
+        { "0.5", true, { { 1, 2 }, { 1, 2 } } },
+        { "0.75x1", true, { { 3, 4 }, { 1, 1 } } },
+        { "1x0.5", true, { { 1, 1 }, { 1, 2 } } },
+        { "0.67", false, {} },   // 2/3 can't be had (gpu/render_scale.h)
+        { "0.6667", false, {} },
+        { "0.6", false, {} },
+        { "0.25", false, {} },
+        { "0.875", false, {} },  // (not offered)
+        { "-1", false, {} },
     };
     for (const Case& c : cases)
     {
@@ -397,6 +597,32 @@ static void TestParse()
     CHECK(half.x.Size(1280) == 1920 && half.y.Size(720) == 1080 && half.SlotWords() == 2304 && half.PixelsNum() == 9 && half.PixelsDen() == 4,
         "1.5x: %ux%u, %u words a page", half.x.Size(1280), half.y.Size(720), half.SlotWords());
     CHECK(half.Exact(1280, 720) && !half.Exact(1279, 720) && !half.Exact(640, 359) && RenderScale::Whole(2, 2).Exact(1279, 359), "exact");
+    // The setting's eighths (settings.h): the seven entries, nothing else.
+    struct Eighth { uint32_t value; AxisScale want; };
+    for (const Eighth& e : { Eighth{ 4, { 1, 2 } }, Eighth{ 5, { 5, 8 } }, Eighth{ 6, { 3, 4 } }, Eighth{ 8, { 1, 1 } }, Eighth{ 12, kHalf },
+             Eighth{ 16, { 2, 1 } }, Eighth{ 24, { 3, 1 } } })
+    {
+        AxisScale got{ 7, 7 };
+        CHECK(gpu::AxisFromEighths(e.value, got) && got == e.want, "eighths %u: %u/%u", e.value, got.num, got.den);
+    }
+    for (uint32_t v : { 0u, 1u, 2u, 3u, 7u, 9u, 10u, 20u, 32u, 64u })
+    {
+        AxisScale got;
+        CHECK(!gpu::AxisFromEighths(v, got), "eighths %u accepted", v);
+    }
+    RenderScale q{ { 3, 4 }, { 3, 4 } }, e5{ { 5, 8 }, { 5, 8 } }, h2{ { 1, 2 }, { 1, 2 } };
+    CHECK(q.x.Size(1280) == 960 && q.y.Size(720) == 540 && q.SlotWords() == 576 && q.PixelsNum() == 9 && q.PixelsDen() == 16 && q.Below() &&
+        !q.IsOne(), "0.75x: %ux%u, %u words a page", q.x.Size(1280), q.y.Size(720), q.SlotWords());
+    CHECK(e5.x.Size(1280) == 800 && e5.y.Size(720) == 450 && e5.SlotWords() == 400 && e5.PixelsNum() == 25 && e5.PixelsDen() == 64,
+        "0.625x: %ux%u, %u words a page", e5.x.Size(1280), e5.y.Size(720), e5.SlotWords());
+    CHECK(h2.x.Size(1280) == 640 && h2.y.Size(720) == 360 && h2.SlotWords() == 256 && h2.PixelsNum() == 1 && h2.PixelsDen() == 4,
+        "0.5x: %ux%u, %u words a page", h2.x.Size(1280), h2.y.Size(720), h2.SlotWords());
+    CHECK(q.Exact(1280, 720) && q.Exact(640, 720) && !q.Exact(1278, 720) && e5.Exact(1280, 720) && e5.Exact(640, 720) && !e5.Exact(1276, 720) &&
+        h2.Exact(1278, 718), "exact below 1x");
+    const RenderScale quarterX{ { 3, 4 }, { 1, 1 } };
+    CHECK(!RenderScale::Whole(2, 2).Below() && !half.Below() && quarterX.Below(), "below");
+    CHECK(gpu::ScaleName(q) == "0.75x0.75" && gpu::ScaleName(e5) == "0.625x0.625" && gpu::ScaleName(h2) == "0.5x0.5", "%s %s %s",
+        gpu::ScaleName(q).c_str(), gpu::ScaleName(e5).c_str(), gpu::ScaleName(h2).c_str());
 }
 
 // The shaders that touch the scaled memory take the shared code.
@@ -423,7 +649,8 @@ static void TestShaders(const char* rendererPath)
             "%s doesn't use the block layout", shader);
     }
     const std::string glsl = GLSL_SCALE_CODE;
-    for (const char* fn : { "uint sbHostEdge(", "uint sbOverlap(", "uint sbCenterHost(", "uint sbBlockIndex(", "uint sbSampleWord(" })
+    for (const char* fn : { "uint sbHostEdge(", "uint sbOverlap(", "uint sbCenterHost(", "uint sbSubMask(", "uint sbDropBit(", "uint sbPutBit(",
+             "uint sbBlockIndex(", "uint sbSampleWord(" })
         CHECK(glsl.find(fn) != std::string::npos, "GLSL_SCALE_CODE lacks %s", fn);
     size_t comments = 0;
     for (size_t at = glsl.find("//"); at != std::string::npos; at = glsl.find("//", at + 2))
@@ -435,7 +662,9 @@ int main(int argc, char** argv)
 {
     TestWholeScalesUnchanged();
     TestHalfAxis();
+    TestBelowAxis();
     TestBoxFilter();
+    TestCenterBelow();
     TestSlotLayout();
     TestRoundTrip();
     TestParse();

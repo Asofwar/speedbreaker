@@ -687,7 +687,10 @@ namespace gpu::renderer
         double s_timestampPeriod = 1.0;
 
         // NFSMW_PASS_PROFILE=<frame>: time every render pass of one frame and
-        // print them (targets, area, draws, GPU us). 256 passes max.
+        // print them (targets, area, draws, GPU us). 256 passes max. The
+        // compute work between them is timed too, each dispatch with its
+        // barrier as an entry of its own (ProfileCompute: a resolve, a
+        // texture's load, the scaled memory's, the front buffer).
         const int s_profileFrame = [] { const char* v = std::getenv("NFSMW_PASS_PROFILE"); return v ? std::atoi(v) : -1; }();
         VkQueryPool s_passQueries = VK_NULL_HANDLE;
         // Per profiled pass, also what was recorded in the gap before it:
@@ -698,6 +701,10 @@ namespace gpu::renderer
         std::vector<PassInfo> s_passInfos;
         bool s_profiling = false;
         uint32_t s_passQueryNext = 0;
+        // The last entry's end timestamp is still to be written (EndPass,
+        // ProfileComputeEnd). With the pool full no entry is added, and the
+        // previous one's end, written already, must not be written again.
+        bool s_passEndPending = false;
         std::atomic<uint64_t> s_gpuExecNs{ 0 };
         std::chrono::steady_clock::time_point s_lastCompletion;
         VkCommandPool s_commandPool = VK_NULL_HANDLE;
@@ -1825,8 +1832,12 @@ namespace gpu::renderer
             uint32_t flags;
             float posScale[4];
             uint32_t vfRedirect[4][4];  // guest start, size, ring offset, 0 (vertex data snapshots)
+            float lodBias;              // the computed LODs' bias: log2(scale) below 1x, else 0 (Draw)
+            uint32_t pad[3];            // (whole 16-byte rows: draw_state::ChangedRows)
         };
-        static_assert(sizeof(DrawConstants) == 112);
+        // 128 bytes: the push-constant size every Vulkan device has
+        // (maxPushConstantsSize's minimum), so nothing more fits here.
+        static_assert(sizeof(DrawConstants) == 128);
 
         struct TextureLayout
         {
@@ -2013,8 +2024,14 @@ namespace gpu::renderer
         // guest pixel's host pixels down into guest memory (depth takes one
         // sample), so the game and the texture cache see 1x data as before.
         // The scale is a ratio on each axis (gpu/render_scale.h): 1, 1.5
-        // (3 host pixels for every 2 guest ones: 1920x1080), 2, 3, 4.
-        // NFSMW_RENDER_SCALE=<n> or <sx>x<sy> (1, 1.5, 2, 3 or 4; default 1).
+        // (3 host pixels for every 2 guest ones: 1920x1080), 2, 3, 4; and
+        // below the 360's 720p 0.75 (3/4: 960x540), 0.625 (5/8: 800x450) and
+        // 0.5 (1/2: 640x360), for a GPU that can't afford 720p, whose frame
+        // the presenter upscales (Upscaling FSR 1). The 1x targets stay 1x
+        // there too: the bloom chain's blurs read the 1x copy of the scene
+        // the resolves still write (box-filtered up from the host pixels).
+        // NFSMW_RENDER_SCALE=<n> or <sx>x<sy> (1, 1.5, 2, 3 or 4, or 0.5,
+        // 0.625 or 0.75; default 1).
         // The setting applies live (ApplyLiveSettings): every scaled target,
         // the scaled resolve memory and the scaled textures are made again at
         // the new scale between two frames, and Auto follows the picture's
@@ -2026,14 +2043,18 @@ namespace gpu::renderer
 
         // What the Internal Resolution setting asks for with the picture
         // covering `regionW` x `regionH` of the swapchain.
-        // The setting's value is the scale in half steps (settings.h: 2 is
-        // 1x, 3 is 1.5x, 4 is 2x, 6 is 3x). Auto (whole scales only, for
-        // now: video::AutoRenderScale) could pick 1.5x by returning one.
+        // The setting's value is the scale in eighths (settings.h: 8 is 1x,
+        // 12 is 1.5x, 16 is 2x, 24 is 3x; below 720p 6 is 0.75x, 5 0.625x
+        // and 4 0.5x). Auto (whole scales only, for now:
+        // video::AutoRenderScale) could pick 1.5x by returning one; it never
+        // goes below 1x (that is the player's call, for a weak GPU).
         gpu::RenderScale WantedRenderScale(int32_t setting, uint32_t regionW, uint32_t regionH)
         {
             if (setting > 0)
             {
-                gpu::AxisScale a = gpu::AxisFromHalves(uint32_t(std::clamp(setting, 2, 6)));
+                gpu::AxisScale a;
+                if (!gpu::AxisFromEighths(uint32_t(setting), a))
+                    a = {};  // (not one of the entries: 1x)
                 return { a, a };
             }
             uint32_t sx = 1, sy = 1;
@@ -2105,7 +2126,8 @@ namespace gpu::renderer
             else
             {
                 if (fixed)
-                    fprintf(stderr, "[renderer] NFSMW_RENDER_SCALE=%s ignored: each axis takes 1, 1.5, 2, 3 or 4 (\"1.5\", \"3x2\")\n", fixed);
+                    fprintf(stderr, "[renderer] NFSMW_RENDER_SCALE=%s ignored: each axis takes 1, 1.5, 2, 3 or 4, or below 720p "
+                        "0.5, 0.625 or 0.75 (\"1.5\", \"3x2\", \"0.75\")\n", fixed);
                 video::FrameRegion(regionW, regionH);
                 s_renderScale = WantedRenderScale(setting, regionW, regionH);
             }
@@ -2249,10 +2271,40 @@ namespace gpu::renderer
             ZpdEndSegment();  // a segment never outlives its pass
             s_vk->cmdEndRendering(s_cmd);
             s_passActive = false;
-            if (s_profiling && !s_passInfos.empty() && s_passInfos.back().query + 1 < s_passQueryNext)
+            if (s_profiling && s_passEndPending)
+            {
                 vkCmdWriteTimestamp(s_cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s_passQueries, s_passInfos.back().query + 1);
+                s_passEndPending = false;
+            }
             PassEndBarrier();
             SignalWrites();
+        }
+
+        // NFSMW_PASS_PROFILE: compute work outside the passes (a resolve, a
+        // texture's load...) timed as an entry of its own, `desc` naming it:
+        // ProfileCompute before its dispatch (outside a pass, recording),
+        // ProfileComputeEnd after it and its barrier. Off: one test each.
+        void ProfileCompute(const char* desc)
+        {
+            if (!s_profiling || s_passQueryNext + 2 > 512)
+                return;
+            vkCmdResetQueryPool(s_cmd, s_passQueries, s_passQueryNext, 2);
+            vkCmdWriteTimestamp(s_cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, s_passQueries, s_passQueryNext);
+            GapCounters now{ s_stats.resolves, s_stats.uploads, s_stats.submits, writewatch::GetGuardStats().uploadBytes };
+            s_passInfos.push_back({ desc, 0, s_slot, s_passQueryNext, uint32_t(now.resolves - s_gapLast.resolves),
+                uint32_t(now.uploads - s_gapLast.uploads), uint32_t(now.submits - s_gapLast.submits), (now.shadowBytes - s_gapLast.shadowBytes) / 1024 });
+            s_gapLast = now;
+            s_passQueryNext += 2;
+            s_passEndPending = true;
+        }
+
+        void ProfileComputeEnd()
+        {
+            if (s_profiling && s_passEndPending)
+            {
+                vkCmdWriteTimestamp(s_cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s_passQueries, s_passInfos.back().query + 1);
+                s_passEndPending = false;
+            }
         }
 
         // Guest rectangle [x0, x1) x [y0, y1) in host pixels at `scale`: its
@@ -2483,6 +2535,7 @@ namespace gpu::renderer
                     uint32_t(now.uploads - s_gapLast.uploads), uint32_t(now.submits - s_gapLast.submits), (now.shadowBytes - s_gapLast.shadowBytes) / 1024 });
                 s_gapLast = now;
                 s_passQueryNext += 2;
+                s_passEndPending = true;
             }
             s_vk->cmdBeginRendering(s_cmd, &ri);
             s_passActive = true;
@@ -3724,7 +3777,9 @@ namespace gpu::renderer
         // the 32-bit texel at guest byte address A are at
         //   slot(A >> 12) x 4096 x s + (A & 4095) x s + (j x sx + i) x 4;
         // at 1.5x a 2x2 block of texels keeps its 3x3 samples together
-        // (gpu/render_scale.h, sbSampleWord, has the layout).
+        // (gpu/render_scale.h, sbSampleWord, has the layout), and below 1x
+        // a block of 2x2 (0.5x), 4x4 (0.75x) or 8x8 texels (0.625x) its 1x1,
+        // 3x3 or 5x5 (s 1/4, 9/16, 25/64: a slot smaller than the page).
         // A page's scaled copy is current while the last write to the page
         // was a scaled resolve: its write sequence is still the one recorded
         // right after that resolve (a CPU write, a 1x resolve or any other
@@ -3757,6 +3812,15 @@ namespace gpu::renderer
             uint64_t allocations = 0, evictions = 0, textures = 0, fallbacks = 0;
             uint64_t loads = 0, untiledBytes = 0, resolvedBytes = 0;  // for the [perf] line
             uint32_t hostPageGuestPages = 1;  // guest pages per host page (write sequences are per host page)
+            // Below 1x (ScaledWriteWanted): per destination, its scaled
+            // copies left unread in a row; per page, the last scaled
+            // resolve's destination (index + 1, 0: none) and whether a reader
+            // took the page's scaled copy since. 1x-only resolves skipped so far.
+            struct Writer { uint64_t key; uint32_t unread; };
+            std::vector<Writer> writers;
+            std::vector<uint16_t> pageWriter;
+            std::vector<uint8_t> pageRead;
+            uint64_t unreadSkips = 0;
         } s_scaled;
 
         bool EnsureScaledMemory();
@@ -3834,18 +3898,130 @@ namespace gpu::renderer
             return seq != 0 && s_scaled.pageSlot[page] != 0 && writewatch::WriteSequence(page << 12, 4096) == seq;
         }
 
-        // Every page of [base, base + size) has a current scaled copy.
+        // Below 1x: a destination whose scaled copy went unread this many
+        // times in a row keeps none (ScaledWriteWanted).
+        constexpr uint32_t kUnreadSkip = 8;
+
+        // Every page of [base, base + size) has a current scaled copy. Below
+        // 1x a reader asks (a scaled texture, the front buffer): the pages
+        // were read (ScaledWriteWanted), or one without a copy is wanted
+        // again from its writer.
         bool ScaledRangeValid(uint32_t base, uint32_t size)
         {
             if (!s_scaled.enabled || size == 0)
                 return false;
             uint32_t first = base >> 12, last = std::min<uint32_t>((base + size - 1) >> 12, kGuestPages - 1);
+            const bool below = s_scaled.scale.Below() && !s_scaled.pageWriter.empty();
             for (uint32_t page = first; page <= last; page++)
                 if (!ScaledPageValid(page))
+                {
+                    if (below)
+                        for (uint32_t p = page; p <= last; p++)
+                            if (uint32_t w = s_scaled.pageWriter[p]; w && s_scaled.writers[w - 1].unread >= kUnreadSkip)
+                                s_scaled.writers[w - 1].unread = 0;
                     return false;
+                }
             for (uint32_t page = first; page <= last; page++)
                 s_scaled.slotRef[s_scaled.pageSlot[page] - 1] = 1;
+            if (below)
+                std::fill(s_scaled.pageRead.begin() + first, s_scaled.pageRead.begin() + last + 1, uint8_t(1));
             return true;
+        }
+
+        // A resolve's pages: [first, last], its extent (ResolveExtent), and
+        // with a page-aligned base of 32-bit texels, where each page is one
+        // 32x32 tile, the tiles its rectangle (destination texels [x0, x1) x
+        // [y0, y1)) touches or covers whole. The extent also holds the tiles
+        // of the rows between that lie beside the rectangle (the right half's
+        // extent runs through the left half's tiles of every row but its last).
+        struct ResolvePages
+        {
+            uint32_t first, last;
+            bool tiles;  // page-aligned 32-bit destination: a page is a tile
+            uint32_t basePage, tilesPerRow;
+            int32_t x0, y0, x1, y1;
+
+            bool Touches(uint32_t page) const
+            {
+                if (!tiles)
+                    return true;
+                const uint32_t t = page - basePage;
+                const int32_t tx = int32_t(t % tilesPerRow * 32), ty = int32_t(t / tilesPerRow * 32);
+                return page >= basePage && tx < x1 && tx + 32 > x0 && ty < y1 && ty + 32 > y0;
+            }
+            bool Covers(uint32_t page) const
+            {
+                if (!tiles)
+                    return false;
+                const uint32_t t = page - basePage;
+                const int32_t tx = int32_t(t % tilesPerRow * 32), ty = int32_t(t / tilesPerRow * 32);
+                return page >= basePage && tx >= x0 && tx + 32 <= x1 && ty >= y0 && ty + 32 <= y1;
+            }
+        };
+
+        // Below 1x, a scaled resolve of `pages` to destination `key` (base,
+        // size, pitch, format): whether to keep its scaled samples. They cost
+        // about what its 1x copy does (a 1280x720 one 0.18 ms at the Steam
+        // Deck's capped clock), and the game writes surfaces it never samples
+        // at host resolution afterwards: its final composite goes over the
+        // scene's texture, read again only once the next frame's scene is
+        // there. The last destinations of the pages it writes (those its
+        // rectangle touches) learn here whether a reader took their copy
+        // before this overwrote it (any of their pages: a texture may read
+        // part); one unread kUnreadSkip times in a row keeps the 1x copy only
+        // from then on, its pages without a scaled one, so a reader uses the
+        // 1x data, and that reader wants it again (ScaledRangeValid): its next
+        // resolve keeps the samples, the frames in between showing the 1x
+        // data. At 1x and above (and with no room for more destinations):
+        // always.
+        bool ScaledWriteWanted(uint64_t key, const ResolvePages& pages)
+        {
+            if (!s_scaled.scale.Below() || s_scaled.pageWriter.empty())
+                return true;
+            auto& writers = s_scaled.writers;
+            uint32_t self = 0;
+            while (self < writers.size() && writers[self].key != key)
+                self++;
+            if (self == writers.size())
+            {
+                if (writers.size() >= 0xFFFF)
+                    return true;
+                writers.push_back({ key, 0 });
+            }
+            // The pages' previous destinations, each once: read or not.
+            uint32_t seen[8], seenCount = 0;
+            bool read[8] = {};
+            for (uint32_t page = pages.first; page <= pages.last; page++)
+            {
+                uint32_t w = s_scaled.pageWriter[page];
+                if (!w || !pages.Touches(page))
+                    continue;
+                uint32_t i = 0;
+                while (i < seenCount && seen[i] != w)
+                    i++;
+                if (i == seenCount)
+                {
+                    if (seenCount == 8)
+                        continue;  // (more than 8 destinations under one resolve: the rest aren't judged)
+                    seen[seenCount++] = w;
+                }
+                read[i] = read[i] || s_scaled.pageRead[page];
+            }
+            for (uint32_t i = 0; i < seenCount; i++)
+            {
+                auto& w = writers[seen[i] - 1];
+                if (read[i])
+                    w.unread = 0;
+                else if (w.unread < UINT32_MAX)
+                    w.unread++;
+            }
+            for (uint32_t page = pages.first; page <= pages.last; page++)
+                if (pages.Touches(page))
+                {
+                    s_scaled.pageWriter[page] = uint16_t(self + 1);
+                    s_scaled.pageRead[page] = 0;
+                }
+            return writers[self].unread < kUnreadSkip;
         }
 
         const char* kUntileGlsl = R"(#version 460
@@ -4542,7 +4718,8 @@ void main()
             // only (resolved surfaces have no mips).
             // (Mipmapped textures keep their levels on the 1x path.)
             // At 1.5x only a texture of whole 2x2 blocks (even width and
-            // height; gpu/render_scale.h).
+            // height; gpu/render_scale.h), below 1x of whole 2x2, 4x4 or
+            // 8x8 ones (the scene's 1280x720 and 640x720 are).
             bool scaledCandidate = !cube && !volume && f.tiled && layers == 1 && !f.stacked &&
                 ScaledFormat(fi) && offX == 0 && offY == 0 && maxLevel == 0 && s_scaled.scale.Exact(width, height) &&
                 s_scaled.scale.HostPixels(width, height) * 4 <= s_scaled.scratchSize;
@@ -4726,12 +4903,15 @@ void main()
                             if (!t.uploaded && slice == 0)
                                 ToGeneral(t.image.image, VK_IMAGE_ASPECT_COLOR_BIT, layers);
                             ComputeWorkRecorded();
+                            if (s_profiling)
+                                ProfileCompute(std::format("texture {}x{} fmt {} at {:08X}, stored directly", width, height, format, base).c_str());
                             vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_untileStorePipeline);
                             s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_untileStoreLayout, 0, AddSharedParts(w, 2), w);
                             vkCmdPushConstants(s_cmd, s_untileStoreLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uc), &uc);
                             if (!(s_exp & 4))
                                 vkCmdDispatch(s_cmd, (bw + 7) / 8, (bh + 7) / 8, 1);
                             FullBarrier();
+                            ProfileComputeEnd();
                             SubmitIfStarving();
                             continue;
                         }
@@ -4756,6 +4936,8 @@ void main()
                             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &ring, nullptr },
                         };
                         ComputeWorkRecorded();
+                        if (s_profiling)
+                            ProfileCompute(std::format("texture {}x{} fmt {} at {:08X}, staged", width, height, format, base).c_str());
                         vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_untilePipeline);
                         s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_untileLayout, 0, AddSharedParts(w, 2), w);
                         vkCmdPushConstants(s_cmd, s_untileLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uc), &uc);
@@ -4774,6 +4956,7 @@ void main()
                         if (!(s_exp & 16))  // NFSMW_GPU_EXP bit 16: no staging copy (upload cost experiment)
                             vkCmdCopyBufferToImage(s_cmd, s_ring, t.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
                         FullBarrier();
+                        ProfileComputeEnd();
                         SubmitIfStarving();
                     }
                     // Mip levels 1..maxLevel, each face from its storage.
@@ -5222,9 +5405,10 @@ void main()
 
         VkPipeline s_resolvePipeline = VK_NULL_HANDLE;
         VkPipeline s_resolveCoalescedPipeline = VK_NULL_HANDLE;  // scaled resolves (see COALESCED in the shader)
-        // The same for a source of another scale denominator ([coalesced][den x - 1][den y - 1]: 1.5x is 3/2), made
-        // at the first resolve that needs it (ResolvePipeline); [..][0][0] are the two above.
-        VkPipeline s_resolveDenPipelines[2][2][2] = {};
+        // The same for a source of another scale denominator ([coalesced][log2 den x][log2 den y]: 1.5x is 3/2,
+        // 0.75x 3/4, 0.625x 5/8), made at the first resolve that needs it (ResolvePipeline); [..][0][0] are the
+        // two above. (Coalesced only up to a den y of 2: a group is two rows.)
+        VkPipeline s_resolveDenPipelines[2][4][4] = {};
         VkPipeline ResolvePipeline(bool coalesced, const gpu::RenderScale& scale);
 
         // Coalesced scaled resolves: 2.8 -> 1.1 ms of scaled resolves a frame
@@ -5234,6 +5418,18 @@ void main()
         {
             const char* coalesce = std::getenv("NFSMW_SCALED_COALESCE");
             return coalesce ? coalesce[0] != '0' : props.vendorID != 0x106B;
+        }
+
+        // Whether a coalesced group (32x2 pixels, see COALESCED in the shader)
+        // holds whole blocks of `scale`: their rows two at most. Not below 1x
+        // at all: a block of 3/4 or 5/8 is four or eight rows, which a group
+        // would split, and at 1/2, where it fits, each pixel owns a quarter of
+        // a sample, so the group's shared memory and barrier cost more than
+        // they gather (a 1280x720 resolve 474 us coalesced, against 367 us
+        // per thread at 3/4, on the Steam Deck).
+        bool ScaledCoalesceFits(const gpu::RenderScale& scale)
+        {
+            return !scale.Below() && scale.y.den <= 2 && scale.x.den <= 32;
         }
 
         // The resolve pipelines a scale will use, made now (at start or at a
@@ -5247,7 +5443,7 @@ void main()
             VkPhysicalDeviceProperties props;
             vkGetPhysicalDeviceProperties(s_vk->physical, &props);
             ResolvePipeline(false, scale);
-            if (ScaledCoalesce(props))
+            if (ScaledCoalesce(props) && ScaledCoalesceFits(scale))
                 ResolvePipeline(true, scale);
         }
         VkPipelineLayout s_resolveLayout = VK_NULL_HANDLE;
@@ -5344,19 +5540,35 @@ uint bppLog2(uint f)
 // weighted by how much of it lies inside (gpu/render_scale.h's box filter:
 // 2/3 and 1/3, in 1/den of a pixel, num of them a whole guest pixel), or
 // (depth) the one holding its centre. The rectangle's origin is whole blocks
-// (even), so its pixels' host coordinates count from srcOrigin.
+// (even), so its pixels' host coordinates count from srcOrigin. Below 1x
+// (a den of 2, 4 or 8; its origin a multiple of den) the one host pixel
+// holding the guest pixel's centre, colour as depth (below).
 vec4 pxFraction(uint x, uint y)
 {
     if ((p.flags & 2u) != 0u)
         return texelFetch(src, clamp(p.srcOrigin + ivec2(sbCenterHost(x, p.scale.x, kDen.x), sbCenterHost(y, p.scale.y, kDen.y)),
             ivec2(0), ivec2(p.srcSize) - 1), 0);
     vec4 v = vec4(0.0);
-    uint x1 = sbHostSize(x + 1u, p.scale.x, kDen.x), y1 = sbHostSize(y + 1u, p.scale.y, kDen.y);
-    for (uint j = sbHostEdge(y, p.scale.y, kDen.y); j < y1; j++)
-        for (uint i = sbHostEdge(x, p.scale.x, kDen.x); i < x1; i++)
-            v += float(sbOverlap(x, i, p.scale.x, kDen.x) * sbOverlap(y, j, p.scale.y, kDen.y)) *
-                texelFetch(src, clamp(p.srcOrigin + ivec2(i, j), ivec2(0), ivec2(p.srcSize) - 1), 0);
-    v /= float(p.scale.x * p.scale.y);
+    if (p.scale.x < kDen.x && p.scale.y < kDen.y)
+    {
+        // Below 1x: the host pixel holding the guest pixel's centre, as for
+        // depth. The 1x copy is the bloom's input (blurred down from 320x180)
+        // and the CPU's, never what the frame shows; the box filter's two
+        // to four fetches a pixel (at 0.75x 2.25 on average, with their
+        // weights) made a scaled resolve of the scene 3.5 times as costly
+        // as a 1x one on the Steam Deck, more than the draws saved.
+        v = texelFetch(src, clamp(p.srcOrigin + ivec2(sbCenterHost(x, p.scale.x, kDen.x), sbCenterHost(y, p.scale.y, kDen.y)),
+            ivec2(0), ivec2(p.srcSize) - 1), 0);
+    }
+    else
+    {
+        uint x1 = sbHostSize(x + 1u, p.scale.x, kDen.x), y1 = sbHostSize(y + 1u, p.scale.y, kDen.y);
+        for (uint j = sbHostEdge(y, p.scale.y, kDen.y); j < y1; j++)
+            for (uint i = sbHostEdge(x, p.scale.x, kDen.x); i < x1; i++)
+                v += float(sbOverlap(x, i, p.scale.x, kDen.x) * sbOverlap(y, j, p.scale.y, kDen.y)) *
+                    texelFetch(src, clamp(p.srcOrigin + ivec2(i, j), ivec2(0), ivec2(p.srcSize) - 1), 0);
+        v /= float(p.scale.x * p.scale.y);
+    }
     v *= p.expScale;
     if ((p.flags & 1u) != 0u) v = v.bgra;
     return v;
@@ -5422,6 +5634,7 @@ uint pack16(vec4 c)
 // cost. (A pipeline of its own: the shared memory would slow the others.)
 // By block (gpu/render_scale.h): a pixel at a whole scale, 2x2 pixels at
 // 1.5x (a group is 16 whole blocks: its rows start even, as its columns).
+// Not below 1x (ScaledCoalesceFits).
 shared uint g_samples[64 * 16];  // by block, then sample (up to 64 pixels' worth at 4x4)
 shared uint g_offsets[64];       // each block's samples in the pool; ~0u: none
 #endif
@@ -5451,6 +5664,9 @@ void main()
         // whole scale all its sx x sy, at 1.5x one, two or four of its 2x2
         // block's 3x3, from where its texel sits in the block (its word's
         // bits 0 and 2; the rectangle's origin is even, so gx and gy agree).
+        // Below 1x one or none (3/4: a 4x4 block's 3x3, its first row and
+        // column of texels owning none), from the word's sub-texel bits
+        // (sbSubMask; the origin a multiple of den).
         uint a = word << 2;
         uint slot = inside ? s_table[a >> 12] : 0u;
         uint s = p.scale.x * p.scale.y;  // samples a block
@@ -6106,7 +6322,9 @@ void main()
                     // At 1.5x the shader counts host pixels from srcOrigin
                     // and the destination's blocks from its origin: both
                     // need even coordinates (resolves are 8-pixel aligned
-                    // and the tile offsets even, so they are).
+                    // and the tile offsets even, so they are). Below 1x
+                    // multiples of 2, 4 or 8 (the 8-pixel alignment, and
+                    // tile offsets of 256 rows and 640 columns).
                     const bool wholeBlocks = (r.x0 + shiftX) >= 0 && (r.y0 + shiftY) >= 0 &&
                         source->scale.x.Exact(uint32_t(r.x0 + shiftX)) && source->scale.y.Exact(uint32_t(r.y0 + shiftY)) &&
                         source->scale.x.Exact(uint32_t(r.x0)) && source->scale.y.Exact(uint32_t(r.y0));
@@ -6117,10 +6335,40 @@ void main()
                     uint32_t firstPage = rangeBase >> 12;
                     uint32_t lastPage = std::min<uint32_t>((rangeBase + rangeBytes - 1) >> 12, kGuestPages - 1);
                     // A 32-bit resolve from a scaled target keeps its samples.
+                    // Below 1x not a depth one's: depth is sampled through a
+                    // conversion (D24 to float), which scaled textures don't
+                    // have (ScaledFormat), so its samples were written and
+                    // never read, 70 us a 1280x256 tile band on the Steam
+                    // Deck. A read of one in another format would find its
+                    // pages without a scaled copy and use the 1x data.
                     bool scaledWrite = !source->scale.IsOne() && wholeBlocks && bl == 2 && !destInfo.copy_dest_array &&
-                        EnsureScaledMemory() && source->scale == s_scaled.scale;
+                        !(depthSource && source->scale.Below()) && EnsureScaledMemory() && source->scale == s_scaled.scale;
+                    // Below 1x only while a reader takes its samples (ScaledWriteWanted).
+                    const ResolvePages pages{ firstPage, lastPage, (rc.destBase & 0xFFFu) == 0 && bl == 2, rc.destBase >> 12,
+                        std::max(rc.destPitch >> 5, 1u), r.x0, r.y0, r.x1, r.y1 };
+                    if (scaledWrite && source->scale.Below())
+                    {
+                        const uint64_t key = (uint64_t(rc.destBase) << 32) ^ (uint64_t(rc.destPitch) << 20) ^ (uint64_t(rc.width) << 8) ^
+                            (uint64_t(rc.height) * 0x9E3779B1ull) ^ (uint64_t(format) << 58);
+                        if (!ScaledWriteWanted(key, pages))
+                        {
+                            scaledWrite = false;
+                            s_scaled.unreadSkips++;
+                            LogOnce((0x35ull << 56) ^ key, "below 1x: resolves of %ux%u to %08X (pitch %u, format %u) keep no scaled copy: "
+                                "not read at host resolution %u times in a row (the 1x copy only, until a reader wants one)", rc.width,
+                                rc.height, rc.destBase, rc.destPitch, format, kUnreadSkip);
+                        }
+                    }
                     if (scaledWrite)
                     {
+                        // Below 1x a page the rectangle covers whole (its
+                        // 32x32 tile: 32-bit texels, a page-aligned base) gets
+                        // every sample from the resolve: no fill first. The
+                        // scene's tile bands, 1x-resolved over by the frame's
+                        // composite (ScaledWriteWanted), went stale each frame
+                        // and were filled from the 1x data before every band
+                        // (0.3 ms a frame on the Steam Deck).
+                        const bool coverSkips = source->scale.Below();
                         std::vector<std::pair<uint32_t, uint32_t>> fresh;
                         for (uint32_t page = firstPage; page <= lastPage; page++)
                         {
@@ -6130,7 +6378,7 @@ void main()
                             bool stale = s_scaled.pageSlot[page] != 0 && !ScaledPageValid(page);
                             bool isFresh;
                             uint32_t slot = ScaledSlot(page, isFresh);
-                            if (isFresh || stale)
+                            if ((isFresh || stale) && !(coverSkips && pages.Covers(page)))
                                 fresh.push_back({ page, slot });
                         }
                         FlushScaledTable();
@@ -6294,7 +6542,16 @@ void main()
                     w[4] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 4, 0, 1,
                         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ti, nullptr, nullptr };
                     ComputeWorkRecorded();
-                    bool coalesced = scaledWrite && s_scaled.coalesce;  // 32x2 pixels a group
+                    bool coalesced = scaledWrite && s_scaled.coalesce && ScaledCoalesceFits(source->scale);  // 32x2 pixels a group
+                    if (s_profiling)
+                    {
+                        char desc[160];
+                        snprintf(desc, sizeof(desc), "resolve %ux%u@%d,%d p%u fmt %u to %08X %s%s%s", rc.width, rc.height, rc.originX,
+                            rc.originY, pitch, format, rc.destBase, depthSource ? "depth " : "",
+                            scaledWrite ? std::format("scaled {}", gpu::ScaleName(source->scale)).c_str()
+                            : !source->scale.IsOne() ? "1x (from a scaled target)" : "1x", fused ? " fused" : "");
+                        ProfileCompute(desc);
+                    }
                     vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ResolvePipeline(coalesced, source->scale));
                     s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_resolveLayout, 0, AddSharedParts(w, 5), w);
                     vkCmdPushConstants(s_cmd, s_resolveLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, s_resolvePush, &rc);
@@ -6302,10 +6559,17 @@ void main()
                     if (!(s_exp & 2))
                         vkCmdDispatch(s_cmd, coalesced ? (rc.width + 31) / 32 : (rc.width / perWord + 7) / 8,
                             coalesced ? (rc.height + 1) / 2 : (rc.height + 7) / 8, 1);
-                    if (scaledWrite)
+                    // Below 1x a scaled resolve's barrier is a 1x one's: its
+                    // pool writes are compute shader writes too, read by
+                    // compute (untiles, the front buffer) and fragment work,
+                    // never by a vertex stage. (A narrower one only where 1x
+                    // resolves get one, NFSMW_PASS_BARRIER 2 and up: Apple's
+                    // default; elsewhere ResolveBarrier is a full one too.)
+                    if (scaledWrite && !source->scale.Below())
                         FullBarrier();  // (above 1x: as before)
                     else
                         ResolveBarrier(rangeBase, rangeBytes, fused ? fused->guestStart : 0);
+                    ProfileComputeEnd();
                     if (s_logShadowMap && depthSource && pitch == 1600 && bl == 2)
                         ShadowMapProbeRecord(rangeBase, rangeBytes, rc, r, source->base);
                     SubmitIfStarving();
@@ -6430,8 +6694,8 @@ layout(push_constant) uniform P { uint count, slotWords, listWord, pad; uvec2 sc
 )" GLSL_SCALE_CODE R"(
 // A new slot starts as its page's 1x data, each word in the host samples its
 // texel owns (all s at a whole scale; at 1.5x one, two or four of its
-// block's): a resolve covering the page only in part leaves no garbage
-// around it.
+// block's; below 1x one or none): a resolve covering the page only in part
+// leaves no garbage around it.
 void main()
 {
     uint n = gl_GlobalInvocationID.x;
@@ -6569,12 +6833,31 @@ void main()
             s_scaled.poolBytes = s_scaled.tableBytes = s_scaled.scratchBytes = 0;
         }
 
+        // The pool for `scale`: NFSMW_SCALED_MB (default 512).
+        // The whole budget, whatever the scale: kept across live changes
+        // of the internal resolution (ResetScaledMemory). Bound whole, so
+        // within the device's storage buffer range (NFSMW_SCALED_MB=4096
+        // is past a 4 GB - 1 limit). Below 1x a slot is smaller than its
+        // page, and a slot for every guest page fits in less than the budget
+        // (288 MB at 0.75x, 200 at 0.625x, 128 at 0.5x; above 1x the budget
+        // is never enough for all of them): no more than that, for a
+        // handheld's memory.
+        VkDeviceSize ScaledPoolSize(const gpu::RenderScale& scale, const VkPhysicalDeviceProperties& props)
+        {
+            uint64_t megabytes = 512;
+            if (const char* v = std::getenv("NFSMW_SCALED_MB"))
+                megabytes = std::clamp<uint64_t>(std::strtoull(v, nullptr, 10), 16, 4096);
+            VkDeviceSize poolSize = std::min<VkDeviceSize>(VkDeviceSize(megabytes) << 20, props.limits.maxStorageBufferRange) & ~VkDeviceSize(0xFFFF);
+            return std::min(poolSize, (VkDeviceSize(kGuestPages) * scale.SlotWords() * 4 + 0xFFFF) & ~VkDeviceSize(0xFFFF));
+        }
+
         // Back to "not made yet" (a new internal resolution; the GPU idle):
         // the next scaled resolve makes it again at the new scale. Every page
         // falls back to its 1x copy until a scaled resolve writes it again.
         // `keepBuffers` (the new scale is above 1x too): the pool and the
         // page table stay allocated, as their sizes don't depend on the
-        // scale; only the slots are laid out again.
+        // scale; only the slots are laid out again. (Below 1x they do: the
+        // caller keeps a pool only when it is big enough for the new scale.)
         void ResetScaledMemory(bool keepBuffers)
         {
             if (!keepBuffers)
@@ -6587,6 +6870,9 @@ void main()
             std::vector<uint64_t>().swap(s_scaled.pageSeq);
             std::vector<uint32_t>().swap(s_scaled.slotPage);
             std::vector<uint8_t>().swap(s_scaled.slotRef);
+            std::vector<uint16_t>().swap(s_scaled.pageWriter);
+            std::vector<uint8_t>().swap(s_scaled.pageRead);
+            s_scaled.writers.clear();
             s_scaled.dirty.clear();
             s_scaled.clock = 0;
             s_scaledChecks.clear();
@@ -6606,15 +6892,11 @@ void main()
                 return false;
             VkPhysicalDeviceProperties props;
             vkGetPhysicalDeviceProperties(s_vk->physical, &props);
-            uint64_t megabytes = 512;
-            if (const char* v = std::getenv("NFSMW_SCALED_MB"))
-                megabytes = std::clamp<uint64_t>(std::strtoull(v, nullptr, 10), 16, 4096);
-            // The whole budget, whatever the scale: kept across live changes
-            // of the internal resolution (ResetScaledMemory). Bound whole, so
-            // within the device's storage buffer range (NFSMW_SCALED_MB=4096
-            // is past a 4 GB - 1 limit).
-            VkDeviceSize poolSize = std::min<VkDeviceSize>(VkDeviceSize(megabytes) << 20, props.limits.maxStorageBufferRange) & ~VkDeviceSize(0xFFFF);
+            VkDeviceSize poolSize = ScaledPoolSize(s_scaled.scale, props);
             s_scaled.slotWords = s_scaled.scale.SlotWords();
+            // (A pool kept from another scale is at least this big: ApplyRenderScale.)
+            if (s_scaled.pool && s_scaled.poolBytes < poolSize)
+                poolSize = s_scaled.poolBytes & ~VkDeviceSize(0xFFFF);
             s_scaled.slots = uint32_t(std::min<uint64_t>(poolSize / (4ull * s_scaled.slotWords), kGuestPages));
             // Scaled textures up to 1280x1024 (at scale). The untile stores
             // into them through an R32_UINT view when the device can for every
@@ -6665,6 +6947,12 @@ void main()
             s_scaled.pageSeq.assign(kGuestPages, 0);
             s_scaled.slotPage.assign(s_scaled.slots, 0);
             s_scaled.slotRef.assign(s_scaled.slots, 0);
+            s_scaled.writers.clear();
+            if (s_scaled.scale.Below())
+            {
+                s_scaled.pageWriter.assign(kGuestPages, 0);
+                s_scaled.pageRead.assign(kGuestPages, 0);
+            }
             long hostPage = sysconf(_SC_PAGESIZE);
             s_scaled.hostPageGuestPages = hostPage > 4096 ? uint32_t(hostPage / 4096) : 1;
             // The pipelines take the scale in their push constants: made
@@ -6698,7 +6986,7 @@ void main()
             s_textureCache->generation++;  // lookups decided without the scaled path
             fprintf(stderr, "[renderer] scaled resolve memory: %u slots of %u KB (%llu MB), scale %s, %s writes, textures %s (%.1f ms)\n",
                 s_scaled.slots, s_scaled.slotWords / 256, (unsigned long long)(poolSize >> 20), gpu::ScaleName(s_scaled.scale).c_str(),
-                s_scaled.coalesce ? "coalesced" : "per-thread", s_scaled.direct ? "stored directly" : "through a scratch buffer",
+                s_scaled.coalesce && ScaledCoalesceFits(s_scaled.scale) ? "coalesced" : "per-thread", s_scaled.direct ? "stored directly" : "through a scratch buffer",
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
             return true;
         }
@@ -6739,6 +7027,8 @@ void main()
             struct { uint32_t base, pitch, width, height, endian, slotWords, scaleX, scaleY, denX, denY; } pc = { base, pitchBlocks,
                 t.width, t.height, endian, s_scaled.slotWords, sc.x.num, sc.y.num, sc.x.den, sc.y.den };
             ComputeWorkRecorded();
+            if (s_profiling)
+                ProfileCompute(std::format("scaled texture {}x{} at {:08X}", t.width, t.height, base).c_str());
             if (t.storeView)
             {
                 // Straight into the image. Everything before is behind a full
@@ -6757,6 +7047,7 @@ void main()
                 vkCmdPushConstants(s_cmd, s_scaledStoreLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
                 vkCmdDispatch(s_cmd, (t.width + 7) / 8, (t.height + 7) / 8, 1);
                 ComputeBarrier();
+                ProfileComputeEnd();
                 return;
             }
             vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_scaledUntilePipeline);
@@ -6772,6 +7063,7 @@ void main()
             region.imageExtent = { t.width, t.height, 1 };
             vkCmdCopyBufferToImage(s_cmd, s_scaled.scratch, t.image.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
             FullBarrier();
+            ProfileComputeEnd();
         }
 
         void FillFreshSlots(const std::vector<std::pair<uint32_t, uint32_t>>& fresh)
@@ -6800,11 +7092,14 @@ void main()
                 struct { uint32_t count, slotWords, listWord, pad, scaleX, scaleY, denX, denY; } pc = { count, s_scaled.slotWords,
                     uint32_t(list / 4), 0, sc.x.num, sc.y.num, sc.x.den, sc.y.den };
                 ComputeWorkRecorded();
+                if (s_profiling)
+                    ProfileCompute(std::format("scaled memory: {} fresh slots filled", count).c_str());
                 vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_scaledFillPipeline);
                 s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_scaledFillLayout, 0, AddSharedParts(w, 3), w);
                 vkCmdPushConstants(s_cmd, s_scaledFillLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
                 vkCmdDispatch(s_cmd, (count * 1024 + 63) / 64, 1, 1);
                 FullBarrier();
+                ProfileComputeEnd();
             }
         }
 
@@ -6939,7 +7234,7 @@ void main()
         }
 
         // The resolve shader for sources whose scale has these denominators
-        // (1 or 2 each; the shader's SB_DEN_X, SB_DEN_Y), into `out`.
+        // (1, 2, 4 or 8 each; the shader's SB_DEN_X, SB_DEN_Y), into `out`.
         void MakeResolvePipeline(bool coalesced, uint32_t denX, uint32_t denY, VkPipeline* out)
         {
             std::string log;
@@ -6967,8 +7262,9 @@ void main()
         // The resolve pipeline for a source at `scale` (see s_resolveDenPipelines).
         VkPipeline ResolvePipeline(bool coalesced, const gpu::RenderScale& scale)
         {
-            const uint32_t dx = std::clamp(scale.x.den, 1u, 2u), dy = std::clamp(scale.y.den, 1u, 2u);
-            VkPipeline& slot = s_resolveDenPipelines[coalesced][dx - 1][dy - 1];
+            // (den is 1, 2, 4 or 8: gpu/render_scale.h.)
+            const uint32_t dx = std::clamp(scale.x.den, 1u, 8u), dy = std::clamp(scale.y.den, 1u, 8u);
+            VkPipeline& slot = s_resolveDenPipelines[coalesced][std::countr_zero(dx)][std::countr_zero(dy)];
             if (!slot)
             {
                 auto start = std::chrono::steady_clock::now();
@@ -7780,7 +8076,8 @@ void main()
                     continue;
                 // Clears still waiting for their target's next pass, in guest
                 // pixels (their host edges came from guest ones: GuestEdge
-                // gives those back).
+                // gives those back; from below 1x the first of the guest
+                // edges sharing one, which the game's 8-aligned clears are).
                 std::vector<PendingClear> moved;
                 std::erase_if(s_pendingClears, [&](const PendingClear& pc) {
                     if (pc.rt != &was)
@@ -7807,7 +8104,16 @@ void main()
             for (RecentTarget& recent : s_recentTargets)
                 recent = {};
             size_t textures = DropTextures([](const Texture& t) { return t.scaled; });
-            ResetScaledMemory(!scale.IsOne());
+            // The buffers are kept for another scale above or below 1x, unless
+            // the pool, made for a smaller scale below 1x, is too small for it,
+            // or below 1x larger than it needs (from 2x to 0.75x: 512 MB where
+            // 288 do) (the GPU is idle here: Flush, and nothing uses them until
+            // the next scaled resolve makes the memory again).
+            VkPhysicalDeviceProperties props;
+            vkGetPhysicalDeviceProperties(s_vk->physical, &props);
+            const VkDeviceSize poolNeeded = ScaledPoolSize(scale, props);
+            const bool poolFits = !s_scaled.pool || (s_scaled.poolBytes >= poolNeeded && (!scale.Below() || s_scaled.poolBytes < poolNeeded + 0x10000));
+            ResetScaledMemory(!scale.IsOne() && poolFits);
             fprintf(stderr, "[renderer] internal resolution %s -> %s (%ux%u, %s): %zu targets and %zu scaled textures replaced in %.1f ms\n",
                 gpu::ScaleName(old).c_str(), gpu::ScaleName(scale).c_str(), scale.x.Size(1280), scale.y.Size(720), how.c_str(), targets, textures,
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
@@ -8963,7 +9269,10 @@ void main()
                     }
                     rt->cut = true;
                     rt->cutReach = { std::max(rt->cutReach.width, scale.x.Size(uint32_t(w))), std::max(rt->cutReach.height, scale.y.Size(uint32_t(h))) };
-                    if (x1 <= x0 || y1 <= y0)
+                    // (Below 1x a cut narrower than a host pixel draws nothing
+                    // too, as the scissor check below finds; a rectangle of
+                    // zero size here would end the target's saving.)
+                    if (x1 <= x0 || y1 <= y0 || drew.extent.width == 0 || drew.extent.height == 0)
                         continue;
                     const VkRect2D& was = rt->cutDrawn;
                     if (was.extent.width && !Contains(was, drew) && !Contains(drew, was) && !Adjoins(was, drew))
@@ -8980,6 +9289,12 @@ void main()
         if (x1 <= x0 || y1 <= y0)
             return;
         VkRect2D scissor = HostRect(scale, x0, y0, x1, y1);
+        // Below 1x a scissor narrower than a host pixel holds none (at 0.75x
+        // one guest column at a block's start): nothing to draw, and a pass
+        // can't have an empty area. (At 1x and above every guest pixel has
+        // one or more: never.)
+        if (scissor.extent.width == 0 || scissor.extent.height == 0)
+            return;
 
         // Viewport: the guest transform is folded into the vertex shader
         // (pc.posScale) and the host viewport covers the whole target.
@@ -9040,7 +9355,7 @@ void main()
         if (s_passBarrier >= 2)
             VertexBarrierIfNeeded(layout.vsMasks, pc.indexAddress, pc.indexAddress ? count << (src.is32 ? 2 : 1) : 0);
         BeginPass(color, depth, scissor);
-        if (s_profiling && !s_passInfos.empty())
+        if (s_profiling && s_passEndPending)  // (this pass's entry: none with the pool full)
         {
             PassInfo& pi = s_passInfos.back();
             if (pi.draws++ < 3)
@@ -9647,6 +9962,20 @@ void main()
         auto colorControl = Reg<reg::RB_COLORCONTROL>();
         pc.alphaTest = colorControl.alpha_test_enable ? uint32_t(colorControl.alpha_func) : 7u;
         pc.alphaRef = RegF(XE_GPU_REG_RB_ALPHA_REF);
+        // Below 1x a host pixel spans 1/scale guest pixels, and the implicit
+        // LOD the GPU takes from the host derivatives sits log2(1/scale)
+        // above the 360's: blurrier textures, and the fonts' empty lower
+        // mips fade the race HUD's text out (its smaller lines gone already
+        // at 0.75x; with this bias all of it stays down to 0.5x, and the
+        // Deck shots' PSNR against 1x rose 1.7-1.9 dB). The pixel shaders'
+        // computed-LOD fetches add it back (TextureFetch in
+        // gpu/shader_translator.cpp). Of two different axes the smaller
+        // correction: no axis gets finer mips than at 1x. 0 at 1x and above,
+        // where the supersampled LODs stay as they were. (Textures the scaled
+        // resolves wrote are at host resolution already and don't need it;
+        // they have one level, where it can only pick the magnification
+        // filter for a fetch minified by less than 1/scale.)
+        pc.lodBias = scale.Below() ? std::min(std::log2(std::max(scaleX, scaleY)), 0.0f) : 0.0f;
 
         float zmin = std::clamp(oz, 0.0f, 1.0f), zmax = std::clamp(oz + sz, 0.0f, 1.0f);
         VkViewport viewport{ 0.0f, 0.0f, w * float(scaleX), h * float(scaleY), zmin, zmax };
@@ -10234,7 +10563,9 @@ void main()
         uint32_t frontBytes = pc.pitch * ((height + 31) & ~31u) * 4;
         // At host resolution when a scaled resolve wrote it (the game's frames;
         // movies and loading screens drawn at 1x use the 1x image). At 1.5x
-        // only a front buffer of whole blocks (even; 1280x720 is).
+        // only a front buffer of whole blocks (even; 1280x720 is), below 1x
+        // of whole blocks of 2, 4 or 8 (1280x720 is): a smaller image than
+        // the frame's, which the presenter scales up (its FSR 1).
         bool scaled = pc.tiled && !showTexture[0] && s_scaled.enabled && s_scaled.scale.Exact(width, height) &&
             ScaledRangeValid(pc.base, frontBytes);
         uint32_t outW = scaled ? s_scaled.scale.x.Size(width) : width, outH = scaled ? s_scaled.scale.y.Size(height) : height;
@@ -10292,12 +10623,15 @@ void main()
             { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &table, nullptr },
         };
         ComputeWorkRecorded();
+        if (s_profiling)
+            ProfileCompute(std::format("front buffer {}x{} at {:08X}{}", outW, outH, pc.base, scaled ? " (scaled memory)" : "").c_str());
         vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_frontPipeline);
         s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_frontLayout, 0, AddSharedParts(w, 4), w);
         vkCmdPushConstants(s_cmd, s_frontLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
         vkCmdDispatch(s_cmd, (outW + 7) / 8, (outH + 7) / 8, 1);
         GuardGpu(pc.base, frontBytes, false, "front buffer");
         FullBarrier();
+        ProfileComputeEnd();
         SubmitRecorded(7);  // the presenter's blit comes later in queue order
         video::SubmitFrontImage(front.image, outW, outH, width, height);
         s_lastFront = { front.image, outW, outH };
@@ -10640,6 +10974,7 @@ void main()
             s_passInfos.clear();
             s_gapLast = { s_stats.resolves, s_stats.uploads, s_stats.submits, writewatch::GetGuardStats().uploadBytes };
             s_passQueryNext = 0;
+            s_passEndPending = false;
             return;
         }
         if (!s_profiling)

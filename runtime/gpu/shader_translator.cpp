@@ -51,6 +51,7 @@ layout(push_constant) uniform DrawConstants
     uint flags;           // bit 0: apply posScale; bits 1-3: vertex W/XY/Z formats
     vec4 posScale;        // NDC = pos.xy * posScale.xy + posScale.zw * pos.w
     uvec4 vfRedirect[4];  // guest start, size, ring byte offset: vertex data snapshots
+    float lodBias;        // added to computed LODs: log2(internal resolution) below 1x, else 0 (TextureFetch)
 } pc;
 
 // Textures: set 1, one binding per fetch slot the shader uses (declared after
@@ -695,12 +696,24 @@ float xmul(float a, float b)
                 // shaders) they bias the implicit LOD; otherwise they are the
                 // LOD. (Using the register value as an absolute LOD pinned
                 // ~70% of NFSMW's world draws to one mip level.)
+                // A computed LOD also adds pc.lodBias, log2 of the internal
+                // resolution below 1x (-1 at 0.5x; 0 at 1x and above): a
+                // host pixel there spans 1/scale guest pixels, so the
+                // implicit LOD would sit log2(1/scale) above the 360's:
+                // blurrier textures, and the game's fonts have empty lower
+                // mips (the race HUD's text faded out, its smaller lines
+                // gone already at 0.75x). It is also the negative mip bias
+                // AMD's FSR 1 integration guide asks for: -log2(display /
+                // render resolution). Explicit LODs (vertex fetches,
+                // textureLod) are the guest's own: not.
                 bool computedLod = op.use_computed_lod() && stage == ShaderStage::Pixel;
                 std::string lod = std::format("fetchLodBias({}u)", slot);
                 if (op.use_register_lod())
                     lod = "texLod + " + lod;
                 if (op.lod_bias() != 0.0f)
                     lod += std::format(" + {}", op.lod_bias());
+                if (computedLod)
+                    lod += " + pc.lodBias";
                 auto sample = [&](const std::string& texture, const std::string& coords) {
                     return computedLod ? std::format("texture({}, {}, {})", texture, coords, lod)
                                        : std::format("textureLod({}, {}, {})", texture, coords, lod);

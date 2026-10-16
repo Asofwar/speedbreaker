@@ -78,10 +78,13 @@ namespace settings
     // Frame Rate: 60, 30, or Auto (video/frame_rate.h: 60, or 30 while the
     // device is hot or can't hold 60).
     constexpr int32_t kFrameRateAuto = 0;
-    // Internal resolution: the multiple of 720p it renders at, in half steps
-    // (2: 1x, 3: 1.5x = 1080p, 4: 2x, 6: 3x; only the tokens "1x", "1.5x"...
-    // are saved, so the numbers are free to change); Auto picks it from the
-    // screen area the picture covers (see renderer).
+    // Internal resolution: the multiple of 720p it renders at, in eighths
+    // (8: 1x, 12: 1.5x = 1080p, 16: 2x, 24: 3x; below the 360's 720p, for
+    // a weak GPU with Upscaling FSR 1: 6: 0.75x = 540p, 5: 0.625x = 450p,
+    // 4: 0.5x = 360p; gpu/render_scale.h. Only the tokens "1x", "1.5x"...
+    // are saved, so the numbers are free to change: they were half steps
+    // before 0.75x); Auto picks it from the screen area the picture covers
+    // (see renderer), never below 1x.
     constexpr int32_t kResolutionAuto = 0;
     // Auto: a screen of another shape is filled (video/picture_fit), the HUD
     // kept in a centred 16:9 block: a wider one with a wider view (Hor+), a

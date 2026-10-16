@@ -83,15 +83,19 @@ namespace settings
             { int32_t(AspectMode::Widescreen), "16:9", "16:9" },
         };
 
-        // The scale in half steps (settings.h); the tokens are what
+        // The scale in eighths (settings.h); the tokens are what
         // settings.toml and NFSMW_RESOLUTION hold, so older files read as
-        // before.
+        // before. The three below 720p come first, in order: the menu steps
+        // through them from Auto as through the rest.
         constexpr EnumEntry kResolutionEntries[] = {
             { kResolutionAuto, "auto", "Auto" },
-            { 2, "1x", "1x (720p)" },
-            { 3, "1.5x", "1.5x (1080p)" },
-            { 4, "2x", "2x (1440p)" },
-            { 6, "3x", "3x (2160p)" },
+            { 4, "0.5x", "0.5x (360p, for FSR)" },
+            { 5, "0.625x", "0.625x (450p, for FSR)" },
+            { 6, "0.75x", "0.75x (540p, for FSR)" },
+            { 8, "1x", "1x (720p)" },
+            { 12, "1.5x", "1.5x (1080p)" },
+            { 16, "2x", "2x (1440p)" },
+            { 24, "3x", "3x (2160p)" },
         };
 
         constexpr EnumEntry kAnisotropyEntries[] = {
@@ -159,7 +163,7 @@ namespace settings
               .env = "NFSMW_TEXTURE_MIPS", .defaultValue = 1 },
             { .id = Id::InternalResolution, .category = Category::Graphics, .type = Type::Enum, .apply = Apply::Live,
               .table = "video", .key = "internal_resolution", .label = "Internal Resolution",
-              .description = "Render the 3D scene above the 360's 720p. 1.5x is 1080p, a little over half the pixels of 2x. Auto: from the screen (1440p: 2x, or 3x2 filling an ultrawide).",
+              .description = "Render the 3D scene above or below the 360's 720p. Auto: from the screen (1440p: 2x, 3x2 filling an ultrawide). Below 1x saves power on a handheld, softer: meant with Upscaling FSR 1.",
               .env = "NFSMW_RESOLUTION", .defaultValue = kResolutionAuto, .entries = kResolutionEntries },
             { .id = Id::WindowWidth, .category = Category::Display, .type = Type::Int, .apply = Apply::Restart, .hidden = true,
               .table = "video", .key = "window_width", .label = "Window Width",
