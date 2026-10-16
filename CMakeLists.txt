@@ -125,8 +125,95 @@ if(SB_TESTS_ONLY)
     enable_testing()
     add_subdirectory(tests)
 else()
+    # Compiler-level optimisation of the game's code: all off by default, and
+    # without them the build is the same as before they existed. They apply to
+    # what the game itself runs, the recompiled code (NfsmwRecompLib) and the
+    # runtime with the libraries it links statically, never to the unit tests.
+    # Linux only (ELF, lld, LLVM's profile runtime): the SteamOS build is
+    # where they were measured (docs/timedemo.md, "Faster builds"); Apple's
+    # linkers and toolchains are untested. They change how the code is laid
+    # out and inlined, never what it computes: a timedemo replays the same
+    # frames on them (the same trace hash).
+    #   -DSB_PGO_GENERATE=ON: an instrumented build that counts how often each
+    #     branch, call and loop runs, for training (scripts/pgo_train.sh).
+    #   -DSB_PGO_PROFILE=<file.profdata>: a build optimised with the counts of
+    #     such a training run, merged by llvm-profdata (scripts/pgo_train.sh).
+    #   -DSB_LTO=ON: ThinLTO, linked with lld. The compiler sees across source
+    #     files at link time, so the runtime's small functions inline into
+    #     their callers in other files (cpu/indirect.cpp's lookup into every
+    #     guest function with an indirect call). Best with the profile. Its
+    #     builds' timedemo replays of the default race go out of step where
+    #     the intro ends more often than others' (docs/timedemo.md): replay
+    #     those again.
+    option(SB_PGO_GENERATE "An instrumented build that writes a profile for SB_PGO_PROFILE (Linux; scripts/pgo_train.sh)" OFF)
+    set(SB_PGO_PROFILE "" CACHE FILEPATH "A profile from scripts/pgo_train.sh (.profdata) to optimise the game's code with (Linux)")
+    option(SB_LTO "ThinLTO for the game's code, linked with lld (Linux)" OFF)
+    if((SB_PGO_GENERATE OR SB_PGO_PROFILE OR SB_LTO) AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        message(FATAL_ERROR "SB_PGO_GENERATE, SB_PGO_PROFILE and SB_LTO are for Linux builds only")
+    endif()
+    if(SB_PGO_GENERATE AND SB_PGO_PROFILE)
+        message(FATAL_ERROR "SB_PGO_GENERATE (training) or SB_PGO_PROFILE (the optimised build), not both")
+    endif()
+    # The build's identity names them after the build type (runtime/CMakeLists.txt,
+    # report/build_info.cpp: the log's [build] line, bug reports, a timedemo's
+    # summary.json): "Release, ThinLTO, PGO".
+    set(SB_BUILD_FLAVOR "")
+    if(SB_LTO)
+        string(APPEND SB_BUILD_FLAVOR ", ThinLTO")
+    endif()
+    if(SB_PGO_GENERATE)
+        string(APPEND SB_BUILD_FLAVOR ", PGO-instrumented")
+    endif()
+    if(SB_PGO_PROFILE)
+        string(APPEND SB_BUILD_FLAVOR ", PGO")
+    endif()
+
     add_subdirectory(recomp)
     add_subdirectory(runtime)
+
+    set(_sb_opt_targets NfsmwRecompLib SpeedBreaker XenonUtilsLite o1heap imgui)
+    set(_sb_opt_compile "")
+    set(_sb_opt_link "")
+    if(SB_LTO)
+        # The ThinLTO cache keeps each file's optimised code by a hash of what
+        # went into it, so a relink after an edit redoes only what it touched.
+        list(APPEND _sb_opt_compile -flto=thin)
+        list(APPEND _sb_opt_link -flto=thin -fuse-ld=lld "LINKER:--thinlto-cache-dir=${CMAKE_BINARY_DIR}/thinlto-cache")
+    endif()
+    if(SB_PGO_GENERATE)
+        # The profile runtime writes its counters from an atexit handler,
+        # which the game's _Exit skips: runtime/debug/pgo_exit.c writes them
+        # first, in place of every call to _Exit (the linker's --wrap).
+        list(APPEND _sb_opt_compile -fprofile-generate)
+        list(APPEND _sb_opt_link -fprofile-generate "LINKER:--wrap=_Exit")
+        target_sources(SpeedBreaker PRIVATE ${CMAKE_SOURCE_DIR}/runtime/debug/pgo_exit.c)
+    endif()
+    if(SB_PGO_PROFILE)
+        get_filename_component(_sb_profile "${SB_PGO_PROFILE}" ABSOLUTE)
+        if(NOT EXISTS "${_sb_profile}")
+            message(FATAL_ERROR "SB_PGO_PROFILE: no file ${_sb_profile} (scripts/pgo_train.sh makes one)")
+        endif()
+        list(APPEND _sb_opt_compile "-fprofile-use=${_sb_profile}")
+        # Except gpu/renderer.cpp, which the profile made slower: Draw inlined
+        # what it calls (50 KB of code grew to 159 KB) and its hottest loop,
+        # the scan of a draw's indices for 0xFFFF, came out at 6 instructions
+        # an index instead of 4, so the command processor (the frame's
+        # critical path) took 4% longer. Without the profile there its other
+        # code (command_processor.cpp) still gains, -2% in all. Worth trying
+        # again when that scan is gone.
+        set_property(SOURCE ${CMAKE_SOURCE_DIR}/runtime/gpu/renderer.cpp TARGET_DIRECTORY SpeedBreaker
+            APPEND PROPERTY COMPILE_OPTIONS -fno-profile-instr-use)
+        # A new profile in the same file recompiles everything it guides.
+        foreach(_sb_target IN LISTS _sb_opt_targets)
+            get_target_property(_sb_sources ${_sb_target} SOURCES)
+            set_source_files_properties(${_sb_sources} TARGET_DIRECTORY ${_sb_target}
+                PROPERTIES OBJECT_DEPENDS "${_sb_profile}")
+        endforeach()
+    endif()
+    foreach(_sb_target IN LISTS _sb_opt_targets)
+        target_compile_options(${_sb_target} PRIVATE ${_sb_opt_compile})
+    endforeach()
+    target_link_options(SpeedBreaker PRIVATE ${_sb_opt_link})
 
     option(SB_TESTS "Build the unit tests (tests/)" OFF)
     if(SB_TESTS)

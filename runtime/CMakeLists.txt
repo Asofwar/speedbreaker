@@ -128,10 +128,12 @@ endif()
 # The build's identity (version, git commit, dirty flag, build date) for the
 # logs, crash reports and Settings > Advanced: generated/build_info.inc,
 # checked on every build but rewritten only when it changes
-# (report/build_info.cmake), so a no-op build stays one.
+# (report/build_info.cmake), so a no-op build stays one. The build type
+# carries the top-level CMakeLists.txt's optimisation switches when one is on
+# (SB_BUILD_FLAVOR: "Release, ThinLTO, PGO").
 add_custom_target(nfsmw_build_info
     COMMAND ${CMAKE_COMMAND} -DSOURCE_DIR=${CMAKE_SOURCE_DIR} -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/generated/build_info.inc
-        -DVERSION=${CMAKE_PROJECT_VERSION} -DBUILD_TYPE=${CMAKE_BUILD_TYPE} -P ${CMAKE_CURRENT_SOURCE_DIR}/report/build_info.cmake
+        -DVERSION=${CMAKE_PROJECT_VERSION} "-DBUILD_TYPE=${CMAKE_BUILD_TYPE}${SB_BUILD_FLAVOR}" -P ${CMAKE_CURRENT_SOURCE_DIR}/report/build_info.cmake
     BYPRODUCTS ${CMAKE_CURRENT_BINARY_DIR}/generated/build_info.inc
     VERBATIM)
 add_dependencies(SpeedBreaker nfsmw_build_info)

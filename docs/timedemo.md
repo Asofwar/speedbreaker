@@ -47,7 +47,8 @@ python3 scripts/bench_compare.py ~/sb-bench/runs/A-[0-9]* -- ~/sb-bench/runs/B-[
 
 `~/sb/A` and `~/sb/B` are two unpacked SteamOS downloads (or
 `scripts/steamos/make_bundle.sh` folders) of the two builds. Without
-`--bundle`, the script runs the dev build, `build/main/runtime/SpeedBreaker`,
+`--bundle`, the script runs the dev build, `build/main/runtime/SpeedBreaker`
+(`--build <dir>` for another build folder's, `<dir>/runtime/SpeedBreaker`),
 from the repo root (on a Steam Deck set up as in
 [scripts/steamos/README.md](../scripts/steamos/README.md), run the script
 inside the `nfsmw-build` distrobox: `distrobox enter nfsmw-build -- scripts/timedemo.sh ...`).
@@ -298,6 +299,88 @@ the file once the copy has landed. The game waits for none of it, so shots
 can be taken in measured runs: on the Deck five uncapped runs with shots
 made 118.4 to 119.1 fps, three without 118.7 to 118.8. The trace hash and the
 draws are those of a run without shots.
+
+## 5. Faster builds
+
+The usual build (README.md) compiles each source file on its own and lays
+out each function by the compiler's guesses of which way its branches go.
+Three options of the top-level `CMakeLists.txt` do better, on Linux (SteamOS
+bundles included). All are off by default, and without them the build is
+the usual one:
+
+| CMake option | What |
+|---|---|
+| `-DSB_PGO_PROFILE=<file.profdata>` | profile-guided optimisation (PGO): the game's code (the recompiled code and the runtime) laid out and inlined by the counts of a training run |
+| `-DSB_PGO_GENERATE=ON` | the instrumented build that makes those counts, for training only: it counts how often each branch, call and loop runs, and writes the counts when the game exits |
+| `-DSB_LTO=ON` | ThinLTO, linked with `lld`: functions inline across source files (the recompiled code's indirect-call lookup into every guest function that calls one) |
+
+They change how the code is laid out and inlined, never what it computes:
+their replays have the trace hash of the usual build. The training is a
+timedemo replay of the instrumented build, and `scripts/pgo_train.sh` does
+each step (its header has the details):
+
+```sh
+scripts/pgo_train.sh build                       # build/pgo-gen: the instrumented game
+scripts/pgo_train.sh run pgo --build build/pgo-gen NFSMW_TIMEDEMO_UNCAPPED=1 NFSMW_BENCH_FROM=1530
+scripts/pgo_train.sh merge build/speedbreaker.profdata ~/sb-bench/pgo/raw
+cmake -S . -B build/pgo -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang \
+    -DCMAKE_CXX_COMPILER=clang++ -DSB_LTO=ON -DSB_PGO_PROFILE=$PWD/build/speedbreaker.profdata
+ninja -C build/pgo SpeedBreaker
+```
+
+For a Steam Deck: build in the container, bundle `build/pgo-gen` with
+`SB_ALLOW_PATHS=1 scripts/steamos/make_bundle.sh build/pgo-gen <out>` (the
+instrumented game carries its functions' names), run `pgo_train.sh run
+<label> --bundle <dir> ...` on the Deck from the folder that has
+`timedemo.sh`, and bring the `.profraw` back to merge it. The instrumented
+game plays at about 92% of the usual speed (114 fps uncapped on the default
+race), so its replay stays in step; a run writes a 7 MB `.profraw`, and two
+trainings of the same race agree to 99.9%. The build says what it is
+(`Release, ThinLTO, PGO` in the log's `[build]` line, bug reports and
+`summary.json`'s `build`).
+
+What they gave on the Steam Deck (the default race, uncapped; the usual
+build against the other in turns, medians of 3 or 4 runs a side, each
+comparison with its own runs of the usual build; thread CPU is the time a
+thread ran in the window, read from `/proc`, per frame):
+
+| | usual build | PGO | PGO + ThinLTO |
+|---|---|---|---|
+| avg fps | 124.2 | 125.1 (+0.7%) | 125.9 (+1.4%) |
+| frame p95 / p99 ms | 11.65 / 12.59 | 11.47 / 12.33 | 11.33 / 12.17 |
+| CP busy ms a frame | 7.17 | 7.00 (-2.4%) | 6.95 (-3.1%) |
+| GPU busy ms a frame | 7.82 | 7.79 | 7.74 (-1.0%) |
+| CPU of all threads, ms a frame | 23.95 | 23.58 (-1.6%) | 23.25 (-3.2%) |
+| guest worker g2, main thread | 6.33, 6.05 | 6.17, 6.04 | 6.09, 5.92 |
+
+The pictures pass the strict check against the usual build's (capped runs:
+at most 2 levels apart). ThinLTO alone gave +0.4% fps and 1% less CPU on the
+guest's threads.
+
+Notes:
+
+- `gpu/renderer.cpp` takes no profile (`-fno-profile-instr-use`). With it,
+  Draw inlined what it calls (50 KB of code grew to 159 KB) and its hottest
+  loop, the scan of a draw's indices for 0xFFFF, came out at 6 instructions
+  an index instead of 4: the command processor took 4% longer (CP busy 7.46
+  against 7.17 ms), although its i-cache misses halved and its branch misses
+  fell 13%. The rest of the command processor's code
+  (`command_processor.cpp`) gains with the profile. Worth trying again once
+  that scan is gone.
+- The race is all the training sees. Code it never ran (police chases, when
+  the race has none) is compiled as rarely used: smaller, and slower if
+  anything when it does run. More races, merged into one profile, cover
+  more.
+- A profile from older code still works: the compiler leaves out the
+  functions that changed since (a warning a file), so train again after
+  large changes.
+- The default race's replay sometimes goes out of step where its intro
+  hands over to the race (`DIVERGENCE kind=checksum loop=4416 step=1520`),
+  most often with ThinLTO: in 8 of 22 runs of ThinLTO builds (7 of 17 with
+  PGO), 1 of 27 of the PGO builds without it, none of 37 of the usual build.
+  The diverged runs replayed the same frames up to there, so it is the
+  replay's timing, not what the code computes. Replay a diverged run again,
+  and give such builds more runs.
 
 ## Switches
 

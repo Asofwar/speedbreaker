@@ -22,6 +22,9 @@
 # Options:
 #   --bundle <dir>       the game of a SteamOS bundle (<dir>/speedbreaker.sh);
 #                        default: the dev build, build/main/runtime/SpeedBreaker
+#   --build <dir>        the dev build of another build folder,
+#                        <dir>/runtime/SpeedBreaker (still run from the repo
+#                        root; scripts/pgo_train.sh's instrumented one)
 #   --race <path.jlg>    the race (default ~/sb-bench/race.jlg)
 #   --out <dir>          where runs go (default ~/sb-bench/runs)
 #   --timeout <s>        stop a game still running after this long (run:
@@ -72,7 +75,7 @@ if [ "$MODE" = run ] && [ $# -gt 0 ]; then
     case "$1" in ""|*[!0-9]*) ;; *) RUNS="$1"; shift ;; esac
 fi
 
-BUNDLE="" RACE="$HOME/sb-bench/race.jlg" OUT="$HOME/sb-bench/runs" TIMEOUT=""
+BUNDLE="" BUILD="" RACE="$HOME/sb-bench/race.jlg" OUT="$HOME/sb-bench/runs" TIMEOUT=""
 CAPTURE_SECONDS="" INPUT_SCRIPT="" SAVE_FROM="" FRESH_SAVE=0 FORCE=0 WARMUP=0
 EXTRA=()
 CAPTURE_ONLY="" RUN_ONLY=""
@@ -80,6 +83,7 @@ need() { [ -n "${2:-}" ] || die "$1 needs a value"; }
 while [ $# -gt 0 ]; do
     case "$1" in
         --bundle) need "$@"; BUNDLE="$2"; shift 2 ;;
+        --build) need "$@"; BUILD="$2"; shift 2 ;;
         --race) need "$@"; RACE="$2"; shift 2 ;;
         --out) need "$@"; OUT="$2"; shift 2 ;;
         --timeout) need "$@"; TIMEOUT="$2"; shift 2 ;;
@@ -105,6 +109,7 @@ for n in "$TIMEOUT" "$CAPTURE_SECONDS"; do
     case "$n" in *[!0-9]*) die "not a number of seconds: $n" ;; esac
 done
 [ "$FRESH_SAVE" = 1 ] && [ -n "$SAVE_FROM" ] && die "--fresh-save or --save-from, not both"
+[ -n "$BUNDLE" ] && [ -n "$BUILD" ] && die "--bundle or --build, not both"
 
 # Absolute paths: the game runs from another folder (the dev build from the
 # repo root) and NFSMW_SAVE_DIR is only taken when absolute.
@@ -118,8 +123,11 @@ if [ -n "$BUNDLE" ]; then
     [ -x "$BUNDLE/speedbreaker.sh" ] || die "no speedbreaker.sh in $BUNDLE: --bundle wants an unpacked SteamOS download"
     say "game: the bundle in $BUNDLE ($(cat "$BUNDLE/VERSION" 2>/dev/null || echo "no VERSION file"))"
 else
-    [ -x "$ROOT/build/main/runtime/SpeedBreaker" ] || die "no dev build at $ROOT/build/main/runtime/SpeedBreaker: build it, or --bundle <dir>"
-    say "game: the dev build, $ROOT/build/main/runtime/SpeedBreaker"
+    # The dev build: build/main's, or that of the folder --build names.
+    GAME="$ROOT/build/main/runtime/SpeedBreaker"
+    [ -n "$BUILD" ] && GAME="$(abspath "$BUILD")/runtime/SpeedBreaker"
+    [ -x "$GAME" ] || die "no dev build at $GAME: build it, or --bundle <dir>"
+    say "game: the dev build, $GAME"
 fi
 
 # borrow_env <pid> <name>...: those variables from another process of this
@@ -212,7 +220,7 @@ run_game() {
         env "${FIXED_ENV[@]}" "$@" "${EXTRA[@]}" "$BUNDLE/speedbreaker.sh" > "$dir/launcher.log" 2>&1 < /dev/null &
     else
         # From the repo root, where the dev build finds game/files.
-        (cd "$ROOT" && exec env "${FIXED_ENV[@]}" "$@" "${EXTRA[@]}" "$ROOT/build/main/runtime/SpeedBreaker") > "$dir/game.log" 2>&1 < /dev/null &
+        (cd "$ROOT" && exec env "${FIXED_ENV[@]}" "$@" "${EXTRA[@]}" "$GAME") > "$dir/game.log" 2>&1 < /dev/null &
     fi
     GAME_PID=$!
     start=$(date +%s)

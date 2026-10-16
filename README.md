@@ -709,6 +709,11 @@ ninja -C build/main SpeedBreaker
 Run `build/main/runtime/SpeedBreaker` from the repository root. With the whole disc extracted in
 `game/files`, it plays from there. Otherwise the first-run installer asks for your disc image.
 
+Optional, on Linux and SteamOS: profile-guided optimisation (`-DSB_PGO_PROFILE=<profile>`, a
+profile that `scripts/pgo_train.sh` trains with a recorded race) and ThinLTO (`-DSB_LTO=ON`,
+linked with `lld`) make the game's own code faster. Neither is on by default; the steps and
+what they gain are in [docs/timedemo.md](docs/timedemo.md#5-faster-builds).
+
 #### 4. Package it (optional)
 
 - **Mac app:** `python3 scripts/macos/make_app.py` makes `build/app/SpeedBreaker.app`, with its

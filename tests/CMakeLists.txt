@@ -245,6 +245,16 @@ if(NOT WIN32)
         add_test(NAME launcher_start_test COMMAND ${SB_BASH} ${CMAKE_CURRENT_SOURCE_DIR}/launcher_start_test.sh
             ${ROOT}/scripts/steamos/bundle/speedbreaker.sh)
     endif()
+    # The PGO training build's exit hook (debug/pgo_exit.c, SB_PGO_GENERATE in
+    # the top-level CMakeLists.txt): an instrumented program that leaves
+    # through _Exit, as the game does, writes its counts with it and none
+    # without. Linux (the linker's --wrap) and Clang; skipped (77) without
+    # LLVM's profile runtime.
+    if(SB_BASH AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_C_COMPILER_ID STREQUAL "Clang")
+        add_test(NAME pgo_exit_test COMMAND ${SB_BASH} ${CMAKE_CURRENT_SOURCE_DIR}/pgo_exit_test.sh
+            ${CMAKE_C_COMPILER} ${RT}/debug/pgo_exit.c)
+        set_tests_properties(pgo_exit_test PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
 endif()
 # The entitlements in a Mach-O's code signature (platform/code_signature.h),
 # on files built byte by byte: what the iOS app reads from its own.

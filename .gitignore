@@ -43,6 +43,11 @@ build-survey
 /game/shaders/
 *.ppm
 
+# Profile-guided optimisation (scripts/pgo_train.sh): the counts of training
+# runs and the profiles merged from them, made from the game's own code
+*.profraw
+*.profdata
+
 # Logs and bug reports (they hold a screenshot of the game)
 last-run.log
 previous-run.log
