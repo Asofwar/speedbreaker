@@ -20,16 +20,22 @@
 // (more so uncapped, where the lag varies most: 37 to 91 dB PSNR between
 // uncapped runs, at the vblank's pace a level or two).
 //
-// In a replay, that one lock (called from 0x822236E8) waits first for the
-// texture's fence, as a lock without the flag does (D3D's own sub_82597410,
-// which picks the fence, and BlockOnFence, sub_82597498, r4 the fence's
-// address; the fence is the resource's word at +4, which D3D's lock reads
-// too): the average is of the previous frame in every run, capped or not.
-// The render thread then waits for the GPU to finish the previous frame's
-// brightness pass where it used to run on (counted as a game wait, like
-// D3D's other ones). NFSMW_TIMEDEMO_EXPOSURE_WAIT=0 turns it off. Capture and
-// normal play are untouched: the exposure is drawing only, nothing the game's
-// simulation or its Joylog sees.
+// In a replay that takes pictures (NFSMW_BENCH_SHOTS), that one lock (called
+// from 0x822236E8) waits first for the texture's fence, as a lock without the
+// flag does (D3D's own sub_82597410, which picks the fence, and BlockOnFence,
+// sub_82597498, r4 the fence's address; the fence is the resource's word at
+// +4, which D3D's lock reads too): the average is of the previous frame in
+// every run, capped or not. The render thread then waits for the GPU to
+// finish the previous frame's brightness pass where it used to run on
+// (counted as a game wait, like D3D's other ones). That costs an uncapped
+// replay on a Steam Deck about 1.5% of its frame rate (121.4 against 123.2
+// fps, p99 13.5 against 12.6 ms, one build), and a capped one a few late
+// frames (0 to 6 in a run, up to 29 ms, on the Deck and headless; none
+// without it): a replay that takes no pictures, whose times are what it
+// measures, doesn't wait, as in play.
+// NFSMW_TIMEDEMO_EXPOSURE_WAIT=1 or 0 makes any replay wait or not. Capture
+// and normal play are untouched: the exposure is drawing only, nothing the
+// game's simulation or its Joylog sees.
 #include <stdafx.h>
 #include "timedemo.h"
 
@@ -43,14 +49,28 @@ namespace
 {
     constexpr uint32_t kExposureLock = 0x822236E8;  // sub_822234F0's lock of the previous frame's 64x64
 
+    // NFSMW_TIMEDEMO_EXPOSURE_WAIT=1 or 0, else whether the run takes
+    // pictures (NFSMW_BENCH_SHOTS).
     const bool s_enabled = [] {
-        const char* v = std::getenv("NFSMW_TIMEDEMO_EXPOSURE_WAIT");
-        return !(v && v[0] == '0');
+        if (const char* v = std::getenv("NFSMW_TIMEDEMO_EXPOSURE_WAIT"))
+            return v[0] != '0';
+        const char* shots = std::getenv("NFSMW_BENCH_SHOTS");
+        return shots && shots[0];
     }();
 }
 
 PPC_FUNC(sub_82589398)
 {
+    if (uint32_t(ctx.lr) == kExposureLock && timedemo::Replaying())
+    {
+        static std::atomic<bool> s_said{ false };
+        if (!s_said.exchange(true, std::memory_order_relaxed))
+            fprintf(stderr, s_enabled
+                    ? "[timedemo] exposure: the brightness the exposure adapts to waits for its frame on the GPU "
+                      "(NFSMW_TIMEDEMO_EXPOSURE_WAIT=0: it doesn't)\n"
+                    : "[timedemo] exposure: the brightness as the GPU side has it, no wait: the run takes no pictures "
+                      "(NFSMW_TIMEDEMO_EXPOSURE_WAIT=1: it waits)\n");
+    }
     if (s_enabled && uint32_t(ctx.lr) == kExposureLock && timedemo::Replaying())
     {
         // The resource the lock's fence is that of (as sub_82589398 picks
@@ -60,10 +80,6 @@ PPC_FUNC(sub_82589398)
             resource = PPC_LOAD_U32(texture + 44);
         if (uint32_t fence = PPC_LOAD_U32(resource + 4))
         {
-            static std::atomic<bool> s_said{ false };
-            if (!s_said.exchange(true, std::memory_order_relaxed))
-                fprintf(stderr, "[timedemo] exposure: the brightness the exposure adapts to waits for its frame on the GPU "
-                    "(NFSMW_TIMEDEMO_EXPOSURE_WAIT=0: it doesn't)\n");
             const PPCContext saved = ctx;
             // A word below the caller's stack for the fence, as D3D's lock
             // keeps it in its own frame; the calls' frames go below it.

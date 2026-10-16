@@ -256,7 +256,8 @@ one doesn't, 2 when the runs can't be compared.
 
 A replay draws its pictures the same at any pace: the two things a picture
 took from the timing, the exposure's brightness and the clouds' drift, wait
-and hold still in a replay ([Exposure and clouds](#exposure-and-clouds)).
+and hold still in a replay that takes pictures ([Exposure and
+clouds](#exposure-and-clouds)).
 On the Steam Deck (the default race, seven shots):
 
 - Uncapped against uncapped, the usual build against its ThinLTO and PGO
@@ -427,14 +428,20 @@ had it: every picture after came out a little brighter or darker, by up to
 20 to 49 levels between uncapped runs of one build (PSNR down to 37 dB), at
 the vblank's pace a level or two.
 
-So in a replay that one lock waits for its texture's fence, as a lock that
-isn't read-only does, and every run averages the previous frame
-(`[timedemo] exposure: ...` in the log; `NFSMW_TIMEDEMO_EXPOSURE_WAIT=0`
-turns it off). The render thread then waits, each frame, for the GPU to
-finish the previous frame's brightness pass, where it used to run on (one
-of D3D's waits on the GPU, as the `[hitch]` lines and `NFSMW_TIMELINE`
-count them). Times from replays without the wait don't compare with times
-from replays with it: give both sides of an A/B the same.
+So in a replay that takes pictures (`NFSMW_BENCH_SHOTS`) that one lock
+waits for its texture's fence, as a lock that isn't read-only does, and
+every run averages the previous frame (`[timedemo] exposure: ...` in the
+log). The render thread then waits, each frame, for the GPU to finish the
+previous frame's brightness pass, where it used to run on (one of D3D's
+waits on the GPU, as the `[hitch]` lines and `NFSMW_TIMELINE` count them).
+That costs an uncapped replay on the Steam Deck about 1.5% of its frame
+rate (121.4 against 123.2 fps, p99 13.5 against 12.6 ms, one build), and a
+capped one a few late frames (0 to 6 in a run, up to 29 ms; none without
+it), so a replay that takes no pictures doesn't wait: its times are those of
+play. `NFSMW_TIMEDEMO_EXPOSURE_WAIT=1` or `=0` makes any
+replay wait or not. Times from replays with the wait don't compare with
+times from replays without it: give both sides of an A/B the same shots,
+or the same switch.
 
 The clouds were the other thing a picture took from the timing. The sky's
 cloud scroll (its vertex shader constant c13.x) moves on whenever the sky's
@@ -451,10 +458,10 @@ three uncapped headless replays.
 
 All off by default: without them the game behaves exactly as without this
 feature. A timedemo also holds audio streams ([Audio streams](#audio-streams)),
-capture and replay alike, and a replay waits for the exposure's brightness
-and holds the clouds still ([Exposure](#exposure-and-clouds));
-`NFSMW_TIMEDEMO_EXPOSURE_WAIT=0` and `NFSMW_TIMEDEMO_CLOUD_HOLD=0` turn
-those off.
+capture and replay alike, a replay that takes pictures waits for the
+exposure's brightness, and every replay holds the clouds still
+([Exposure](#exposure-and-clouds)); `NFSMW_TIMEDEMO_EXPOSURE_WAIT=1|0` and
+`NFSMW_TIMEDEMO_CLOUD_HOLD=0` change those.
 
 | Variable | Meaning |
 |---|---|
@@ -471,7 +478,7 @@ those off.
 | `NFSMW_BENCH_EXIT=0` | stay in the game after the report (the default is to exit) |
 | `NFSMW_BENCH_SHOTS=<step>,...` | the picture of these world steps of the race (counted as `NFSMW_BENCH_FROM` is), as `shot-<step>.ppm` in the report's folder (see [Pictures](#4-compare-pictures)) |
 | `NFSMW_BENCH_SHOTS_SHOWN=1` | each of those also as the window shows it, after the presenter's post-processing: `shot-<step>-shown.ppm` |
-| `NFSMW_TIMEDEMO_EXPOSURE_WAIT=0` | replay: the exposure's brightness as the GPU side has it when the game reads it, as before the wait (see [Exposure](#exposure-and-clouds)) |
+| `NFSMW_TIMEDEMO_EXPOSURE_WAIT=1\|0` | replay: the exposure's brightness waits for its frame on the GPU (1), or is as the GPU side has it when the game reads it (0); default: the wait in a replay that takes pictures (`NFSMW_BENCH_SHOTS`) only (see [Exposure](#exposure-and-clouds)) |
 | `NFSMW_TIMEDEMO_CLOUD_HOLD=0` | replay: the clouds drift as the threads' timing has it, as before the hold (see [Exposure](#exposure-and-clouds)) |
 | `NFSMW_SAVE_DIR=<dir>` | an absolute path: `save/` and `profile_settings.bin` there instead of the data folder's |
 
