@@ -1247,6 +1247,102 @@ namespace gpu::renderer
 
         void WriteDeferredIn(uint32_t base, uint32_t size);
 
+        // NFSMW_RESOLVE_USE=<swap> (diagnostic, shadow mode): from that swap on,
+        // per resolve destination (its guest range), how often anything read its
+        // guest bytes before the next resolve there wrote them again: GPU work
+        // (EnsureShadow), or the CPU (a page of it no longer GPU-owned: read
+        // back) - or nothing (dead: written over unread). [resolve-use] lines
+        // every 600 swaps and at exit.
+        const uint64_t s_resolveUseFrom = [] { const char* v = std::getenv("NFSMW_RESOLVE_USE"); return v ? uint64_t(std::max(std::atoll(v), 0ll)) : 0ull; }();
+        bool s_resolveUse = false;  // counting (from s_resolveUseFrom)
+        struct ResolveUse
+        {
+            uint32_t width = 0, height = 0, format = 0;
+            bool depth = false, fused = false, partial = false, deferred = false;
+            bool pending = false, gpuRead = false;  // written by a resolve since; read by GPU work since
+            uint64_t resolves = 0, bytes = 0, dead = 0, deadBytes = 0, gpuReads = 0, cpuReads = 0;
+        };
+        std::map<uint64_t, ResolveUse> s_resolveUses;  // (range base << 32) | range bytes
+        bool s_resolveUseQuiet = false;  // (a resolve's own EnsureShadow isn't a read)
+        std::mutex s_resolveUseMutex;    // (the exit report reads the map on another thread)
+        uint64_t s_resolveUseFrames = 0;
+
+        // A resolve into [base, base + size) of `bytes` pixel bytes: the last
+        // one there was read, or not. Returns its entry (for what the resolve
+        // turns out to be).
+        ResolveUse* NoteResolveUse(uint32_t base, uint32_t size, uint32_t w, uint32_t h, uint32_t format, bool depth, uint64_t bytes)
+        {
+            std::lock_guard lock(s_resolveUseMutex);
+            ResolveUse& u = s_resolveUses[uint64_t(base) << 32 | size];
+            if (u.pending)
+            {
+                bool cpu = false;
+                for (uint32_t page = base >> 12; page <= (base + size - 1) >> 12 && !cpu; page++)
+                    cpu = !writewatch::AnyGpuOwned(page << 12, 4096);
+                if (u.gpuRead)
+                    u.gpuReads++;
+                else if (cpu)
+                    u.cpuReads++;
+                else
+                {
+                    u.dead++;
+                    u.deadBytes += bytes;
+                }
+            }
+            u.pending = true;
+            u.gpuRead = false;
+            u.width = w;
+            u.height = h;
+            u.format = format;
+            u.depth = depth;
+            u.resolves++;
+            u.bytes += bytes;
+            return &u;
+        }
+
+        void NoteResolveRead(uint32_t base, uint32_t size)
+        {
+            if (s_resolveUseQuiet)
+                return;
+            std::lock_guard lock(s_resolveUseMutex);
+            for (auto& [key, u] : s_resolveUses)
+            {
+                uint32_t b = uint32_t(key >> 32), n = uint32_t(key);
+                if (u.pending && uint64_t(b) < uint64_t(base) + size && uint64_t(base) < uint64_t(b) + n)
+                    u.gpuRead = true;
+            }
+        }
+
+        void ReportResolveUse(const char* when)
+        {
+            if (!s_resolveUseFrames)
+                return;
+            std::lock_guard lock(s_resolveUseMutex);
+            uint64_t bytes = 0, dead = 0, resolves = 0, deadResolves = 0;
+            std::vector<std::pair<uint64_t, const ResolveUse*>> order;
+            for (auto& [key, u] : s_resolveUses)
+            {
+                bytes += u.bytes;
+                dead += u.deadBytes;
+                resolves += u.resolves;
+                deadResolves += u.dead;
+                order.push_back({ key, &u });
+            }
+            std::sort(order.begin(), order.end(), [](auto& a, auto& b) { return a.second->bytes > b.second->bytes; });
+            const double f = double(s_resolveUseFrames);
+            fprintf(stderr, "[resolve-use] %s, %llu frames: a frame %.1f resolves, %.2f MB; dead (written over unread) %.1f resolves, %.2f MB (%.0f%%)\n",
+                when, (unsigned long long)s_resolveUseFrames, double(resolves) / f, double(bytes) / f / 1048576.0, double(deadResolves) / f,
+                double(dead) / f / 1048576.0, bytes ? 100.0 * double(dead) / double(bytes) : 0.0);
+            for (size_t i = 0; i < order.size() && i < 24; i++)
+            {
+                const ResolveUse& u = *order[i].second;
+                fprintf(stderr, "[resolve-use]   %08X+%u %ux%u fmt %u %s%s%s: %.2f a frame, %.3f MB; dead %llu, read by GPU work %llu, by the CPU %llu\n",
+                    uint32_t(order[i].first >> 32), uint32_t(order[i].first), u.width, u.height, u.format, u.depth ? "depth" : "colour",
+                    u.fused ? (u.partial ? " fused (part)" : " fused") : "", u.deferred ? " deferred" : "", double(u.resolves) / f,
+                    double(u.bytes) / f / 1048576.0, (unsigned long long)u.dead, (unsigned long long)u.gpuReads, (unsigned long long)u.cpuReads);
+            }
+        }
+
         // Shadow mode: bring the GPU's copy of [base, base + size) up to date
         // before recording work that reads it (deferred resolves' bytes there
         // too: NFSMW_RESOLVE_DEFER).
@@ -1256,6 +1352,8 @@ namespace gpu::renderer
                 return;
             base &= 0x1FFFFFFF;
             size = std::min<uint32_t>(size, uint32_t(kSharedSize) - base);
+            if (s_resolveUse)
+                NoteResolveRead(base, size);
             WriteDeferredIn(base, size);
             uint64_t key = uint64_t(base) << 32 | size;
             auto it = s_shadowSynced.find(key);
@@ -5454,8 +5552,10 @@ void main()
         // two above. (Coalesced only up to a den y of 2: a group is two rows.)
         VkPipeline s_resolveDenPipelines[2][4][4] = {};
         VkPipeline s_resolveTexturePipeline = VK_NULL_HANDLE;  // TEXTURE_ONLY (NFSMW_RESOLVE_DEFER; made at its first use)
+        VkPipeline s_resolveWritebackPipeline = VK_NULL_HANDLE;  // TEXTURE_WRITEBACK (NFSMW_RESOLVE_DEFER_COLOR; the same)
+        VkPipeline s_resolveWritebackCheckPipeline = VK_NULL_HANDLE;  // and WRITEBACK_CHECK (NFSMW_RESOLVE_DEFER_COLOR=2)
         VkPipeline ResolvePipeline(bool coalesced, const gpu::RenderScale& scale);
-        void MakeResolvePipeline(bool coalesced, uint32_t denX, uint32_t denY, VkPipeline* out, bool textureOnly = false);
+        void MakeResolvePipeline(bool coalesced, uint32_t denX, uint32_t denY, VkPipeline* out, bool textureOnly = false, uint32_t writeback = 0);
 
         // Coalesced scaled resolves: 2.8 -> 1.1 ms of scaled resolves a frame
         // on the Steam Machine (RADV), but 2.6-3.4 -> 4.1-4.4 ms on an M1 Pro
@@ -5530,7 +5630,11 @@ layout(std430, set = 0, binding = 0) buffer SharedMemory { uint g_mem[]; };)" GL
 layout(set = 0, binding = 1) uniform texture2D src;
 layout(std430, set = 0, binding = 2) buffer ScaledPool { uint s_pool[]; };
 layout(std430, set = 0, binding = 3) readonly buffer ScaledTable { uint s_table[]; };
+#ifdef TEXTURE_WRITEBACK
+layout(set = 0, binding = 4, r32ui) readonly uniform uimage2D t_image;
+#else
 layout(set = 0, binding = 4, r32ui) writeonly uniform uimage2D t_image;
+#endif
 layout(push_constant) uniform P
 {
     ivec2 origin;
@@ -5725,6 +5829,34 @@ void main()
         imageStore(t_image, ivec2(int(x), int(y)), uvec4(o, 0u, 0u, 0u));
 #endif
     }
+}
+#elif defined(TEXTURE_WRITEBACK)
+// NFSMW_RESOLVE_DEFER_COLOR: a deferred colour resolve's guest bytes, from
+// the cached texture that holds its texels: raw 32-bit ones (no conversion),
+// each the guest word in the texture's endianness (main() below stores
+// swapWord(m, texEndian)), so swapped back it is the word again. The
+// rectangle lies in the texture whole (see Resolve).
+void main()
+{
+    uvec2 id = gl_GlobalInvocationID.xy;
+    if (id.x >= p.size.x || id.y >= p.size.y)
+        return;
+    uint x = uint(p.origin.x) + id.x, y = uint(p.origin.y) + id.y;
+    uint word = ((p.destBase + tiled2D(x, y, p.destPitch, 2u)) & 0x1FFFFFFFu) >> 2;
+#ifdef TEX_OFFSET
+    uint v = imageLoad(t_image, ivec2(int(x + p.texX), int(y + p.texY))).x;
+#else
+    uint v = imageLoad(t_image, ivec2(int(x), int(y))).x;
+#endif
+#ifdef WRITEBACK_CHECK
+    // NFSMW_RESOLVE_DEFER_COLOR=2: the word main() stored, compared (the
+    // pool binding counts: [0] words that differ, [1] words compared).
+    if (g_mem[word] != swapWord(v, p.texEndian))
+        atomicAdd(s_pool[0], 1u);
+    atomicAdd(s_pool[1], 1u);
+#else
+    memStore(word, swapWord(v, p.texEndian));
+#endif
 }
 #else
 void main()
@@ -6244,6 +6376,35 @@ void main()
             return v ? std::clamp(std::atoi(v), 0, 2) : kResolveDeferDefault;
         }();
         const bool s_resolveDefer = s_resolveDeferMode != 0;
+        // NFSMW_RESOLVE_DEFER_COLOR=1 (shadow mode; off by default): a colour
+        // resolve into a cached texture (the exact fusion or a part of one,
+        // NFSMW_FUSE_PARTIAL, NFSMW_DIRECT_CUBE), at 1x, of raw 32-bit texels
+        // (no conversion), whose rectangle lies in the texture whole, stores
+        // into the texture only too. Its guest bytes are written back from the
+        // texture when something reads them (TEXTURE_WRITEBACK: a texel is the
+        // guest word in the texture's endianness), so the target needs no
+        // keeping. A later colour resolve into the same texture leaves the
+        // owed ones owed (the texture holds the latest texels of all of
+        // them), and those its rectangle covers no longer owe anything. The
+        // texture stays cached while it holds owed texels. In the race 90% of
+        // the resolved bytes were written over unread (NFSMW_RESOLVE_USE),
+        // ~9.3 MB a frame of them such colour resolves: the scene into its
+        // texture (whole, in strips or halves), the six environment cube
+        // faces, the bloom chain.
+        // NFSMW_RESOLVE_DEFER_COLOR=2 (a check): such resolves aren't deferred,
+        // but after each (guest bytes and texels stored as usual) a
+        // WRITEBACK_CHECK pass compares every word with the one written back
+        // from the texture would be, and the write-back runs too (the same
+        // words again): [defer-check] colour lines count the words that differ.
+        const int s_resolveDeferColorMode = [] { const char* v = std::getenv("NFSMW_RESOLVE_DEFER_COLOR"); return v ? std::clamp(std::atoi(v), 0, 2) : 0; }();
+        const bool s_resolveDeferColor = s_resolveDeferColorMode == 1;
+        struct ColourCheck
+        {
+            VkBuffer buffer = VK_NULL_HANDLE;
+            VkDeviceMemory memory = VK_NULL_HANDLE;
+            volatile uint32_t* counts = nullptr;  // [0] words that differ, [1] words compared (coherent)
+        };
+        ColourCheck s_colourCheck;
         struct DeferCheckRange { uint32_t base, bytes, endian; };
         std::mutex s_deferCheckMutex;
         std::vector<DeferCheckRange> s_deferCheckRanges;  // the destinations deferred so far (8 at most)
@@ -6286,9 +6447,14 @@ void main()
             VkImageView sampleView;           // its depth aspect
             VkFormat format;                  // the target's format and size
             uint32_t width, height;
+            // A colour resolve's (NFSMW_RESOLVE_DEFER_COLOR; none of the
+            // above): the cached texture, and the face, holding its texels.
+            Texture* texture = nullptr;
+            uint32_t layer = 0;
         };
         std::vector<DeferredResolve> s_deferredResolves;
-        constexpr size_t kMaxDeferred = 4;  // more: the oldest is written
+        constexpr size_t kMaxDeferred = 32;  // more: the oldest is written
+        constexpr size_t kMaxDeferredDepth = 4;  // of them depth ones (each keeps a target's image)
         // Images of depth targets that went into records and came back, for the
         // next target of their format and size that needs one.
         struct SpareTarget
@@ -6302,21 +6468,23 @@ void main()
         // Resolves deferred; replaced unwritten; written for GPU work, for the
         // CPU, for want of room (any thread reads them at exit).
         std::atomic<uint64_t> s_deferredCount{ 0 }, s_deferReplaced{ 0 }, s_deferForGpu{ 0 }, s_deferForCpu{ 0 }, s_deferForRoom{ 0 };
+        std::atomic<uint64_t> s_deferredColour{ 0 }, s_deferForResolve{ 0 };  // (colour ones; written for a resolve not deferred)
 
-        // Records deferred resolve `i`'s guest bytes (the main resolve shader
-        // from its depth, guest memory only) and takes it off the list; its
-        // image becomes a spare.
-        void WriteDeferred(size_t i)
+        // Whether deferred colour resolve `b`'s rectangle in its texture holds
+        // all of `a`'s (the same texture and face).
+        bool CoversTexels(const ResolveConstants& b, const ResolveConstants& a)
         {
-            DeferredResolve d = s_deferredResolves[i];
-            s_deferredResolves.erase(s_deferredResolves.begin() + ptrdiff_t(i));
-            EndPass();
-            Begin();
-            ResolveConstants rc = d.rc;
-            rc.texWrite = 0;
-            VkDescriptorImageInfo ii{ VK_NULL_HANDLE, d.sampleView, VK_IMAGE_LAYOUT_GENERAL };
-            VkDescriptorImageInfo ti{ VK_NULL_HANDLE, s_dummyStorage.view, VK_IMAGE_LAYOUT_GENERAL };
-            VkDescriptorBufferInfo pool = DummyStorage(s_scaled.pool);
+            const int64_t bx = int64_t(b.originX) + b.texX, by = int64_t(b.originY) + b.texY;
+            const int64_t ax = int64_t(a.originX) + a.texX, ay = int64_t(a.originY) + a.texY;
+            return bx <= ax && by <= ay && bx + b.width >= ax + a.width && by + b.height >= ay + a.height;
+        }
+
+        // A resolve shader pass over `rc`'s rectangle (8x8 groups): `src` its
+        // source, `store` its texture binding, `pool` its pool binding.
+        void DispatchResolvePass(VkPipeline pipeline, const ResolveConstants& rc, VkImageView src, VkImageView store, VkDescriptorBufferInfo pool)
+        {
+            VkDescriptorImageInfo ii{ VK_NULL_HANDLE, src, VK_IMAGE_LAYOUT_GENERAL };
+            VkDescriptorImageInfo ti{ VK_NULL_HANDLE, store, VK_IMAGE_LAYOUT_GENERAL };
             VkDescriptorBufferInfo table = DummyStorage(s_scaled.table);
             VkWriteDescriptorSet w[8]{};
             w[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 0, 0, 1,
@@ -6330,12 +6498,33 @@ void main()
             w[4] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 4, 0, 1,
                 VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ti, nullptr, nullptr };
             ComputeWorkRecorded();
-            if (s_profiling)
-                ProfileCompute(std::format("deferred resolve {}x{} to {:08X}: its guest bytes", rc.width, rc.height, rc.destBase).c_str());
-            vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_resolvePipeline);  // (1x only are deferred)
+            vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
             s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_resolveLayout, 0, AddSharedParts(w, 5), w);
             vkCmdPushConstants(s_cmd, s_resolveLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, s_resolvePush, &rc);
             vkCmdDispatch(s_cmd, (rc.width + 7) / 8, (rc.height + 7) / 8, 1);
+        }
+
+        // Records deferred resolve `i`'s guest bytes and takes it off the
+        // list: a depth one's from its depth (the main resolve shader, guest
+        // memory only; its image becomes a spare), a colour one's from its
+        // texture (TEXTURE_WRITEBACK).
+        void WriteDeferred(size_t i)
+        {
+            DeferredResolve d = s_deferredResolves[i];
+            s_deferredResolves.erase(s_deferredResolves.begin() + ptrdiff_t(i));
+            EndPass();
+            Begin();
+            const bool colour = d.texture != nullptr;
+            ResolveConstants rc = d.rc;
+            rc.texWrite = 0;
+            if (colour && !s_resolveWritebackPipeline)
+                MakeResolvePipeline(false, 1, 1, &s_resolveWritebackPipeline, false, 1);
+            if (s_profiling)
+                ProfileCompute(std::format("deferred resolve {}x{} to {:08X}: its guest bytes{}", rc.width, rc.height, rc.destBase,
+                    colour ? ", from its texture" : "").c_str());
+            DispatchResolvePass(colour ? s_resolveWritebackPipeline : s_resolvePipeline,  // (1x only are deferred)
+                rc, colour ? s_dummy[0].view : d.sampleView, colour ? d.texture->storeViews[d.layer] : s_dummyStorage.view,
+                DummyStorage(s_scaled.pool));
             ResolveBarrier(d.rangeBase, d.rangeBytes, 0);
             ProfileComputeEnd();
             // Guarded as the resolve's own write would have been (its pages
@@ -6344,8 +6533,54 @@ void main()
             GuardGpu(d.rangeBase, d.rangeBytes, true, "resolve");
             writewatch::MarkGpuOwned(d.rangeBase, d.rangeBytes);
             writewatch::DeferredWritten(d.rangeBase, d.rangeBytes);
-            s_spareTargets.push_back({ d.image, d.sampleView, d.format, d.width, d.height });
+            if (!colour)
+                s_spareTargets.push_back({ d.image, d.sampleView, d.format, d.width, d.height });
             LogOnce(0x3300, "deferred resolve to %08X (%ux%u) written: something reads its guest bytes", rc.destBase, rc.width, rc.height);
+        }
+
+        // NFSMW_RESOLVE_DEFER_COLOR=2: after a colour resolve that could have
+        // been deferred, its words compared with the write-back's
+        // (WRITEBACK_CHECK, into s_colourCheck), and the write-back itself.
+        void CheckColourWriteback(const ResolveConstants& resolved, Texture* t, uint32_t layer, uint32_t rangeBase, uint32_t rangeBytes)
+        {
+            if (!s_colourCheck.buffer)
+            {
+                VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+                bci.size = 256;
+                bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+                Check(vkCreateBuffer(s_dev, &bci, nullptr, &s_colourCheck.buffer), "colour check buffer");
+                VkMemoryRequirements req;
+                vkGetBufferMemoryRequirements(s_dev, s_colourCheck.buffer, &req);
+                VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+                mai.allocationSize = req.size;
+                mai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                Check(vkAllocateMemory(s_dev, &mai, nullptr, &s_colourCheck.memory), "colour check memory");
+                Check(vkBindBufferMemory(s_dev, s_colourCheck.buffer, s_colourCheck.memory, 0), "colour check bind");
+                void* mapped = nullptr;
+                Check(vkMapMemory(s_dev, s_colourCheck.memory, 0, VK_WHOLE_SIZE, 0, &mapped), "colour check map");
+                s_colourCheck.counts = static_cast<volatile uint32_t*>(mapped);
+                s_colourCheck.counts[0] = 0;
+                s_colourCheck.counts[1] = 0;
+                MakeResolvePipeline(false, 1, 1, &s_resolveWritebackCheckPipeline, false, 2);
+                if (!s_resolveWritebackPipeline)
+                    MakeResolvePipeline(false, 1, 1, &s_resolveWritebackPipeline, false, 1);
+                LogOnce(0x3500, "NFSMW_RESOLVE_DEFER_COLOR=2: colour resolves into cached textures compared with their write-back");
+            }
+            EndPass();
+            Begin();
+            ResolveConstants rc = resolved;
+            rc.texWrite = 0;
+            DispatchResolvePass(s_resolveWritebackCheckPipeline, rc, s_dummy[0].view, t->storeViews[layer], { s_colourCheck.buffer, 0, 256 });
+            FullBarrier();
+            DispatchResolvePass(s_resolveWritebackPipeline, rc, s_dummy[0].view, t->storeViews[layer], DummyStorage(s_scaled.pool));
+            ResolveBarrier(rangeBase, rangeBytes, t->guestStart);
+        }
+
+        void ReportColourCheck(const char* when)
+        {
+            if (s_colourCheck.counts)
+                fprintf(stderr, "[defer-check] colour %s: %u words compared with their write-back from the texture, %u differ%s\n", when,
+                    s_colourCheck.counts[1], s_colourCheck.counts[0], s_colourCheck.counts[0] ? " (NOT exact)" : "");
         }
 
         // Before work that reads guest bytes [base, base + size): the deferred
@@ -6538,9 +6773,35 @@ void main()
                             break;
                         }
                     }
+                // NFSMW_RESOLVE_DEFER_COLOR: deferred colour resolves this one
+                // overlaps, whose texture holds this one's range too (the same
+                // pitch): kept from EnsureShadow below. Should this one be
+                // deferred into the same texture and face, they stay owed
+                // (those it covers no longer owe anything once it does);
+                // otherwise they are written before it writes guest memory.
+                std::vector<DeferredResolve> held;
+                if (s_resolveDeferColor && ResolveFormatSupported(format) && ResolveBppLog2(format) == 2)
+                    for (size_t i = s_deferredResolves.size(); i-- > 0;)
+                    {
+                        const DeferredResolve& d = s_deferredResolves[i];
+                        const Texture* t = d.texture;
+                        if (t && uint64_t(d.rangeBase) < uint64_t(rangeBase) + rangeBytes && uint64_t(rangeBase) < uint64_t(d.rangeBase) + d.rangeBytes &&
+                            rangeBase >= t->guestStart && uint64_t(rangeBase) + rangeBytes <= uint64_t(t->guestStart) + t->guestSize &&
+                            d.rc.destPitch == ((destPitch.copy_dest_pitch + 31) & ~31u))
+                        {
+                            held.push_back(d);
+                            s_deferredResolves.erase(s_deferredResolves.begin() + ptrdiff_t(i));
+                        }
+                    }
+                ResolveUse* use = s_resolveUse && s_shadowMode && ResolveFormatSupported(format)
+                    ? NoteResolveUse(rangeBase, rangeBytes, uint32_t(r.x1 - r.x0), uint32_t(r.y1 - r.y0), format, depthSource,
+                        (uint64_t(r.x1 - r.x0) * uint32_t(r.y1 - r.y0)) << ResolveBppLog2(format))
+                    : nullptr;
                 // Shadow mode: pages the resolve covers only in part keep
                 // the CPU's latest data around it.
+                s_resolveUseQuiet = true;
                 EnsureShadow(rangeBase, rangeBytes);
+                s_resolveUseQuiet = false;
                 if (destInfo.copy_dest_array)
                     LogOnce(0x200, "resolve to a 3D/array destination is not implemented (copying slice 0)");
                 if (!ResolveFormatSupported(format))
@@ -6662,6 +6923,18 @@ void main()
                                 "not read at host resolution %u times in a row (the 1x copy only, until a reader wants one)", rc.width,
                                 rc.height, rc.destBase, rc.destPitch, format, kUnreadSkip);
                         }
+                    }
+                    // (Scaled: no fusion, so held colour records, see above,
+                    // are written now, before the fill below reads the 1x data.)
+                    if (scaledWrite)
+                    {
+                        for (const DeferredResolve& h : held)
+                        {
+                            s_deferredResolves.push_back(h);
+                            s_deferForResolve++;
+                            WriteDeferred(s_deferredResolves.size() - 1);
+                        }
+                        held.clear();
                     }
                     if (scaledWrite)
                     {
@@ -6853,7 +7126,37 @@ void main()
                     const bool defer = s_resolveDefer && s_shadowMode && depthSource && fused && !partial && !scaledWrite && bl == 2 &&
                         source->scale.IsOne() && copyControl.depth_clear_enable && !s_logShadowMap && r.x0 + shiftX <= 0 &&
                         r.y0 + shiftY <= 0 && r.x1 + shiftX >= int32_t(source->guestWidth) && r.y1 + shiftY >= int32_t(source->guestHeight);
-                    if (defer && !s_resolveTexturePipeline)
+                    // NFSMW_RESOLVE_DEFER_COLOR (see s_resolveDeferColor).
+                    const bool colourFits = s_shadowMode && !depthSource && fused && fused->convert == 0 && !scaledWrite && bl == 2 &&
+                        source->scale.IsOne() && r.x0 >= 0 && r.y0 >= 0 && uint64_t(r.x1) + rc.texX <= fused->width &&
+                        uint64_t(r.y1) + rc.texY <= fused->height;
+                    const bool deferColour = s_resolveDeferColor && colourFits;
+                    const bool checkColour = s_resolveDeferColorMode == 2 && colourFits && !s_splitMemory;
+                    std::vector<DeferredResolve> covered;  // held ones this one's texels cover whole
+                    for (const DeferredResolve& h : held)
+                    {
+                        const bool same = deferColour && h.texture == fused && h.layer == layer;
+                        if (same && CoversTexels(rc, h.rc))
+                            covered.push_back(h);
+                        else
+                        {
+                            s_deferredResolves.push_back(h);
+                            if (!same)
+                            {
+                                s_deferForResolve++;
+                                WriteDeferred(s_deferredResolves.size() - 1);
+                            }
+                        }
+                    }
+                    const bool textureOnly = defer || deferColour;
+                    if (use)
+                    {
+                        std::lock_guard lock(s_resolveUseMutex);
+                        use->fused = fused != nullptr;
+                        use->partial = partial;
+                        use->deferred = textureOnly;
+                    }
+                    if (textureOnly && !s_resolveTexturePipeline)
                         MakeResolvePipeline(false, 1, 1, &s_resolveTexturePipeline, true);
                     if (s_profiling)
                     {
@@ -6862,14 +7165,14 @@ void main()
                             rc.originY, pitch, format, rc.destBase, depthSource ? "depth " : "",
                             scaledWrite ? std::format("scaled {}", gpu::ScaleName(source->scale)).c_str()
                             : !source->scale.IsOne() ? "1x (from a scaled target)" : "1x", fused ? " fused" : "",
-                            defer ? ", texture only (deferred)" : "");
+                            textureOnly ? ", texture only (deferred)" : "");
                         ProfileCompute(desc);
                     }
-                    vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, defer ? s_resolveTexturePipeline : ResolvePipeline(coalesced, source->scale));
+                    vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, textureOnly ? s_resolveTexturePipeline : ResolvePipeline(coalesced, source->scale));
                     s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_resolveLayout, 0, AddSharedParts(w, 5), w);
                     vkCmdPushConstants(s_cmd, s_resolveLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, s_resolvePush, &rc);
                     uint32_t perWord = bl >= 2 ? 1 : (4 >> bl);
-                    if (!(s_exp & 2) && defer)  // a group a 32x32 tile of the destination
+                    if (!(s_exp & 2) && textureOnly)  // a group a 32x32 tile of the destination
                         vkCmdDispatch(s_cmd, ((r.x1 - 1) >> 5) - (r.x0 >> 5) + 1, ((r.y1 - 1) >> 5) - (r.y0 >> 5) + 1, 1);
                     else if (!(s_exp & 2))
                         vkCmdDispatch(s_cmd, coalesced ? (rc.width + 31) / 32 : (rc.width / perWord + 7) / 8,
@@ -6885,6 +7188,8 @@ void main()
                     else
                         ResolveBarrier(rangeBase, rangeBytes, fused ? fused->guestStart : 0);
                     ProfileComputeEnd();
+                    if (checkColour)
+                        CheckColourWriteback(rc, fused, layer, rangeBase, rangeBytes);
                     if (s_logShadowMap && depthSource && pitch == 1600 && bl == 2)
                         ShadowMapProbeRecord(rangeBase, rangeBytes, rc, r, source->base);
                     SubmitIfStarving();
@@ -6945,7 +7250,7 @@ void main()
                     }
                     // Deferred: its bytes owed first, so that no CPU access
                     // finds the pages guarded and not owed.
-                    if (defer)
+                    if (textureOnly)
                         writewatch::DeferWrite(rangeBase, rangeBytes);
                     GuardGpu(rangeBase, rangeBytes, true, "resolve");
                     writewatch::MarkGpuOwned(rangeBase, rangeBytes);
@@ -6953,14 +7258,37 @@ void main()
                     {
                         s_deferReplaced++;
                         writewatch::DeferredWritten(replaced->rangeBase, replaced->rangeBytes);
-                        s_spareTargets.push_back({ replaced->image, replaced->sampleView, replaced->format, replaced->width, replaced->height });
+                        if (!replaced->texture)
+                            s_spareTargets.push_back({ replaced->image, replaced->sampleView, replaced->format, replaced->width, replaced->height });
                     }
-                    if (defer)
+                    for (const DeferredResolve& c : covered)
+                    {
+                        s_deferReplaced++;
+                        writewatch::DeferredWritten(c.rangeBase, c.rangeBytes);
+                    }
+                    if (deferColour)
                     {
                         if (s_deferredResolves.size() >= kMaxDeferred)
                         {
                             s_deferForRoom++;
                             WriteDeferred(0);
+                        }
+                        s_deferredResolves.push_back({ rangeBase, rangeBytes, rc, Image{}, VK_NULL_HANDLE, VK_FORMAT_UNDEFINED, 0, 0, fused, layer });
+                        s_deferredCount++;
+                        s_deferredColour++;
+                        LogOnce(0x3400, "colour resolves into cached textures defer their guest bytes (NFSMW_RESOLVE_DEFER_COLOR; the first: "
+                            "%ux%u at %08X)", rc.width, rc.height, rc.destBase);
+                    }
+                    if (defer)
+                    {
+                        auto depthRecord = [](const DeferredResolve& d) { return d.texture == nullptr; };
+                        if (s_deferredResolves.size() >= kMaxDeferred ||
+                            size_t(std::count_if(s_deferredResolves.begin(), s_deferredResolves.end(), depthRecord)) >= kMaxDeferredDepth)
+                        {
+                            s_deferForRoom++;
+                            auto oldest = std::find_if(s_deferredResolves.begin(), s_deferredResolves.end(), depthRecord);
+                            WriteDeferred(s_deferredResolves.size() >= kMaxDeferred || oldest == s_deferredResolves.end()
+                                ? 0 : size_t(oldest - s_deferredResolves.begin()));
                         }
                         auto [image, view] = SwapTargetImage(*source);
                         s_deferredResolves.push_back({ rangeBase, rangeBytes, rc, image, view, source->vkFormat, source->width, source->height });
@@ -7583,11 +7911,13 @@ void main()
 
         // The resolve shader for sources whose scale has these denominators
         // (1, 2, 4 or 8 each; the shader's SB_DEN_X, SB_DEN_Y), into `out`;
-        // `textureOnly`: its TEXTURE_ONLY variant (whole scales).
-        void MakeResolvePipeline(bool coalesced, uint32_t denX, uint32_t denY, VkPipeline* out, bool textureOnly)
+        // `textureOnly`: its TEXTURE_ONLY variant, `writeback` 1 its
+        // TEXTURE_WRITEBACK one, 2 that with WRITEBACK_CHECK (whole scales).
+        void MakeResolvePipeline(bool coalesced, uint32_t denX, uint32_t denY, VkPipeline* out, bool textureOnly, uint32_t writeback)
         {
             std::string log;
-            std::string preamble = coalesced ? "#define COALESCED\n" : textureOnly ? "#define TEXTURE_ONLY\n" : "";
+            std::string preamble = coalesced ? "#define COALESCED\n" : textureOnly ? "#define TEXTURE_ONLY\n"
+                : writeback == 2 ? "#define TEXTURE_WRITEBACK\n#define WRITEBACK_CHECK\n" : writeback ? "#define TEXTURE_WRITEBACK\n" : "";
             if (s_resolvePush != offsetof(ResolveConstants, texX))
                 preamble += "#define TEX_OFFSET\n";
             if (denX != 1)
@@ -8144,6 +8474,18 @@ void main()
         template <typename Which>
         size_t DropTextures(Which which)
         {
+            // Deferred colour resolves' bytes from those textures first, and
+            // their reads done before the textures go.
+            bool owed = false;
+            for (size_t i = s_deferredResolves.size(); i-- > 0;)
+                if (s_deferredResolves[i].texture && which(*s_deferredResolves[i].texture))
+                {
+                    s_deferForGpu++;
+                    WriteDeferred(i);
+                    owed = true;
+                }
+            if (owed)
+                Flush();
             s_textureCache->generation++;
             size_t dropped = 0;
             for (auto it = s_textures.begin(); it != s_textures.end();)
@@ -8265,7 +8607,11 @@ void main()
             for (const auto& [key, t] : s_textures)
             {
                 keys.push_back(key);
-                candidates.push_back({ t->image.bytes, t->lastUsed });
+                // (One a deferred colour resolve's bytes are to come from
+                // counts as used now: never evicted.)
+                const bool owed = std::any_of(s_deferredResolves.begin(), s_deferredResolves.end(),
+                    [&](const DeferredResolve& d) { return d.texture == t.get(); });
+                candidates.push_back({ t->image.bytes, owed ? s_frame : t->lastUsed });
                 usage.bytes += t->image.bytes;
             }
             usage.count = uint32_t(s_textures.size());
@@ -11181,6 +11527,14 @@ void main()
     {
         if (s_vk)
             ApplyLiveSettings();
+        if (frame % 600 == 0)
+            ReportColourCheck("so far");
+        if (s_resolveUseFrom && frame >= s_resolveUseFrom)
+        {
+            s_resolveUse = true;
+            if (++s_resolveUseFrames % 600 == 0)
+                ReportResolveUse("so far");
+        }
         if (s_uploadLog)
         {
             UploadLog& log = *s_uploadLog;
@@ -11395,14 +11749,16 @@ void main()
         s_compileCv.notify_all();
         SavePipelineCache();
         SavePipelineKeys();
-        if (s_resolveDefer)
+        ReportResolveUse("at exit");
+        ReportColourCheck("at exit");
+        if (s_resolveDefer || s_resolveDeferColor)
         {
             auto ds = writewatch::GetDeferStats();
-            fprintf(stderr, "[renderer] deferred resolves (NFSMW_RESOLVE_DEFER): %llu, replaced unwritten %llu, written for GPU work %llu, "
-                "for the CPU %llu, for room %llu; CPU accesses that waited %llu, stale read-backs %llu\n",
-                (unsigned long long)s_deferredCount.load(), (unsigned long long)s_deferReplaced.load(), (unsigned long long)s_deferForGpu.load(),
-                (unsigned long long)s_deferForCpu.load(), (unsigned long long)s_deferForRoom.load(), (unsigned long long)ds.waits,
-                (unsigned long long)ds.staleReadbacks);
+            fprintf(stderr, "[renderer] deferred resolves (NFSMW_RESOLVE_DEFER): %llu (%llu colour), replaced unwritten %llu, written for GPU "
+                "work %llu, for the CPU %llu, for a resolve %llu, for room %llu; CPU accesses that waited %llu, stale read-backs %llu\n",
+                (unsigned long long)s_deferredCount.load(), (unsigned long long)s_deferredColour.load(), (unsigned long long)s_deferReplaced.load(),
+                (unsigned long long)s_deferForGpu.load(), (unsigned long long)s_deferForCpu.load(), (unsigned long long)s_deferForResolve.load(),
+                (unsigned long long)s_deferForRoom.load(), (unsigned long long)ds.waits, (unsigned long long)ds.staleReadbacks);
         }
         // A shot's copy still being read and written out (ReadBackFrontImage):
         // a moment for it, so its file is whole and its buffer freed.
