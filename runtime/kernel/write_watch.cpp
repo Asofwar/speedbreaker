@@ -54,8 +54,14 @@ namespace writewatch
         // while another of its guest pages still has one: protected again
         // at the next Rearm (submission boundary).
         std::vector<uint32_t> s_rearm;
-        // NFSMW_LOG_GUARD=1: what each guest page was guarded for, logged on stalls.
+        // NFSMW_LOG_GUARD=1: what each guest page was guarded for, logged on
+        // stalls (the first 400; NFSMW_LOG_GUARD=<n> above 1: the first n).
         const bool s_logGuard = std::getenv("NFSMW_LOG_GUARD") != nullptr;
+        const uint32_t s_logGuardMax = [] {
+            const char* v = std::getenv("NFSMW_LOG_GUARD");
+            const long n = v ? std::atol(v) : 0;
+            return n > 1 ? uint32_t(std::min(n, 10'000'000L)) : 400u;
+        }();
         std::unique_ptr<std::atomic<const char*>[]> s_gpuTag;
         std::unique_ptr<std::atomic<uint32_t>[]> s_gpuRange[2];
         std::atomic<uint64_t> s_stalls{ 0 }, s_stallUs{ 0 }, s_faults{ 0 }, s_opened{ 0 };
@@ -764,7 +770,7 @@ namespace writewatch
                 static std::atomic<uint32_t> logged{ 0 };
                 Dl_info dl{};
                 dladdr(t_faultPc, &dl);
-                if (logged++ < 400)
+                if (logged++ < s_logGuardMax)
                     fprintf(stderr, "[guard] stall %llu us (%s %08X): %s %08X+%X (submission %llu%s) in %s\n", (unsigned long long)us,
                         t_faultWrite ? "write" : "read", t_faultPhysical, s_gpuTag[sub].load(), s_gpuRange[0][sub].load(),
                         s_gpuRange[1][sub].load(), (unsigned long long)use, done ? "" : ", gave up", dl.dli_sname ? dl.dli_sname : "?");
