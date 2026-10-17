@@ -3559,6 +3559,8 @@ namespace gpu::renderer
         // Found in the same pass, the highest as the highest index + 1,
         // which wraps a restart (0xFFFF in 16 bits, ~0 in 32; never an index
         // there, see above) to 0: no branch keeps the loops from vectorizing.
+        // 16 bits out without restart (not on Apple: see Draw), 0xFFFF is an
+        // index: the highest + 1 is counted in 32 bits there.
         vsnap::IndexRange ConvertIndices(uint8_t* dst, const IndexSource& src, uint32_t count, bool out16, bool restart, uint32_t resetIndex)
         {
             auto range = [](uint32_t lo, uint32_t hiPlus1) {
@@ -3568,6 +3570,26 @@ namespace gpu::renderer
             {
                 const uint8_t* p = s_sharedHost + (src.base & 0x1FFFFFFE);
                 bool swap = src.endian == 1 || src.endian == 2;
+                if (out16 && !restart)
+                {
+                    uint32_t lo = 0xFFFFFFFFu, hiPlus1 = 0;
+                    auto copy = [&](auto order) {
+                        for (uint32_t i = 0; i < count; i++)
+                        {
+                            uint16_t v;
+                            memcpy(&v, p + size_t(i) * 2, 2);
+                            v = order(v);
+                            memcpy(dst + size_t(i) * 2, &v, 2);
+                            lo = std::min(lo, uint32_t(v));
+                            hiPlus1 = std::max(hiPlus1, uint32_t(v) + 1);
+                        }
+                    };
+                    if (swap)
+                        copy([](uint16_t v) { return __builtin_bswap16(v); });
+                    else
+                        copy([](uint16_t v) { return v; });
+                    return range(lo, hiPlus1);
+                }
                 if (out16)
                 {
                     uint16_t lo = 0xFFFF, hiPlus1 = 0;
@@ -9094,8 +9116,11 @@ void main()
         if (useIndices)
             vertexCount = directIndices ? count : uint32_t(indices.size());
         // 16-bit indices when 0xFFFF means what the pipeline says: restart
-        // with the guest's reset index 0xFFFF, or no restart and no 0xFFFF
-        // index (Metal can't turn primitive restart off).
+        // with the guest's reset index 0xFFFF, or no restart (an index
+        // 0xFFFF is then a vertex like any other). Metal can't turn primitive
+        // restart off: there, without restart, only when no index is 0xFFFF
+        // (a scan of them; elsewhere it was ~8% of the command processor's
+        // time on a Steam Deck at 5 W, its hottest loop with the conversion).
         bool indices16 = false;
         if (directIndices && !src.is32)
         {
@@ -9103,8 +9128,12 @@ void main()
                 indices16 = resetIndex == 0xFFFF;
             else
             {
+#ifdef __APPLE__
                 const uint16_t* p = reinterpret_cast<const uint16_t*>(s_sharedHost + (src.base & 0x1FFFFFFE));
                 indices16 = std::find(p, p + count, uint16_t(0xFFFF)) == p + count;  // byte order doesn't matter
+#else
+                indices16 = true;
+#endif
             }
         }
         const VkDeviceSize indexBytes = directIndices ? VkDeviceSize(count) * (indices16 ? 2 : 4) : indices.size() * 4;
