@@ -649,7 +649,21 @@ namespace video
                 // (Out of the swapchain lock: the main thread takes it to
                 // build a swapchain.)
                 if (r == VK_ERROR_DEVICE_LOST)
-                    DeviceLost("vkWaitForPresentKHR (the present waiter)");
+                {
+                    // Not necessarily the device's: on a Steam Deck in Game
+                    // Mode at a 5 W TDP limit the present wait returned it
+                    // now and then (2 of 7 races) with nothing in the
+                    // kernel's log, no GPU timeout or reset. A device really
+                    // lost fails the renderer's fence waits and the
+                    // presenter's acquire, submit and present too, which say
+                    // so (DeviceLost); here only that frame's timing goes.
+                    static std::atomic<uint64_t> s_lostWaits{ 0 };
+                    const uint64_t n = s_lostWaits.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if ((n & (n - 1)) == 0)  // the 1st, 2nd, 4th, 8th...
+                        fprintf(stderr, "[video] vkWaitForPresentKHR returned VK_ERROR_DEVICE_LOST for present %llu (%llu so far): "
+                                        "its timing dropped; the device draws on unless its own calls fail\n",
+                            (unsigned long long)t.id, (unsigned long long)n);
+                }
                 int64_t now = NowNs();
                 {
                     std::lock_guard lock(s_timingMutex);
