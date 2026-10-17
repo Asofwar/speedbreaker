@@ -126,6 +126,11 @@ namespace writewatch
     void SetCompleted(uint64_t submission);
     // A GPU write to the range not completed yet (its CPU copy is stale).
     bool GpuWritePending(uint32_t physical, uint32_t size);
+    // Shadow mode: the range's bytes as the GPU's copy holds them now, into
+    // `dst`, without waiting for writes still to come (one in flight may show
+    // in part): the last a completed write left, for a reader that can take
+    // them (game/exposure_lock.cpp). False outside shadow mode.
+    bool ReadShadow(uint32_t physical, uint32_t size, void* dst);
     // Protect again host pages a fault opened while another of their guest
     // pages still had a GPU hazard (command processor, at submissions). Also
     // closes NFSMW_WATCH_SUBPAGES snapshots nothing compared for a while.

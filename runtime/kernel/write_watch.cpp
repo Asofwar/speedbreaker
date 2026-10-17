@@ -1299,6 +1299,14 @@ namespace writewatch
         s_shadow = shadow;
     }
 
+    bool ReadShadow(uint32_t physical, uint32_t size, void* dst)
+    {
+        if (!s_shadow || size == 0 || uint64_t(physical) + size > kPhysicalSize)
+            return false;
+        std::memcpy(dst, s_shadow + physical, size);
+        return true;
+    }
+
     bool RangeWrittenSince(uint32_t physical, uint32_t size, uint64_t sequence)
     {
         if (!s_pageCount || size == 0)
