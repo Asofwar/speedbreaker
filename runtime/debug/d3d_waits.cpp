@@ -10,6 +10,7 @@
 #include <kernel/function.h>
 #include <cpu/guest_time.h>
 #include <cpu/host_cpu.h>
+#include <gpu/cp_doorbell.h>
 #include "timeline.h"
 
 extern "C" PPC_FUNC(__imp__sub_825A5B20);
@@ -21,25 +22,42 @@ namespace
     // processor, and on the Steam Machine's CPU (two fast cores, four slow
     // ones: see hostcpu::ReserveFastCore) the scheduler kept the spinning
     // thread on a fast core. A wait still spins for its first 20 us, so short
-    // waits end on time; after that each poll sleeps 50 us. Linux only:
-    // macOS coalesces default-QoS timers to ~10 ms (see the command
-    // processor's Worker). NFSMW_GPU_WAIT_BACKOFF=0 spins throughout.
+    // waits end on time. After that each poll sleeps until the GPU side next
+    // stores something such a loop may poll (a fence, the ring's read
+    // pointer, an interrupt handler's stores: gpu::g_gpuProgress), or 1 ms as
+    // the safety net for a store that nothing rings for. It slept 50 us a
+    // poll before, ~20000 wake-ups a second for a thread that waits long: CPU
+    // power, which a Steam Deck at a low TDP limit takes from its GPU. Linux
+    // only: macOS coalesces default-QoS timers to ~10 ms (see the command
+    // processor's Worker). NFSMW_GPU_WAIT_BACKOFF=0 spins throughout, =50
+    // sleeps 50 us a poll as before.
     void BackOff()
     {
 #ifdef __linux__
-        static const bool backOff = [] { const char* v = std::getenv("NFSMW_GPU_WAIT_BACKOFF"); return !v || v[0] != '0'; }();
-        if (!backOff)
+        static const int mode = [] {
+            const char* v = std::getenv("NFSMW_GPU_WAIT_BACKOFF");
+            return !v ? 1 : v[0] == '0' ? 0 : std::atoi(v) == 50 ? 2 : 1;
+        }();
+        if (mode == 0)
             return;
         using Clock = std::chrono::steady_clock;
         thread_local Clock::time_point lastPoll{}, waitStart{};
+        // The bell's count read at the last poll, before this poll's check.
+        thread_local uint32_t seen = 0;
         auto now = Clock::now();
         if (now - lastPoll > std::chrono::microseconds(200))
             waitStart = now;  // a new wait (one wait's polls are at most ~60 us apart)
         lastPoll = now;
+        const uint32_t rings = seen;
+        seen = gpu::g_gpuProgress.Rings();
         if (now - waitStart < std::chrono::microseconds(20))
             return;
         hostcpu::TightenTimerSlack();
-        std::this_thread::sleep_for(std::chrono::microseconds(50));
+        if (mode == 2)
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        else if (seen == rings)
+            gpu::g_gpuProgress.Wait(rings, std::chrono::milliseconds(1));  // (else: rung since: check again at once)
+        seen = gpu::g_gpuProgress.Rings();
         lastPoll = Clock::now();
 #endif
     }
