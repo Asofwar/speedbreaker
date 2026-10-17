@@ -1,6 +1,7 @@
 // Tests for gpu::bars (runtime/gpu/edge_bars.h): which front-end quads are
 // the police vid-cam's side bars or the intro's black frame, what they fill
-// past the 16:9 band, the stretched copy's posScale, the band clip's rows,
+// (a bar past the 16:9 band, a black frame everything outside it at every
+// shape: GitHub #19), the stretched copy's posScale, the band clip's rows,
 // and the whole plan the renderer asks for (PlanFill) on the draws as
 // dumped. From the repo root:
 //   clang++ -std=c++20 -O2 -UNDEBUG -Iruntime tests/edge_bars_test.cpp -o build/edge_bars_test
@@ -325,8 +326,13 @@ static void BandOracle(const char* what, float sy, const float ps[4], float host
     CHECK(wrong == 0, "%s: %d band rows differ from the pixel-centre oracle", what, wrong);
 }
 
+// The intro's black frame (the cut at ~95 s; ~57 s: kFrameY57), band units.
+constexpr float kFrameX = 0.970f, kFrameY = 0.939f, kFrameY57 = 0.920f;
+constexpr uint32_t kFrameColour = 0xFF000000;
+
 // Under Vert+ the fills and the band clip's rows split the scissor's rows
-// with no gap and no overlap: a bar's half and a black frame's whole width.
+// with no gap and no overlap (a bar's half); and the black frame's fill and
+// the frame's own pixels split the scissor's pixels the same way.
 static void Complement(const char* what, float sy, const float ps[4], float hostW, float hostH, const Rect& scissor)
 {
     const Rows band = BandRows(-sy, sy, ps[1], ps[3], hostH);
@@ -343,22 +349,25 @@ static void Complement(const char* what, float sy, const float ps[4], float host
             fill = fill || (y >= r[i].y0 && y < r[i].y1);
         wrong += band == fill;
     }
-    // The black frame's fill, every column: each pixel of the scissor is in
-    // exactly one of the band's rows and the fill.
-    Rect k[2]{};
-    const uint32_t kn = BlackoutRects(ps, hostW, hostH, scissor, 1.0f, sy, k);
+    // The black frame's fill: each pixel of the scissor is in exactly one of
+    // the frame's own pixels (its box through the same Edge rule as the
+    // rasteriser's pixel centres) and the fill.
+    const Box frame{ -kFrameX, kFrameX, -kFrameY * sy, kFrameY * sy };
+    const Rect own = ClipToHost(frame.x0, frame.x1, frame.y0, frame.y1, ps, hostW, hostH);
+    Rect k[4]{};
+    const uint32_t kn = BlackoutRects(frame, ps, hostW, hostH, scissor, k);
     int wrongPx = 0;
     for (int32_t y = scissor.y0; y < scissor.y1; y++)
         for (int32_t x = scissor.x0; x < scissor.x1; x++)
         {
-            int in = (y >= top && y < bottom) ? 1 : 0;
+            int in = (x >= own.x0 && x < own.x1 && y >= own.y0 && y < own.y1) ? 1 : 0;
             for (uint32_t i = 0; i < kn; i++)
                 in += (x >= k[i].x0 && x < k[i].x1 && y >= k[i].y0 && y < k[i].y1) ? 1 : 0;
             wrongPx += in != 1;
         }
     printf("complement %s: band rows [%d,%d), %d row(s) wrong; black frame %d pixel(s) wrong\n", what, top, bottom, wrong, wrongPx);
     CHECK(wrong == 0, "%s: %d rows both or neither in the band clip and the fill", what, wrong);
-    CHECK(wrongPx == 0, "%s: %d pixels both or neither in the band clip and the black frame's fill", what, wrongPx);
+    CHECK(wrongPx == 0, "%s: %d pixels both or neither in the black frame and its fill", what, wrongPx);
 }
 
 static void Cover(const char* what, float bx0, float bx1, float sx, float sy, const float ps[4])
@@ -379,10 +388,11 @@ static void Cover(const char* what, float bx0, float bx1, float sx, float sy, co
 // ---- The intro's black frame (the cut between two shots, ~95 s) ----
 
 // Its box in band units, as logged (NFSMW_LOG_FRONTEND "inset candidate",
-// the Deck and 32:9): x +-0.970, y +-0.939, FF000000; and the one at the
-// intro's start (~57 s): y +-0.920, FE000000.
-constexpr float kFrameX = 0.970f, kFrameY = 0.939f, kFrameY57 = 0.920f;
-constexpr uint32_t kFrameColour = 0xFF000000;
+// the Deck and 32:9): x +-0.970, y +-0.939, FF000000 (kFrameX, kFrameY); and
+// the one at the intro's start (~57 s): y +-0.920, FE000000 (kFrameY57). The
+// Blacklist bio's panel (GitHub #19): x +-0.976, y +-0.985, FB000000 then
+// FF000000, fading in from 11000000.
+constexpr float kBioX = 0.976f, kBioY = 0.985f;
 
 static void MatchFrame(const char* what, const Quad& q, float sx, float sy, bool want, const BlackoutRule& rule)
 {
@@ -477,10 +487,11 @@ static void PlantedBlackout(const char* what, const BlackoutRule& wrong)
 }
 
 static void FillFrame(const char* what, float sx, float sy, const float ps[4], float hostW, float hostH, const Rect& scissor,
-    uint32_t wantN, const Rect* want)
+    uint32_t wantN, const Rect* want, float fx = kFrameX, float fy = kFrameY)
 {
-    Rect got[2]{};
-    const uint32_t n = BlackoutRects(ps, hostW, hostH, scissor, sx, sy, got);
+    Rect got[4]{};
+    const Box b{ -fx * sx, fx * sx, -fy * sy, fy * sy };
+    const uint32_t n = BlackoutRects(b, ps, hostW, hostH, scissor, got);
     printf("%s: %u rect(s)", what, n);
     for (uint32_t i = 0; i < n; i++)
         printf(" [%d,%d)x[%d,%d)", got[i].x0, got[i].x1, got[i].y0, got[i].y1);
@@ -491,13 +502,50 @@ static void FillFrame(const char* what, float sx, float sy, const float ps[4], f
             got[i].y1, want[i].x0, want[i].x1, want[i].y0, want[i].y1);
 }
 
-// The black frame's fill against pixel centres: a pixel of the scissor is
-// filled exactly when its centre is outside the band (|y| > sy under Vert+,
-// |x| > sx under Hor+); ties within 1/256 pixel skipped, as above.
-static void FrameOracle(const char* what, float sx, float sy, const float ps[4], float hostW, float hostH, const Rect& scissor)
+// v0.1.1-v0.1.5's black frame fill, kept here as a planted fault: only what
+// lies past the band (the rows above and below it under Vert+, the columns
+// beside it under Hor+, nothing at 16:9), so the band's thin border round
+// the frame showed what was behind (GitHub #19's Blacklist bio).
+static uint32_t PastBandOnly(const Box&, const float ps[4], float hostW, float hostH, const Rect& scissor, float scaleX, float scaleY,
+    Rect out[4])
 {
-    Rect r[2]{};
-    const uint32_t n = BlackoutRects(ps, hostW, hostH, scissor, sx, sy, r);
+    uint32_t n = 0;
+    auto add = [&](const Rect& r) {
+        const Rect c = Intersect(r, scissor);
+        if (!Empty(c))
+            out[n++] = c;
+    };
+    const float e = kFillEdge;
+    if (scaleY < 1.0f)
+    {
+        add(ClipToHost(-e, e, scaleY, e, ps, hostW, hostH));
+        add(ClipToHost(-e, e, -e, -scaleY, ps, hostW, hostH));
+    }
+    else if (scaleX < 1.0f)
+    {
+        add(ClipToHost(scaleX, e, -e, e, ps, hostW, hostH));
+        add(ClipToHost(-e, -scaleX, -e, e, ps, hostW, hostH));
+    }
+    return n;
+}
+
+// The black frame's fill against pixel centres: a pixel of the scissor is
+// filled, exactly once, when its centre lies outside the frame's box (past
+// the band and in the band's border round it, at every shape, 16:9 too),
+// never inside it; ties within 1/256 pixel skipped, as above. `rects` makes
+// the rectangles (BlackoutRects, or a planted fault). Returns the wrong
+// pixels.
+using FrameRectsFn = uint32_t (*)(const Box&, const float*, float, float, const Rect&, float, float, Rect*);
+static uint32_t RingRects(const Box& b, const float* ps, float w, float h, const Rect& sc, float, float, Rect* out)
+{
+    return BlackoutRects(b, ps, w, h, sc, out);
+}
+static int FrameOracle(const char* what, float sx, float sy, const float ps[4], float hostW, float hostH, const Rect& scissor,
+    FrameRectsFn rects = RingRects, bool print = true, float fx = kFrameX, float fy = kFrameY)
+{
+    const Box b{ -fx * sx, fx * sx, -fy * sy, fy * sy };
+    Rect r[4]{};
+    const uint32_t n = rects(b, ps, hostW, hostH, scissor, sx, sy, r);
     const float pxX = std::fabs(ps[0]) * hostW * 0.5f, pxY = std::fabs(ps[1]) * hostH * 0.5f;
     auto tie = [](float d, float px) { return std::fabs(d) * px < 1.0f / 256.0f; };
     int wrong = 0, ties = 0;
@@ -507,19 +555,24 @@ static void FrameOracle(const char* what, float sx, float sy, const float ps[4],
         for (int32_t x = scissor.x0; x < scissor.x1; x++)
         {
             const float cx = ((float(x) + 0.5f) / hostW * 2.0f - 1.0f - ps[2]) / ps[0];
-            const bool want = sy < 1.0f ? std::fabs(cy) > sy : sx < 1.0f ? std::fabs(cx) > sx : false;
-            const bool onEdge = sy < 1.0f ? tie(std::fabs(cy) - sy, pxY) : sx < 1.0f && tie(std::fabs(cx) - sx, pxX);
-            bool got = false;
-            for (uint32_t i = 0; i < n; i++)
-                got = got || (x >= r[i].x0 && x < r[i].x1 && y >= r[i].y0 && y < r[i].y1);
-            if (onEdge)
+            if (tie(cx - b.x0, pxX) || tie(cx - b.x1, pxX) || tie(cy - b.y0, pxY) || tie(cy - b.y1, pxY))
+            {
                 ties++;
-            else
-                wrong += got != want;
+                continue;
+            }
+            const bool want = !(cx > b.x0 && cx < b.x1 && cy > b.y0 && cy < b.y1);
+            int got = 0;
+            for (uint32_t i = 0; i < n; i++)
+                got += x >= r[i].x0 && x < r[i].x1 && y >= r[i].y0 && y < r[i].y1;
+            wrong += got != (want ? 1 : 0);
         }
     }
-    printf("oracle black frame %s: %d pixel(s) wrong (%d on an edge, skipped)\n", what, wrong, ties);
-    CHECK(wrong == 0, "black frame %s: %d pixels differ from the pixel-centre oracle", what, wrong);
+    if (print)
+    {
+        printf("oracle black frame %s: %d pixel(s) wrong (%d on an edge, skipped)\n", what, wrong, ties);
+        CHECK(wrong == 0, "black frame %s: %d pixels differ from the pixel-centre oracle", what, wrong);
+    }
+    return wrong;
 }
 
 // ---- PlanFill on the draws as the renderer sees them ----
@@ -906,8 +959,8 @@ static void BackdropTests()
             printf("planted %s: %d wrong pixel(s)\n", what, bad);
             CHECK(bad > 0, "planted %s: no wrong pixel", what);
         };
-        run("the whole strips (the black frame's fill)", [](const Box&, const float* ps, float w, float h, const Rect& sc, float sx, float sy, Rect* out) {
-            return BlackoutRects(ps, w, h, sc, sx, sy, out);
+        run("the whole strips (v0.1.5's black frame fill)", [](const Box& b, const float* ps, float w, float h, const Rect& sc, float sx, float sy, Rect* out) {
+            return PastBandOnly(b, ps, w, h, sc, sx, sy, out);
         });
         run("past the picture only (no corners)", [](const Box& b, const float* ps, float w, float h, const Rect& sc, float sx, float sy, Rect* out) {
             Rect r[8]{};
@@ -1292,42 +1345,82 @@ int main()
 
     printf("\nblack frame fill:\n");
     {
-        const Rect deck[2] = { { 0, 0, 1280, 36 }, { 0, 684, 1280, 720 } };
-        FillFrame("Deck, 1x", 1.0f, 0.9f, ps, 1280, 2048, frame, 2, deck);
-        FillFrame("Deck, 1x, half-pixel", 1.0f, 0.9f, half, 1280, 2048, frame, 2, deck);
-        const Rect deck2[2] = { { 0, 0, 2560, 72 }, { 0, 1368, 2560, 1440 } };
-        FillFrame("Deck, 2x", 1.0f, 0.9f, ps, 2560, 4096, frame2, 2, deck2);
-        const Rect deck2h[2] = { { 0, 0, 2560, 73 }, { 0, 1369, 2560, 1440 } };
-        FillFrame("Deck, 2x, half-pixel", 1.0f, 0.9f, half, 2560, 4096, frame2, 2, deck2h);
-        const Rect r43[2] = { { 0, 0, 1280, 90 }, { 0, 630, 1280, 720 } };
-        FillFrame("4:3", 1.0f, 0.75f, ps, 1280, 2048, frame, 2, r43);
-        FillFrame("iPad Pro", 1.0f, 0.750366f, ps, 1280, 2048, frame, 2, r43);
-        const Rect r32[2] = { { 0, 0, 1280, 56 }, { 0, 664, 1280, 720 } };
-        FillFrame("3:2", 1.0f, 0.84375f, ps, 1280, 2048, frame, 2, r32);
-        const Rect t[1] = { { 0, 428, 1280, 464 } };
-        FillFrame("Deck, tile at y -256", 1.0f, 0.9f, tiled, 1280, 2048, Rect{ 0, 0, 1280, 464 }, 1, t);
-        const Rect g[2] = { { 100, 10, 1180, 36 }, { 100, 684, 1180, 700 } };
+        // Everything outside the frame: the rows above and below it, then
+        // the columns beside it within its rows (v0.1.5: only past the band,
+        // the Deck's rows 0..35 and 684..719, nothing at 16:9).
+        const Rect deck[4] = { { 0, 0, 1280, 56 }, { 0, 664, 1280, 720 }, { 0, 56, 19, 664 }, { 1261, 56, 1280, 664 } };
+        FillFrame("Deck, 1x", 1.0f, 0.9f, ps, 1280, 2048, frame, 4, deck);
+        const Rect deckh[4] = { { 0, 0, 1280, 56 }, { 0, 665, 1280, 720 }, { 0, 56, 20, 665 }, { 1261, 56, 1280, 665 } };
+        FillFrame("Deck, 1x, half-pixel", 1.0f, 0.9f, half, 1280, 2048, frame, 4, deckh);
+        const Rect deck2[4] = { { 0, 0, 2560, 112 }, { 0, 1328, 2560, 1440 }, { 0, 112, 38, 1328 }, { 2522, 112, 2560, 1328 } };
+        FillFrame("Deck, 2x", 1.0f, 0.9f, ps, 2560, 4096, frame2, 4, deck2);
+        const Rect deck2h[4] = { { 0, 0, 2560, 113 }, { 0, 1329, 2560, 1440 }, { 0, 113, 39, 1329 }, { 2523, 113, 2560, 1329 } };
+        FillFrame("Deck, 2x, half-pixel", 1.0f, 0.9f, half, 2560, 4096, frame2, 4, deck2h);
+        const Rect r43[4] = { { 0, 0, 1280, 106 }, { 0, 614, 1280, 720 }, { 0, 106, 19, 614 }, { 1261, 106, 1280, 614 } };
+        FillFrame("4:3", 1.0f, 0.75f, ps, 1280, 2048, frame, 4, r43);
+        FillFrame("iPad Pro", 1.0f, 0.750366f, ps, 1280, 2048, frame, 4, r43);
+        const Rect r32[4] = { { 0, 0, 1280, 75 }, { 0, 645, 1280, 720 }, { 0, 75, 19, 645 }, { 1261, 75, 1280, 645 } };
+        FillFrame("3:2", 1.0f, 0.84375f, ps, 1280, 2048, frame, 4, r32);
+        const Rect t[3] = { { 0, 408, 1280, 464 }, { 0, 0, 19, 408 }, { 1261, 0, 1280, 408 } };
+        FillFrame("Deck, tile at y -256", 1.0f, 0.9f, tiled, 1280, 2048, Rect{ 0, 0, 1280, 464 }, 3, t);
+        const Rect g[2] = { { 100, 10, 1180, 56 }, { 100, 664, 1180, 700 } };
         FillFrame("Deck, game scissor", 1.0f, 0.9f, ps, 1280, 2048, Rect{ 100, 10, 1180, 700 }, 2, g);
-        const Rect fl[2] = { { 0, 684, 1280, 720 }, { 0, 0, 1280, 36 } };
-        FillFrame("Deck, y flipped", 1.0f, 0.9f, flipped, 1280, 2048, frame, 2, fl);
-        const Rect w329[2] = { { 1920, 0, 2560, 1440 }, { 0, 0, 640, 1440 } };
-        FillFrame("32:9, 2x", 0.5f, 1.0f, ps, 2560, 4096, frame2, 2, w329);
-        const Rect w329h[2] = { { 1921, 0, 2560, 1440 }, { 0, 0, 641, 1440 } };
-        FillFrame("32:9, 2x, half-pixel", 0.5f, 1.0f, half, 2560, 4096, frame2, 2, w329h);
-        const Rect uw[2] = { { 1120, 0, 1280, 720 }, { 0, 0, 160, 720 } };
-        FillFrame("21:9", 0.75f, 1.0f, ps, 1280, 2048, frame, 2, uw);
-        const Rect u3440[2] = { { 1116, 0, 1280, 720 }, { 0, 0, 164, 720 } };
-        FillFrame("3440x1440", 0.744186f, 1.0f, ps, 1280, 2048, frame, 2, u3440);
-        FillFrame("16:9", 1.0f, 1.0f, ps, 1280, 2048, frame, 0, nullptr);
+        const Rect fl[4] = { { 0, 664, 1280, 720 }, { 0, 0, 1280, 56 }, { 0, 56, 19, 664 }, { 1261, 56, 1280, 664 } };
+        FillFrame("Deck, y flipped", 1.0f, 0.9f, flipped, 1280, 2048, frame, 4, fl);
+        const Rect w329[4] = { { 0, 0, 2560, 44 }, { 0, 1396, 2560, 1440 }, { 0, 44, 659, 1396 }, { 1901, 44, 2560, 1396 } };
+        FillFrame("32:9, 2x", 0.5f, 1.0f, ps, 2560, 4096, frame2, 4, w329);
+        const Rect w329h[4] = { { 0, 0, 2560, 45 }, { 0, 1397, 2560, 1440 }, { 0, 45, 660, 1397 }, { 1902, 45, 2560, 1397 } };
+        FillFrame("32:9, 2x, half-pixel", 0.5f, 1.0f, half, 2560, 4096, frame2, 4, w329h);
+        const Rect uw[4] = { { 0, 0, 1280, 22 }, { 0, 698, 1280, 720 }, { 0, 22, 174, 698 }, { 1106, 22, 1280, 698 } };
+        FillFrame("21:9", 0.75f, 1.0f, ps, 1280, 2048, frame, 4, uw);
+        const Rect u3440[4] = { { 0, 0, 1280, 22 }, { 0, 698, 1280, 720 }, { 0, 22, 178, 698 }, { 1102, 22, 1280, 698 } };
+        FillFrame("3440x1440", 0.744186f, 1.0f, ps, 1280, 2048, frame, 4, u3440);
+        const Rect r169[4] = { { 0, 0, 1280, 22 }, { 0, 698, 1280, 720 }, { 0, 22, 19, 698 }, { 1261, 22, 1280, 698 } };
+        FillFrame("16:9", 1.0f, 1.0f, ps, 1280, 2048, frame, 4, r169);
+        const Rect r169h[4] = { { 0, 0, 2560, 45 }, { 0, 1397, 2560, 1440 }, { 0, 45, 39, 1397 }, { 2523, 45, 2560, 1397 } };
+        FillFrame("16:9, 2x, half-pixel", 1.0f, 1.0f, half, 2560, 4096, frame2, 4, r169h);
     }
     FrameOracle("Deck 1x", 1.0f, 0.9f, ps, 1280, 2048, frame);
     FrameOracle("Deck 3x, half-pixel", 1.0f, 0.9f, half, 3840, 6144, frame3);
     FrameOracle("4:3 2x, y flipped, half-pixel", 1.0f, 0.75f, flippedHalf, 2560, 4096, frame2);
     FrameOracle("Deck, tile", 1.0f, 0.9f, tiled, 1280, 2048, Rect{ 0, 0, 1280, 464 });
+    FrameOracle("Deck, game scissor", 1.0f, 0.9f, ps, 1280, 2048, Rect{ 100, 10, 1180, 700 });
     FrameOracle("32:9 2x, half-pixel", 0.5f, 1.0f, half, 2560, 4096, frame2);
     FrameOracle("21:9 1x", 0.75f, 1.0f, ps, 1280, 2048, frame);
     FrameOracle("3440x1440 2x", 0.744186f, 1.0f, ps, 2560, 4096, frame2);
     FrameOracle("16:9", 1.0f, 1.0f, ps, 1280, 2048, frame);
+    FrameOracle("16:9 2x, half-pixel", 1.0f, 1.0f, half, 2560, 4096, frame2);
+    FrameOracle("~57 s frame, Deck", 1.0f, 0.9f, ps, 1280, 2048, frame, RingRects, true, kFrameX, kFrameY57);
+    FrameOracle("Blacklist bio panel, 16:9", 1.0f, 1.0f, ps, 1280, 2048, frame, RingRects, true, kBioX, kBioY);
+    FrameOracle("Blacklist bio panel, Deck 2x, half-pixel", 1.0f, 0.9f, half, 2560, 4096, frame2, RingRects, true, kBioX, kBioY);
+    // Planted: the oracle catches v0.1.5's fill (past the band only) at
+    // every shape, 16:9 included, and a ring that leaves the frame's own
+    // rows' sides out.
+    {
+        struct Shape2
+        {
+            const char* name;
+            float sx, sy;
+        };
+        const Shape2 shapes[] = { { "Deck", 1.0f, 0.9f }, { "4:3", 1.0f, 0.75f }, { "16:9", 1.0f, 1.0f }, { "21:9", 0.75f, 1.0f }, { "32:9", 0.5f, 1.0f } };
+        int failing = 0;
+        for (const Shape2& sh : shapes)
+            failing += FrameOracle(sh.name, sh.sx, sh.sy, ps, 1280, 2048, frame, PastBandOnly, false) > 0;
+        printf("planted black frame fill 'past the band only (v0.1.5)': %d of %zu shapes fail\n", failing, std::size(shapes));
+        CHECK(failing == int(std::size(shapes)), "planted 'past the band only': %d of %zu shapes fail", failing, std::size(shapes));
+        const int rowsOnly = FrameOracle("rows only", 1.0f, 0.9f, ps, 1280, 2048, frame,
+            [](const Box& b, const float* q, float w, float h, const Rect& sc, float, float, Rect* out) {
+                Rect r[4]{};
+                const uint32_t n = BlackoutRects(b, q, w, h, sc, r);
+                uint32_t m = 0;
+                for (uint32_t i = 0; i < n && i < 2; i++)
+                    out[m++] = r[i];
+                return m;
+            },
+            false);
+        printf("planted black frame fill 'rows above and below only': %d wrong pixel(s)\n", rowsOnly);
+        CHECK(rowsOnly > 0, "planted 'rows above and below only' passed");
+    }
     Cover("black frame, Deck", -kFrameX, kFrameX, 1.0f, 0.9f, ps);
     Cover("black frame, 32:9, half-pixel", -kFrameX, kFrameX, 0.5f, 1.0f, half);
 
@@ -1342,8 +1435,14 @@ int main()
         const Rect right[2] = { { 640, 0, 1280, 36 }, { 640, 684, 1280, 720 } }, left[2] = { { 0, 0, 640, 36 }, { 0, 684, 640, 720 } };
         PlanCase("Deck right bar", d, rightDeck, Fill::RightBar, 2, right);
         PlanCase("Deck left bar", d, leftDeck, Fill::LeftBar, 2, left);
-        const Rect black[2] = { { 0, 0, 1280, 36 }, { 0, 684, 1280, 720 } };
-        PlanCase("Deck black frame", d, frameDeck, Fill::Blackout, 2, black);
+        const Rect black[4] = { { 0, 0, 1280, 56 }, { 0, 664, 1280, 720 }, { 0, 56, 19, 664 }, { 1261, 56, 1280, 664 } };
+        PlanCase("Deck black frame", d, frameDeck, Fill::Blackout, 4, black);
+        // The Blacklist bio's panel (GitHub #19), as logged on the Deck:
+        // "black frame x -0.976..0.976 y -0.887..0.887 colour FB000000".
+        const Rect bio[4] = { { 0, 0, 1280, 41 }, { 0, 679, 1280, 720 }, { 0, 41, 15, 679 }, { 1265, 41, 1280, 679 } };
+        PlanCase("Deck Blacklist bio panel", d, Polys(Rectangle(-kBioX, kBioX, -kBioY, kBioY, 1.0f, 0.9f, 0xFB000000), deck), Fill::Blackout, 4, bio);
+        // ... fading in (11000000): left as it is, as before.
+        PlanCase("Deck Blacklist bio panel fading in", d, Polys(Rectangle(-kBioX, kBioX, -kBioY, kBioY, 1.0f, 0.9f, 0x11000000), deck), Fill::None);
         {
             const Plan p = RunPlan(d, rightDeck);
             CHECK(std::fabs(p.box.x0 - 0.651f) < 1e-5f && std::fabs(p.box.x1 - 1.406f) < 1e-5f && std::fabs(p.box.y0 + 1.024f * 0.9f) < 1e-5f &&
@@ -1357,22 +1456,26 @@ int main()
         const EPolys right329 = Polys(Rectangle(0.651f, 1.406f, -1.024f, 1.039f, 0.5f, 1.0f, 0xFD000000), w329);
         const EPolys frame329 = Polys(Rectangle(-kFrameX, kFrameX, -kFrameY, kFrameY, 0.5f, 1.0f, kFrameColour), w329);
         const Draw d329 = S2Draw(w329, 0.5f, 1.0f, ps, 2560, 4096, frame2);
-        const Rect r329[1] = { { 1920, 0, 2560, 1440 } }, f329[2] = { { 1920, 0, 2560, 1440 }, { 0, 0, 640, 1440 } };
+        const Rect r329[1] = { { 1920, 0, 2560, 1440 } };
+        const Rect f329[4] = { { 0, 0, 2560, 44 }, { 0, 1396, 2560, 1440 }, { 0, 44, 659, 1396 }, { 1901, 44, 2560, 1396 } };
         PlanCase("32:9 right bar", d329, right329, Fill::RightBar, 1, r329);
-        PlanCase("32:9 black frame", d329, frame329, Fill::Blackout, 2, f329);
+        PlanCase("32:9 black frame", d329, frame329, Fill::Blackout, 4, f329);
         // 21:9: the bars reach the screen edge (nothing to fill), the black
         // frame does not.
         const Matrix uw = FrontEndMatrix(0.75f, 1.0f);
         const Draw duw = S2Draw(uw, 0.75f, 1.0f, ps);
         PlanCase("21:9 right bar", duw, Polys(Rectangle(0.651f, 1.406f, -1.024f, 1.039f, 0.75f, 1.0f, 0xFD000000), uw), Fill::RightBar, 0, nullptr);
-        const Rect fuw[2] = { { 1120, 0, 1280, 720 }, { 0, 0, 160, 720 } };
-        PlanCase("21:9 black frame", duw, Polys(Rectangle(-kFrameX, kFrameX, -kFrameY, kFrameY, 0.75f, 1.0f, kFrameColour), uw), Fill::Blackout, 2,
+        const Rect fuw[4] = { { 0, 0, 1280, 22 }, { 0, 698, 1280, 720 }, { 0, 22, 174, 698 }, { 1106, 22, 1280, 698 } };
+        PlanCase("21:9 black frame", duw, Polys(Rectangle(-kFrameX, kFrameX, -kFrameY, kFrameY, 0.75f, 1.0f, kFrameColour), uw), Fill::Blackout, 4,
             fuw);
-        // 16:9 never gets here (the renderer's block needs a view scale
-        // below 1), and a plan there fills nothing.
+        // 16:9 (the renderer asks PlanFill there too): the thin border round
+        // the frame; a vid-cam bar there fills nothing.
         const Matrix m169 = FrontEndMatrix(1.0f, 1.0f);
+        const Rect f169[4] = { { 0, 0, 1280, 22 }, { 0, 698, 1280, 720 }, { 0, 22, 19, 698 }, { 1261, 22, 1280, 698 } };
         PlanCase("16:9 black frame", S2Draw(m169, 1.0f, 1.0f, ps),
-            Polys(Rectangle(-kFrameX, kFrameX, -kFrameY, kFrameY, 1.0f, 1.0f, kFrameColour), m169), Fill::Blackout, 0, nullptr);
+            Polys(Rectangle(-kFrameX, kFrameX, -kFrameY, kFrameY, 1.0f, 1.0f, kFrameColour), m169), Fill::Blackout, 4, f169);
+        PlanCase("16:9 right bar", S2Draw(m169, 1.0f, 1.0f, ps), Polys(Rectangle(0.651f, 1.406f, -1.024f, 1.039f, 1.0f, 1.0f, 0xFD000000), m169),
+            Fill::RightBar, 0, nullptr);
         // A ppc/ from before the Vert+ hooks reports no front-end y scale
         // (0): Hor+ still fills (c5 the unnarrowed 0.92), a narrowed view
         // can't happen there and is refused.

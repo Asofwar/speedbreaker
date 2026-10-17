@@ -15,6 +15,9 @@
 #include <imgui_internal.h>  // DragToScroll: the window under a touch, its scroll and the active item
 #include <platform/ios_ui.h>
 #endif
+#if defined(__APPLE__) && !TARGET_OS_IOS
+#include <platform/macos_window.h>
+#endif
 
 #include <SDL3/SDL.h>
 
@@ -498,6 +501,33 @@ namespace ui
         }
 #endif
 
+#if defined(__APPLE__) && !TARGET_OS_IOS
+        bool s_buttonsShown = true;  // as AppKit makes the window
+        int s_buttonChanges = 0;     // logged, the first few
+
+        // The window's close, minimise and zoom buttons, over the picture in
+        // a window (platform/macos_window.h), come and go with the pointer:
+        // shown while it shows over the window, hidden when it hides (the
+        // mouse still for 2 s), leaves the window, or the app isn't in front
+        // (SDL then gives no window the mouse). In fullscreen they stay:
+        // macOS shows them there only with the menu bar.
+        void UpdateWindowButtons(bool pointerShown)
+        {
+            if (!s_window)
+                return;
+            const bool fullscreen = SDL_GetWindowFlags(s_window) & SDL_WINDOW_FULLSCREEN;
+            const bool shown = fullscreen || (pointerShown && SDL_GetMouseFocus() == s_window);
+            if (shown == s_buttonsShown)
+                return;
+            s_buttonsShown = shown;
+            platform::macos::ShowWindowButtons(s_window, shown);
+            if (++s_buttonChanges <= 6)
+                fprintf(stderr, "[ui] window buttons %s\n",
+                    shown ? (fullscreen ? "shown (fullscreen)" : "shown (the pointer is over the window)")
+                          : "hidden (the pointer hid or left the window)");
+        }
+#endif
+
         // Shows or hides the cursor for now (each frame, and as the menu
         // opens or closes). While a menu or modal page has the mouse, ImGui's
         // backend shows it and picks its shape; otherwise it must keep its
@@ -516,6 +546,9 @@ namespace ui
                     io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
             }
             const bool show = s_cursorIdle.Shows(SDL_GetTicksNS(), menu);
+#if defined(__APPLE__)
+            UpdateWindowButtons(show);  // every time: the pointer can leave without hiding
+#endif
             if (show == s_cursorShown)
                 return;
             s_cursorShown = show;
@@ -971,14 +1004,20 @@ namespace ui
         UpdateScale();
         ImGui::NewFrame();
         // Panels and toasts lay out in the work area: the window's safe area,
-        // clear of an iPhone's Dynamic Island and home indicator (elsewhere
-        // the whole window, as before).
+        // clear of an iPhone's Dynamic Island and home indicator, and below a
+        // Mac window's title bar where that lies over the picture (the
+        // window's buttons are there: platform/macos_window.h); elsewhere the
+        // whole window, as before.
         // (The window's, in its points: kept inside the display, which is
         // the swapchain's shape while FitUiDisplay overrules the window.)
         if (SDL_Rect safe; s_window && SDL_GetWindowSafeArea(s_window, &safe) && safe.w > 0 && safe.h > 0)
         {
             ImGuiViewport* viewport = ImGui::GetMainViewport();
-            const float x0 = std::clamp(float(safe.x), 0.0f, io.DisplaySize.x), y0 = std::clamp(float(safe.y), 0.0f, io.DisplaySize.y);
+            float top = float(safe.y);
+#if defined(__APPLE__) && !TARGET_OS_IOS
+            top = std::max(top, platform::macos::TitleStripHeight(s_window));
+#endif
+            const float x0 = std::clamp(float(safe.x), 0.0f, io.DisplaySize.x), y0 = std::clamp(top, 0.0f, io.DisplaySize.y);
             const float x1 = std::clamp(float(safe.x + safe.w), x0, io.DisplaySize.x), y1 = std::clamp(float(safe.y + safe.h), y0, io.DisplaySize.y);
             if (x1 - x0 >= 1.0f && y1 - y0 >= 1.0f)
             {

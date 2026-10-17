@@ -301,8 +301,9 @@ its name>`, e.g. `NFSMW_GPU=intel %command%` in Steam's launch options.
 
 **Settings:** **F1** or **Cmd+,**, or Back + Start on a controller. The game starts in a window;
 Display > Fullscreen switches to full screen and decides how the game starts from then on. The
-window's green button (or Ctrl+Cmd+F) switches only until you quit. While you play, the mouse
-pointer hides after two seconds without moving. SpeedBreaker needs macOS 15 (Sequoia) or later.
+window's green button (or Ctrl+Cmd+F) switches only until you quit. In a window, the picture
+runs up under a transparent title bar, and the window's buttons show while you move the mouse
+over it. While you play, the mouse pointer hides after two seconds without moving. SpeedBreaker needs macOS 15 (Sequoia) or later.
 
 ### iPhone and iPad
 
@@ -558,7 +559,7 @@ SpeedBreaker folder instead: `data/`, `data/game` and `cache/`.
 2. A notice says where the zip file went: your **Desktop** (on SteamOS, pick it up in Desktop
    Mode, or in the Desktop app on a Steam Frame), the **SpeedBreaker** folder in the Files app on
    iPhone and iPad, or the data folder above when there is no Desktop. Its name says which
-   version you were running, for example `speedbreaker-bug-report-v0.1.5-<date>_<time>.zip`.
+   version you were running, for example `speedbreaker-bug-report-v0.1.6-<date>_<time>.zip`.
 3. Open an [issue][issues], attach the zip, and say what you were doing, what you expected, what
    happened, and roughly how long into the session it happened.
 

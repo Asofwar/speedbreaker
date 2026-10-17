@@ -13,7 +13,12 @@
 // left every voice empty for half of each burst: gameplay audio came out
 // chopped 50% (two frames on, two off), thin and "tinny". SDL's queue is
 // kept near two device buffers to absorb the device's pulls, and the
-// cadence gains or skips a frame to follow the device clock. NFSMW_MUTE=1
+// cadence gains or skips a frame to follow the device clock, but never stops
+// (apu/audio_cadence.h): all of the game's sound, its sound commands
+// included, runs on this callback, so a device that stops taking audio must
+// not stop it (GitHub issue #20: the sound stopped for good, then the game
+// hung after the race). What such a device can't take is dropped, and the
+// log says when it stopped and started taking audio again. NFSMW_MUTE=1
 // (or no audio device) keeps the same cadence with no output. The driver
 // handle and wrapped argument follow Xenia.
 //
@@ -24,6 +29,7 @@
 // frames owed.
 #include <stdafx.h>
 #include "audio.h"
+#include "audio_cadence.h"
 #include <kernel/function.h>
 #include <cpu/guest_thread.h>
 #include <cpu/guest_time.h>
@@ -33,6 +39,7 @@
 #endif
 #include <user/settings.h>
 #include <video/presenter.h>
+#include <report/report.h>
 
 namespace
 {
@@ -54,6 +61,19 @@ namespace
     constexpr int FRAME_BYTES = SAMPLES_PER_FRAME * CHANNELS * sizeof(float);
     std::atomic<int> s_targetFrames{ 4 };  // SDL queue level to hold (frames of 256 samples)
     int s_deviceFrames = 0;                // the device's buffer at the stream's rate (FollowDevice)
+    // What the hang report says about the audio (apu::DescribeState): when
+    // the render callback last ran, when the game's mix last had sound, and
+    // since when the device hasn't taken audio (0: it has); steady-clock ns.
+    std::atomic<int64_t> s_lastRenderNs{ 0 }, s_lastSoundNs{ 0 }, s_deviceStalledNs{ 0 };
+    std::atomic<uint64_t> s_dropped{ 0 };  // frames the device didn't take (dropped)
+    // The cadence (the audio thread; the frames it renders are submitted on
+    // that thread too).
+    apu::AudioCadence s_cadence;
+
+    int64_t SteadyNs()
+    {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
 
     // The queue level for the stream's device as it is now: two device
     // buffers (at the stream's rate), at least 4 frames. Logs it when it
@@ -140,9 +160,42 @@ namespace
             paused = guesttime::PausedNs();
             next = steady_clock::now();
         } while (guesttime::Suspended() || guesttime::PausedNs() != paused);
+        // NFSMW_TEST_AUDIO_DEVICE_STALL=<s>[+<secs>] (tests): the output
+        // device stops taking audio <s> seconds after this thread starts
+        // (paused, as a device that stalls or that another app holds), for
+        // good or for <secs>.
+        double stallAt = -1, stallFor = 0;
+        if (const char* v = std::getenv("NFSMW_TEST_AUDIO_DEVICE_STALL"))
+        {
+            char* end = nullptr;
+            stallAt = std::strtod(v, &end);
+            if (end && *end == '+')
+                stallFor = std::strtod(end + 1, nullptr);
+        }
+        int stallState = 0;  // 0 before, 1 stalled, 2 over
+        const auto started = steady_clock::now();
         while (s_running)
         {
             std::this_thread::sleep_until(next);
+            if (stallAt >= 0 && stallState < 2 && s_stream)
+            {
+                const double t = duration<double>(steady_clock::now() - started).count();
+                if (stallState == 0 && t >= stallAt)
+                {
+                    stallState = 1;
+                    fprintf(stderr, "[test] NFSMW_TEST_AUDIO_DEVICE_STALL: the output device stops taking audio (%.1f s)\n", t);
+                    std::lock_guard lock(s_streamMutex);
+                    SDL_PauseAudioStreamDevice(s_stream);
+                }
+                else if (stallState == 1 && stallFor > 0 && t >= stallAt + stallFor)
+                {
+                    stallState = 2;
+                    fprintf(stderr, "[test] NFSMW_TEST_AUDIO_DEVICE_STALL: the output device takes audio again (%.1f s)\n", t);
+                    std::lock_guard lock(s_streamMutex);
+                    if (!guesttime::Suspended())
+                        SDL_ResumeAudioStreamDevice(s_stream);
+                }
+            }
             // No guest audio time passes while the game is suspended: render
             // nothing (the main thread has paused the device). After it the
             // cadence moves on by exactly the time suspended, keeping its
@@ -172,17 +225,31 @@ namespace
                     FollowDevice(false);
                 }
                 // Follow the device clock: one frame more or less when the
-                // queue drifts from its target.
-                int queued = SDL_GetAudioStreamQueued(s_stream) / FRAME_BYTES;
-                if (queued > s_targetFrames + 2)
-                    frames = 0;
-                else if (queued < s_targetFrames - 2)
-                    frames = 2;
+                // queue drifts from its target, never stopping the game's
+                // sound (audio_cadence.h).
+                int queued = std::max(0, SDL_GetAudioStreamQueued(s_stream)) / FRAME_BYTES;
+                frames = s_cadence.Frames(queued, s_targetFrames);
+                if (s_cadence.Stalled() && !s_deviceStalledNs.load(std::memory_order_relaxed))
+                {
+                    s_deviceStalledNs.store(SteadyNs(), std::memory_order_relaxed);
+                    fprintf(stderr, "[audio] the output device has taken no audio for %.1f s (%.0f ms queued): the game's sound "
+                        "carries on, unheard, until it does\n", apu::AudioCadence::StallTicks(s_targetFrames) * apu::kFrameNs / 1e9,
+                        1000.0 * queued * SAMPLES_PER_FRAME / SAMPLE_RATE);
+                }
+                if (s_cadence.Resumed())
+                {
+                    // What was queued before the stall is stale.
+                    SDL_ClearAudioStream(s_stream);
+                    const int64_t since = s_deviceStalledNs.exchange(0, std::memory_order_relaxed);
+                    fprintf(stderr, "[audio] the output device takes audio again after %.1f s (%llu frames dropped in all)\n",
+                        since ? double(SteadyNs() - since) / 1e9 : 0.0, (unsigned long long)s_dropped.load());
+                }
             }
             for (int i = 0; i < frames && !guesttime::Suspended(); i++)
             {
                 RenderFrame(ctx);
                 s_rendered.fetch_add(1, std::memory_order_relaxed);
+                s_lastRenderNs.store(SteadyNs(), std::memory_order_relaxed);
             }
         }
     }
@@ -207,6 +274,22 @@ namespace apu
     uint64_t RenderedFrames()
     {
         return s_rendered.load(std::memory_order_relaxed);
+    }
+
+    std::string DescribeState()
+    {
+        const int64_t now = SteadyNs();
+        auto ago = [now](int64_t t) { return t ? std::format("{:.1f} s ago", double(now - t) / 1e9) : std::string("never"); };
+        std::string text = std::format("Render callbacks: {} (the last {}); frames from the game: {}; the game's mix last had sound {}.\n",
+            s_rendered.load(), ago(s_lastRenderNs.load()), s_framesSubmitted.load(), ago(s_lastSoundNs.load()));
+        if (!s_stream)
+            return text + "Output device: none (muted by NFSMW_MUTE, or no device).\n";
+        const int64_t stalled = s_deviceStalledNs.load();
+        text += std::format("Output device: {:.1f} ms queued (target {:.1f} ms); {}; {} frames dropped in all.\n", QueuedMs(),
+            1000.0 * s_targetFrames * SAMPLES_PER_FRAME / SAMPLE_RATE,
+            stalled ? std::format("not taking audio for {:.1f} s", double(now - stalled) / 1e9) : std::string("taking audio"),
+            s_dropped.load());
+        return text;
     }
 
     double QueuedMs()
@@ -256,6 +339,34 @@ uint32_t XAudioUnregisterRenderDriverClient(uint32_t driver)
 uint32_t XAudioSubmitRenderDriverFrame(uint32_t driver, void* samples)
 {
     s_framesSubmitted++;
+    // When the game's mix last had sound (the hang report), and a line once it
+    // has been silent for 10 s in a row (its sound stopped, or a silent
+    // screen) and when it sounds again: a player's log shows when it dropped.
+    if (samples)
+    {
+        static uint64_t silentFrames = 0;
+        static double silentFrom = 0;
+        const auto* words = static_cast<const uint32_t*>(samples);
+        bool silent = true;
+        for (uint32_t i = 0; i < SAMPLES_PER_FRAME * CHANNELS && silent; i++)
+            silent = (words[i] & 0xFFFFFF7Fu) == 0;  // +0.0 or -0.0, big-endian
+        constexpr uint64_t kSilentLog = 10 * SAMPLE_RATE / SAMPLES_PER_FRAME;
+        if (!silent)
+        {
+            s_lastSoundNs.store(SteadyNs(), std::memory_order_relaxed);
+            if (silentFrames >= kSilentLog)
+                fprintf(stderr, "[audio] the game's mix sounds again after %.1f s of silence\n",
+                    double(silentFrames) * SAMPLES_PER_FRAME / SAMPLE_RATE);
+            silentFrames = 0;
+        }
+        else
+        {
+            if (silentFrames == 0)
+                silentFrom = report::SessionSeconds();
+            if (++silentFrames == kSilentLog)
+                fprintf(stderr, "[audio] the game's mix has been silent for 10 s (since %.1f s)\n", silentFrom);
+        }
+    }
     if (!s_stream || !samples)
         return 0;
     // Volume, mute and mute-in-background, when they or the focus change.
@@ -321,6 +432,13 @@ uint32_t XAudioSubmitRenderDriverFrame(uint32_t driver, void* samples)
             worstGap = 0;
             nextLog = now + std::chrono::seconds(2);
         }
+    }
+    // A device that isn't taking audio (audio_cadence.h): the frame is
+    // dropped, and the game's sound carries on, unheard.
+    if (s_cadence.Stalled())
+    {
+        s_dropped.fetch_add(1, std::memory_order_relaxed);
+        return 0;
     }
     SDL_PutAudioStreamData(s_stream, out, sizeof(out));
 

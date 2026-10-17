@@ -6,9 +6,10 @@
 //   build/band_filter_test
 // What it checks:
 //   - BandOf's rows and columns are those whose centres lie inside the band
-//     (a pixel-centre oracle), and with the edge-bar fills' rows
-//     (gpu::bars::BlackoutRects) they split the frame with no gap and no
-//     overlap, at every internal resolution (a fuzz over screen shapes too);
+//     (a pixel-centre oracle), and with the edge-bar fills' rows (gpu::
+//     bars::BlackoutRects of a frame as big as the band) they split the
+//     frame with no gap and no overlap, at every internal resolution (a fuzz
+//     over screen shapes too);
 //   - the scaling pass, modelled along the axis that is split (bilinear,
 //     Catmull-Rom with its 2x2 clamp and sharpening, and the 7-fetch
 //     variant), on a frame whose strips are black and whose band is white:
@@ -245,9 +246,10 @@ static int AllCases(const Model& m)
 }
 
 // BandOf against the pixel-centre oracle, and against the edge-bar fills:
-// with the black frame's fill rows (gpu::bars::BlackoutRects, through a
-// full-frame front-end viewport: NDC y = -clip y) every row is in exactly
-// one of the band and the fill. Columns likewise under Hor+.
+// with the fill of a black frame as big as the band (gpu::bars::
+// BlackoutRects, through a full-frame front-end viewport: NDC y = -clip y)
+// every row is in exactly one of the band and the fill. Columns likewise
+// under Hor+.
 static void BandRowsCase(uint32_t w, uint32_t h, float sx, float sy)
 {
     const video::FrameBand b = video::BandOf(w, h, sx, sy);
@@ -271,8 +273,11 @@ static void BandRowsCase(uint32_t w, uint32_t h, float sx, float sy)
         CHECK(wrong == 0, "%ux%u scale %.4f: %d %s differ from the pixel-centre oracle", w, h, scale, wrong, axis ? "rows" : "columns");
     }
     const float ps[4] = { 1.0f, -1.0f, 0.0f, 0.0f };
-    gpu::bars::Rect r[2]{};
-    const uint32_t n = gpu::bars::BlackoutRects(ps, float(w), float(h), { 0, 0, int32_t(w), int32_t(h) }, sx, sy, r);
+    // The fill of a black frame as big as the band itself: everything past
+    // the band (the rows above and below it, or the columns beside it).
+    const gpu::bars::Box band{ -sx, sx, -sy, sy };
+    gpu::bars::Rect r[4]{};
+    const uint32_t n = gpu::bars::BlackoutRects(band, ps, float(w), float(h), { 0, 0, int32_t(w), int32_t(h) }, r);
     int wrongPx = 0;
     for (int32_t y = 0; y < int32_t(h); y += (y % 97 == 0 ? 1 : 7))
         for (int32_t x = 0; x < int32_t(w); x += 13)

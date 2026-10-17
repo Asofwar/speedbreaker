@@ -23,14 +23,27 @@
 // a thin border of the world shows around it, as on the console; a TV's
 // overscan hid it). Under Vert+ the world showed above and below it (63
 // rows on the Deck), under Hor+ beside it (720 px a side at 2880x810). The
-// intro's start (~57 s) has another, 0.920 of the frame's height.
+// intro's start (~57 s) has another, 0.920 of the frame's height. The
+// Blacklist's rival bio (SafeHouseRivalBio.fng, "View Rival Movie / View
+// Rival Car") sets its text and picture on one more, 0.976 x 0.985 of the
+// frame (FF000000, fading in from 11000000), for as long as the screen is
+// up: a thin rectangular border of the scene behind it all round it, on
+// every screen shape (GitHub #19).
 //
 // The fix leaves those draws as they are and, right after each side bar or
-// black frame, draws it once or twice more, stretched over the whole frame
-// and scissored to (its half of) what lies outside the 16:9 band: the rows
-// above and below it (Vert+), or the columns beyond its side (Hor+; for a
-// bar only when it ends short of the screen edge). Nothing inside the band
-// changes, and the strips get the quad's own colour, alpha and blend.
+// black frame, draws it once or more again, stretched over the whole frame
+// and scissored to what it must fill: for a bar, (its half of) what lies
+// outside the 16:9 band, the rows above and below it (Vert+) or the columns
+// beyond its side (Hor+; only when it ends short of the screen edge), and
+// nothing inside the band changes; for a black frame, everything outside
+// the quad itself, the band's thin border too, on every screen shape, 16:9
+// included (the period TV's look, as the results screen's overscan rows).
+// The copies get the quad's own colour, alpha and blend.
+//
+// Two pictures the front end draws just short of the 16:9 frame's edges
+// get the screen's edges instead, on every screen shape: around the results
+// screen's backdrop the rows are cleared to black (PlanBackdrop), and the
+// Showcase's vignette is stretched to the screen's edges (PlanVignette).
 //
 // Units: the frame's clip space after the front-end matrix (w = 1), and
 // "band units" = clip / view scale (x / scaleX, y / scaleY): +-1 are the
@@ -157,13 +170,16 @@ namespace gpu::bars
     }
 
     // A black frame's thresholds, in band units. Logged on the Deck and at
-    // 32:9: x +-0.970, y +-0.939, centred, FF000000 (the cut at ~95 s), and
-    // x +-0.970, y +-0.920, FE000000 (the intro's start, ~57 s). The nearest
-    // draws it must not take: the fades and dims (+-1.29: past the band,
-    // the widen, stretch and cover rules' own), the title key art (x
-    // +-1.104, y +-0.981, grey), the overlay at ~57 s (x +-1.104, B8 alpha),
-    // the vid cam's noise and dark overlays (x +-0.70; 3C alpha), its dialog
-    // boxes (x +-0.58), a full-band black layer (+-1.0, the cover rule's).
+    // 32:9: x +-0.970, y +-0.939, centred, FF000000 (the cut at ~95 s), and x
+    // +-0.970, y +-0.920, FE000000 (the intro's start, ~57 s); x +-0.976, y
+    // +-0.985, FB000000 then FF000000 (the Blacklist bio's panel, its fade in
+    // from 11000000 short of minAlpha: the border shows for those ~15 frames,
+    // as before). The nearest draws it must not take: the fades and dims
+    // (+-1.29: past the band, the widen, stretch and cover rules' own), the
+    // title key art (x +-1.104, y +-0.981, grey), the overlay at ~57 s (x
+    // +-1.104, B8 alpha), the vid cam's noise and dark overlays (x +-0.70; 3C
+    // alpha), its dialog boxes (x +-0.58), a full-band black layer (+-1.0, the
+    // cover rule's).
     struct BlackoutRule
     {
         float centreMax = 0.01f;                     // |the box's centre|, each axis
@@ -286,29 +302,28 @@ namespace gpu::bars
     }
 
     // What a black frame fills, inside the draw's scissor: everything
-    // outside the band, the rows above and below it across the whole width
-    // (Vert+) or the columns beside it down the whole height (Hor+; at most
-    // one of the view scales is below 1). The far edges reach kFillEdge.
-    inline uint32_t BlackoutRects(const float ps[4], float hostW, float hostH, const Rect& scissor, float scaleX, float scaleY,
-        Rect out[2])
+    // outside its box, on every screen shape (16:9 too): the rows above and
+    // below it across the whole width, then the columns beside it within its
+    // rows; up to 4 rectangles, which never overlap and meet the box on the
+    // same pixel edges (Edge) as its own rasterised pixels. The far edges
+    // reach kFillEdge. (v0.1.1 to v0.1.5 filled only past the band: the
+    // thin border inside it showed what was behind, as a 360's own output
+    // does and a period TV's overscan hid: GitHub #19's Blacklist bio.)
+    inline uint32_t BlackoutRects(const Box& b, const float ps[4], float hostW, float hostH, const Rect& scissor, Rect out[4])
     {
         uint32_t n = 0;
-        auto add = [&](const Rect& r) {
-            const Rect c = Intersect(r, scissor);
-            if (!Empty(c))
+        auto add = [&](float cx0, float cx1, float cy0, float cy1) {
+            if (cx1 <= cx0 || cy1 <= cy0)
+                return;
+            const Rect c = Intersect(ClipToHost(cx0, cx1, cy0, cy1, ps, hostW, hostH), scissor);
+            if (!Empty(c) && n < 4)
                 out[n++] = c;
         };
         const float e = kFillEdge;
-        if (scaleY < 1.0f)
-        {
-            add(ClipToHost(-e, e, scaleY, e, ps, hostW, hostH));
-            add(ClipToHost(-e, e, -e, -scaleY, ps, hostW, hostH));
-        }
-        else if (scaleX < 1.0f)
-        {
-            add(ClipToHost(scaleX, e, -e, e, ps, hostW, hostH));
-            add(ClipToHost(-e, -scaleX, -e, e, ps, hostW, hostH));
-        }
+        add(-e, e, b.y1, e);         // past its top in clip y (either way up on screen)
+        add(-e, e, -e, b.y0);        // past its bottom
+        add(-e, b.x0, b.y0, b.y1);   // left of it, within its rows
+        add(b.x1, e, b.y0, b.y1);    // right of it
         return n;
     }
 
@@ -488,24 +503,27 @@ namespace gpu::bars
         uint32_t blend0 = 0;          // RB_BLENDCONTROL0 & 0x1FFF1FFF
         bool t0Sampled = false;       // the pixel shader samples t0
         uint32_t t0Width = 0, t0Height = 0;  // t0's size in texels
+        uint32_t t0Format = 0;        // t0's fetch constant format (6: k_8_8_8_8, 32-bit texels)
         float posScale[4] = {};       // the draw's own: NDC = clip * ps.xy + ps.zw
         float hostW = 0.0f, hostH = 0.0f;    // the host viewport: the target's size times the render scale
         Rect scissor{};               // the draw's scissor (host pixels)
     };
 
-    enum class Fill : uint8_t { None, LeftBar, RightBar, Blackout, Backdrop };
+    enum class Fill : uint8_t { None, LeftBar, RightBar, Blackout, Backdrop, Vignette };
 
     // What to draw after the draw: for a bar or a black frame, `rectCount`
     // more copies of it (none for a bar that reaches the screen edge), with
     // `posScale` and each rectangle as the scissor; for a backdrop, each
-    // rectangle cleared to opaque black (its picture must not be copied).
+    // rectangle cleared to opaque black (its picture must not be copied);
+    // for a vignette, nothing after it: the draw itself is drawn with
+    // `posScale` instead of its own (no rectangles).
     struct Plan
     {
         Fill fill = Fill::None;
         Box box{};          // the quad's, clip space
         uint32_t argb = 0;  // its colour
         uint32_t rectCount = 0;
-        Rect rects[8]{};    // a bar's 2, a black frame's 2, a backdrop's 8
+        Rect rects[8]{};    // a bar's 2, a black frame's 4, a backdrop's 8
         float posScale[4]{};
     };
 
@@ -573,6 +591,145 @@ namespace gpu::bars
         return p;
     }
 
+    // The Showcase's vignette (Showcase.fng: the "Rotate / Zoom Out / Zoom In"
+    // car viewer of the car lot, the customize shop and the Blacklist's rival
+    // cars; GitHub #19): one front-end quad over the 3D garage, centred, x
+    // +-0.970 and y +-0.958 of the 16:9 band (ten of the front end's 640x480
+    // units in from each edge), its 256x256 k_8_8_8_8 texture black, clear in
+    // the middle (every texel there 00000000) and darkening steeply toward its
+    // edges (alpha 0.1-0.8 at the edge itself, 1.0 toward the corners), alpha-
+    // blended (vertex colour 7F7F7F, its alpha fading in from 04 to FE). On a
+    // 16:9 screen the garage shows undimmed in a thin border all round it; a
+    // real 360's own output has that border too (an HDMI capture of the car
+    // lot's Showcase: the same step at x +-0.970), and a period TV's overscan
+    // (2.5-5% a side) hid it. Under Vert+ the garage rendered above and below
+    // the band showed undimmed as well (7% of a MacBook's height at the top and
+    // at the bottom, 55 rows of a Deck's 800): a bright rectangular frame round
+    // the dimmed picture. The quad is stretched to the screen's edges (its box
+    // to +-kFillEdge: CoverFrame), on every screen shape, 16:9 too, as a period
+    // TV showed it (the results screen's overscan rows are filled the same way:
+    // OverscanRows). Its middle is clear, so only its dark edges move out:
+    // 3.1% in x and 4.4% in y at 16:9, y by 1/sv more under Vert+, x by 1/sx
+    // more under Hor+. Thresholds in band units. The nearest draws it must not
+    // take: the intro's black frames (x +-0.970, y +-0.939/0.920: opaque black
+    // over the 32x32 white texture, and the black frame rule's), the title's
+    // key art and the results picture (x +-1.104), the vid cam's noise and dark
+    // overlays (x +-0.70), a full-band picture (+-1.0), an inset picture
+    // (opaque in the middle: the texel check).
+    struct VignetteRule
+    {
+        float centreMax = 0.01f;                     // |the box's centre|, each axis
+        float extentMin = 0.90f, extentMax = 0.99f;  // half its width and half its height
+        uint32_t minTexels = 128;                    // t0 at least this wide and tall
+        float cornerTolerance = 1e-3f;               // clip units, as Rule's
+    };
+
+    // A vignette's shape: one axis-aligned rectangle, one colour on all four
+    // vertices (any alpha: it fades in), centred in the band and covering
+    // most of it in x and y while stopping short of its edges. Its box goes
+    // to `box`. (Its texture is the plan's check: PlanVignette.)
+    inline bool MatchVignette(const Vertex v[4], float scaleX, float scaleY, const VignetteRule& rule = {}, Box* box = nullptr)
+    {
+        if (!(scaleX > 0.0f && scaleY > 0.0f))
+            return false;
+        for (int i = 1; i < 4; i++)
+            if (v[i].argb != v[0].argb)
+                return false;
+        Box b;
+        if (!RectangleBox(v, rule.cornerTolerance, b))
+            return false;
+        const float midX = (b.x0 + b.x1) * 0.5f / scaleX, midY = (b.y0 + b.y1) * 0.5f / scaleY;
+        const float halfX = (b.x1 - b.x0) * 0.5f / scaleX, halfY = (b.y1 - b.y0) * 0.5f / scaleY;
+        if (!(std::fabs(midX) <= rule.centreMax && std::fabs(midY) <= rule.centreMax))
+            return false;
+        if (!(halfX >= rule.extentMin && halfX <= rule.extentMax && halfY >= rule.extentMin && halfY <= rule.extentMax))
+            return false;
+        if (box)
+            *box = b;
+        return true;
+    }
+
+    // The byte offset of texel (x, y) in a 32-bit 2D texture: Xenos tiling
+    // (gpu/renderer.cpp's GLSL tiled2D, pitch in texels, a multiple of 32)
+    // or linear rows of `pitch` texels.
+    inline uint32_t TexelOffset32(uint32_t x, uint32_t y, uint32_t pitch, bool tiled)
+    {
+        if (!tiled)
+            return (y * pitch + x) * 4u;
+        const uint32_t outer = (((y >> 5) * (pitch >> 5)) + (x >> 5)) << 6;
+        const uint32_t inner = (((y >> 1) & 7u) << 3) | (x & 7u);
+        const uint32_t oi = (outer | inner) << 2;
+        const uint32_t bank = (y >> 4) & 1u;
+        const uint32_t pipe = ((x >> 3) & 3u) ^ (((y >> 3) & 1u) << 1);
+        return ((y & 1u) << 4) | (pipe << 6) | (bank << 11) | (oi & 0xFu) | (((oi >> 4) & 1u) << 5) | (((oi >> 5) & 7u) << 8) |
+            ((oi >> 8) << 12);
+    }
+
+    // The texels a vignette's middle must hold clear (00000000, whatever the
+    // endian): the centre and halfway from it to each edge. An inset
+    // picture, opaque there, is no vignette.
+    constexpr uint32_t kClearSamples = 5;
+    inline void ClearSample(uint32_t i, uint32_t width, uint32_t height, uint32_t& x, uint32_t& y)
+    {
+        const uint32_t xs[kClearSamples] = { width / 2, width / 4, width * 3 / 4, width / 2, width / 2 };
+        const uint32_t ys[kClearSamples] = { height / 2, height / 2, height / 2, height / 4, height * 3 / 4 };
+        x = xs[i % kClearSamples];
+        y = ys[i % kClearSamples];
+    }
+
+    // The register checks for a vignette, before any vertex is read:
+    // Candidate's, but alpha-blended (07060706: it is translucent), over a
+    // large 32-bit t0 (format 6, k_8_8_8_8), at every screen shape.
+    inline bool VignetteCandidate(const Draw& d, const VignetteRule& rule = {})
+    {
+        const float* c = d.c;
+        const bool yScale = d.frontEndY > 0.0f ? std::fabs(std::fabs(c[5]) - d.frontEndY) <= d.frontEndY * 1e-5f
+                                               : d.frontEndY == 0.0f && d.scaleY >= 1.0f;
+        return !d.occlusion && d.prim == 13 && d.count == 4 && d.frontEndShader && d.leftAlone && c[3] == 0.0f && c[4] == 0.0f &&
+            c[6] == 0.0f && c[7] == 0.0f && yScale && (d.vte & 0xF) == 0xF && d.blend0 == 0x07060706u && d.t0Sampled && d.t0Format == 6 &&
+            d.t0Width >= rule.minTexels && d.t0Height >= rule.minTexels;
+    }
+
+    // The plan for a vignette: the draw's posScale stretched so its box
+    // reaches past every screen edge (CoverFrame), no rectangles. read: as
+    // PlanFill's; texel(x, y, word): t0's 32-bit texel (x, y), false if it
+    // can't be read. Vertices first (as PlanBackdrop: one quad over a large
+    // t0 gets this far), then the texels of its middle.
+    template <class ReadWord, class ReadTexel>
+    Plan PlanVignette(const Draw& d, ReadWord&& read, ReadTexel&& texel, const VignetteRule& rule = {})
+    {
+        Plan p;
+        if (!VignetteCandidate(d, rule))
+            return p;
+        const float* c = d.c;
+        Vertex v[4];
+        for (uint32_t k = 0; k < 4; k++)
+        {
+            uint32_t w[4];
+            for (uint32_t j = 0; j < 4; j++)
+                if (!read(k, j, w[j]))
+                    return p;
+            float q[3];
+            std::memcpy(q, w, sizeof(q));
+            v[k] = { q[0] * c[0] + q[1] * c[1] + q[2] * c[2] + c[3], q[0] * c[4] + q[1] * c[5] + q[2] * c[6] + c[7], w[3] };
+        }
+        Box box{};
+        if (!MatchVignette(v, d.scaleX, d.scaleY, rule, &box))
+            return p;
+        for (uint32_t i = 0; i < kClearSamples; i++)
+        {
+            uint32_t x, y, word = 1;
+            ClearSample(i, d.t0Width, d.t0Height, x, y);
+            if (!texel(x, y, word) || word != 0)
+                return p;
+        }
+        p.fill = Fill::Vignette;
+        p.box = box;
+        p.argb = v[0].argb;
+        CoverFrame(box, d.posScale, p.posScale);
+        return p;
+    }
+
     // The plan for a draw. read(k, j, word): word j of the draw's vertex k
     // (k 0..3 in draw order, through its indices; an ePoly's words 0..3 are
     // x, y, z and the colour), false past the vertex buffer. Register checks
@@ -608,7 +765,7 @@ namespace gpu::bars
         else if (MatchBlackout(v, d.scaleX, d.scaleY, {}, &box))
         {
             p.fill = Fill::Blackout;
-            p.rectCount = BlackoutRects(d.posScale, d.hostW, d.hostH, d.scissor, d.scaleX, d.scaleY, p.rects);
+            p.rectCount = BlackoutRects(box, d.posScale, d.hostW, d.hostH, d.scissor, p.rects);
         }
         else
             return p;

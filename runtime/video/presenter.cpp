@@ -11,6 +11,7 @@
 #include <game/ultrawide.h>
 #include "gpu_choice.h"
 #include "present_schedule.h"
+#include "swapchain_use.h"
 #include "picture_fit.h"
 #include "frame_rate.h"
 #include "swapchain_policy.h"
@@ -25,9 +26,13 @@
 #if defined(__APPLE__) && TARGET_OS_IOS
 #include <platform/ios_ui.h>
 #endif
+#if defined(__APPLE__) && !TARGET_OS_IOS
+#include <platform/macos_window.h>
+#endif
 #include <user/settings.h>
 #include <report/report.h>
 #include <platform/thermal.h>
+#include <platform/quit_signals.h>
 #include <kernel/memory_status.h>
 
 #include <SDL3/SDL.h>
@@ -273,15 +278,17 @@ namespace video
         // screen for more refreshes than the game gave it vblanks (repeated).
         // The waits run beside presents to the same swapchain, as the
         // extension is used: the WSIs synchronise the two internally (Mesa's,
-        // MoltenVK's), though the spec leaves that to the caller. Destroying
-        // a swapchain waits until no wait is on it.
+        // MoltenVK's), though the spec leaves that to the caller. The waiter
+        // uses a swapchain (its waits, the driver's reports) only through
+        // s_swapchainUse, and destroying one waits until no use is on it
+        // (video/swapchain_use.h).
         bool s_presentTiming = false;
         PFN_vkWaitForPresentKHR s_waitForPresent = nullptr;
         uint64_t s_presentId = 0;  // main thread: the last present's
         struct PresentTiming
         {
             uint64_t id;
-            VkSwapchainKHR swapchain;
+            uint64_t swapchain;  // its generation (s_swapchainUse)
             int64_t presented;  // vkQueuePresentKHR (ns, steady clock)
             int64_t vblank;     // a new game frame: the guest vblank it followed; 0: a redraw
         };
@@ -291,8 +298,10 @@ namespace video
         std::mutex& s_timingMutex = *new std::mutex;
         std::condition_variable& s_timingCv = *new std::condition_variable;
         std::deque<PresentTiming>& s_timings = *new std::deque<PresentTiming>;  // presented, not yet seen on screen
-        std::mutex s_waitSwapchainMutex;      // held by the waiter while it waits
-        VkSwapchainKHR s_waitSwapchain = VK_NULL_HANDLE;  // the one it may wait on
+        // The swapchain the waiter may use (never destroyed either), and its
+        // generation (main thread; 0: none).
+        SwapchainUse<VkSwapchainKHR>& s_swapchainUse = *new SwapchainUse<VkSwapchainKHR>;
+        uint64_t s_swapchainGeneration = 0;
         FILE* s_timingLog = nullptr;          // NFSMW_VBLANK_LOG=<file>: one CSV line per present
 
         // macOS: a new frame may be shown a set time after the guest vblank
@@ -317,8 +326,9 @@ namespace video
         uint32_t s_displayTimingId = 0;  // main thread
         // The decision and the watchdog (main thread: Wanted; the waiter:
         // the driver's reports), and the frames shown at a time not reported
-        // on yet: present id -> the time asked for (steady clock).
-        std::mutex s_scheduleMutex;
+        // on yet: present id -> the time asked for (steady clock). The
+        // mutex is never destroyed (the waiter may be in it at exit).
+        std::mutex& s_scheduleMutex = *new std::mutex;
         PresentSchedule s_schedule;
         struct ScheduledPresent
         {
@@ -355,18 +365,23 @@ namespace video
         // for): the driver's reports on the presents shown since the last
         // call, to NFSMW_VBLANK_LOG's .actual.csv and, for frames shown at a
         // time, to the watchdog; and `t`, if shown at a time, counted as
-        // presented (the driver reports it a present or so later).
+        // presented (the driver reports it a present or so later). The
+        // reports are read only while `t`'s swapchain is the current one,
+        // and it isn't destroyed under the read: a swapchain destroyed since
+        // the wait (a fullscreen toggle, a resize) has none left to read.
         void ReadDriverReports(const PresentTiming& t)
         {
             uint32_t count = 0;
             std::vector<VkPastPresentationTimingGOOGLE> past;
-            if (s_pastTiming(s_device, t.swapchain, &count, nullptr) == VK_SUCCESS && count)
-            {
-                past.resize(count);
-                if (s_pastTiming(s_device, t.swapchain, &count, past.data()) < VK_SUCCESS)
-                    count = 0;
-                past.resize(count);
-            }
+            s_swapchainUse.Use(t.swapchain, [&](VkSwapchainKHR swapchain) {
+                if (s_pastTiming(s_device, swapchain, &count, nullptr) == VK_SUCCESS && count)
+                {
+                    past.resize(count);
+                    if (s_pastTiming(s_device, swapchain, &count, past.data()) < VK_SUCCESS)
+                        count = 0;
+                    past.resize(count);
+                }
+            });
             const int64_t hostToSteady = HostToSteadyNs();
             bool tripped = false;
             {
@@ -469,12 +484,10 @@ namespace video
                     t = s_timings.front();
                 }
                 int64_t start = NowNs();
-                VkResult r = VK_ERROR_OUT_OF_DATE_KHR;
-                {
-                    std::lock_guard lock(s_waitSwapchainMutex);
-                    if (t.swapchain == s_waitSwapchain)
-                        r = s_waitForPresent(s_device, t.swapchain, t.id, 50'000'000);
-                }
+                VkResult r = VK_ERROR_OUT_OF_DATE_KHR;  // its swapchain is gone
+                s_swapchainUse.Use(t.swapchain, [&](VkSwapchainKHR swapchain) {
+                    r = s_waitForPresent(s_device, swapchain, t.id, 50'000'000);
+                });
                 int64_t now = NowNs();
                 {
                     std::lock_guard lock(s_timingMutex);
@@ -544,10 +557,10 @@ namespace video
         void DestroySwapchain()
         {
             {
-                std::lock_guard wait(s_waitSwapchainMutex);  // the waiter is off it after this
-                s_waitSwapchain = VK_NULL_HANDLE;
+                s_swapchainUse.Retire();  // the waiter is off it after this, and stays off
                 std::lock_guard lock(s_timingMutex);
-                std::erase_if(s_timings, [](const PresentTiming& t) { return t.swapchain == s_swapchain; });
+                std::erase_if(s_timings, [](const PresentTiming& t) { return t.swapchain == s_swapchainGeneration; });
+                s_swapchainGeneration = 0;
             }
             for (VkSemaphore s : s_renderDone)
                 vkDestroySemaphore(s_device, s, nullptr);
@@ -671,10 +684,7 @@ namespace video
                         !s_vsync && info.presentMode == VK_PRESENT_MODE_FIFO_KHR ? "; the surface offers nothing else" : "");
                 }
             }
-            {
-                std::lock_guard lock(s_waitSwapchainMutex);
-                s_waitSwapchain = s_swapchain;
-            }
+            s_swapchainGeneration = s_swapchainUse.Publish(s_swapchain);
             if (s_uiReady)
                 ui::SetFormat(s_swapFormat);
             s_swapPolicy.Created({ s_swapExtent.width, s_swapExtent.height });
@@ -2252,6 +2262,11 @@ void main()
             fprintf(stderr, "[video] SDL_CreateWindow: %s\n", SDL_GetError());
             return false;
         }
+#if defined(__APPLE__) && !TARGET_OS_IOS
+        // The title bar over the picture (platform/macos_window.h); a window
+        // made fullscreen gets it when it leaves fullscreen.
+        platform::macos::ConfigureWindow(s_window, !startFullscreen);
+#endif
 #if defined(__APPLE__) && TARGET_OS_IOS
         platform::ios::WatchKeyboards(s_window);
 #endif
@@ -3091,6 +3106,10 @@ void main()
         platform::ios::PollBattery();  // every 5 seconds
 #endif
         ScriptedWindowSizes();
+        // SIGTERM, SIGINT, SIGHUP (platform/quit_signals.h): the window's
+        // way out, from the game, the installer or the startup error page.
+        if (quitsignals::Requested())
+            return false;
         SDL_Event e;
         while (SDL_PollEvent(&e))
         {
@@ -3132,6 +3151,14 @@ void main()
                     fprintf(stderr, "[video] fullscreen %s by the system (the window's fullscreen button or menu, or the window "
                         "manager), for this session; the Fullscreen setting (%s) is unchanged and decides the next launch\n",
                         on ? "on" : "off", settings::GetBool(settings::Id::Fullscreen) ? "On" : "Off");
+#if defined(__APPLE__) && !TARGET_OS_IOS
+                // SDL took the title bar off the picture for the fullscreen
+                // Space: back on here, in the event loop, after SDL's own
+                // callbacks (platform/macos_window.h says why not sooner).
+                int windowW = 0, windowH = 0;
+                if (!on && platform::macos::RestoreAfterFullscreen(s_window) && SDL_GetWindowSize(s_window, &windowW, &windowH))
+                    fprintf(stderr, "[video] the title bar over the picture again (window %dx%d)\n", windowW, windowH);
+#endif
             }
         }
         // Without the queue lock: the command processor's submits take it,
@@ -3729,7 +3756,7 @@ void main()
         if (s_presentTiming && (present == VK_SUCCESS || present == VK_SUBOPTIMAL_KHR))
         {
             std::lock_guard lock(s_timingMutex);
-            s_timings.push_back({ id, s_swapchain, presented, frameVblank });
+            s_timings.push_back({ id, s_swapchainGeneration, presented, frameVblank });
             s_timingCv.notify_one();
         }
         s_lastPresent = std::chrono::steady_clock::now();
@@ -3945,10 +3972,12 @@ void main()
             s_uiReady = false;
         }
         hid::Shutdown();  // a rumble under way would otherwise carry on
-        {
-            std::lock_guard wait(s_waitSwapchainMutex);  // the present waiter is off the swapchain
-            s_waitSwapchain = VK_NULL_HANDLE;
-        }
+        s_swapchainUse.Retire();  // the present waiter is off the swapchain, and stays off
+        // Then the title bar's styling lets go of the window (Retire first:
+        // nothing presents to it while it is taken apart), then SDL frees it.
+#if defined(__APPLE__) && !TARGET_OS_IOS
+        platform::macos::ForgetWindow(s_window);
+#endif
         if (s_window)
             SDL_DestroyWindow(s_window);
         // No SDL_Quit: the process exits next, and the game's audio thread

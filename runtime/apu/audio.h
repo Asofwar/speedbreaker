@@ -5,6 +5,7 @@
 // cpu/guest_time.h).
 #pragma once
 #include <cstdint>
+#include <string>
 
 namespace apu
 {
@@ -24,4 +25,9 @@ namespace apu
     // and the audio queued for the device (ms; 0 without one).
     uint64_t RenderedFrames();
     double QueuedMs();
+
+    // Any thread: the audio's state for a hang report, a line or two: the
+    // render callbacks (the game's sound runs on them), when the game's mix
+    // last had sound, and the output device (GitHub issue #20).
+    std::string DescribeState();
 }

@@ -98,9 +98,17 @@ namespace report
     // The crash handler (a signal handler; async-signal-safe): logs the
     // crash and writes the report. The caller exits afterwards.
     void WriteCrashReport(int sig, siginfo_t* info, void* context);
+    // The session is ending cleanly (the quit path, any return from main()):
+    // its crash marker is removed (crash_marker.h), so one the next launch
+    // finds is a session that didn't. Last, just before the exit: a crash
+    // after it is only logged. Not while a crash is being reported.
+    void ClearCrashMarker();
     // Main thread, once toasts can show: tells the player, once, about a
-    // crash report from an earlier session.
-    void NoticePreviousCrash();
+    // crash report from an earlier session, and logs an earlier session that
+    // ended without quitting. `lastClearsMarker`: the session before this
+    // one ran a version that clears its marker at a clean end (this one or
+    // later: v0.1.5 and older left it after every session).
+    void NoticePreviousCrash(bool lastClearsMarker);
 
     // --- Threads and hangs (watchdog.cpp) ---
 
