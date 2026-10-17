@@ -28,6 +28,7 @@
 #include <install/locate.h>
 #include <install/placement.h>
 #include <install/sha256.h>
+#include <platform/quit_signals.h>
 #include <report/report.h>
 #include <ui/installer_screen.h>
 #include <ui/ui.h>
@@ -176,6 +177,7 @@ namespace
         uint32_t entry;
         uint32_t stackSize;
     };
+    std::atomic<bool> s_guestReturned{ false };  // the game's entry point returned
 
     void* GuestMain(void* arg)
     {
@@ -191,6 +193,7 @@ namespace
         fprintf(stderr, "[runtime] calling entry %08X\n", params->entry);
         uint32_t result = GuestThread::Start({ params->entry, 0, 0 });
         fprintf(stderr, "[runtime] entry point returned %08X\n", result);
+        s_guestReturned = true;
         return nullptr;
     }
 
@@ -409,9 +412,9 @@ int main(int argc, char** argv)
             fprintf(stderr, "[runtime]   %s\n", p.c_str());
         settings::Load();
         // The page needs a window; without one, the system's message box.
-        bool windowed = video::Initialize();
-        ShowStartupError(message.title, message.paragraphs, message.details, windowed);
-        if (windowed)
+        const bool hasWindow = video::Initialize();
+        ShowStartupError(message.title, message.paragraphs, message.details, hasWindow);
+        if (hasWindow)
             video::Shutdown();
         report::FlushLog();
         return 1;
@@ -430,6 +433,18 @@ int main(int argc, char** argv)
     sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
     for (int sig : { SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGFPE, SIGABRT })
         sigaction(sig, &sa, nullptr);
+    // SIGTERM, SIGINT and SIGHUP quit the game as its window's close button
+    // does (platform/quit_signals.h): before SDL starts, which leaves them to
+    // us.
+    quitsignals::Install();
+    // From here on a return from main() is a clean end too (an unknown
+    // option, a cancelled install, a XEX that can't be read): the session's
+    // crash marker goes (report.h). The quit paths' std::_Exit runs no
+    // destructors: they clear it themselves.
+    struct ClearMarkerOnReturn
+    {
+        ~ClearMarkerOnReturn() { report::ClearCrashMarker(); }
+    } clearMarkerOnReturn;
 
     // Anything else starting with '-' is a mistake, not a XEX path.
     if (argc > 1 && argv[1][0] == '-')
@@ -463,9 +478,10 @@ int main(int argc, char** argv)
     // problem began), the "What's new" note below, and this version recorded
     // as the last (user/version_check.h).
     version::Change versionChange = version::Change::Same;
+    std::string lastVersion;  // the last session's ("": not known)
     if (settingsLoaded)
     {
-        std::string last = settings::LastVersion();
+        std::string last = lastVersion = settings::LastVersion();
         versionChange = version::Classify(last, settings::FileFound(), report::Version());
         fprintf(stderr, "[version] %s\n", version::Describe(versionChange, last, report::Version()).c_str());
         if (versionChange != version::Change::Same)
@@ -487,7 +503,14 @@ int main(int argc, char** argv)
         fprintf(stderr, "[memory] %s\n", notice.c_str());
         ui::Toast(notice, 12.0);
     }
-    report::NoticePreviousCrash();
+    // A crash marker left by a session of this version or a later one is a
+    // session that ended without quitting; v0.1.5 and older left theirs after
+    // every session. iOS ends apps without a word (none quits there).
+#if defined(__APPLE__) && TARGET_OS_IOS
+    report::NoticePreviousCrash(false);
+#else
+    report::NoticePreviousCrash(!lastVersion.empty() && version::Compare(lastVersion, report::Version()) >= 0);
+#endif
 
     // NFSMW_LIFELINE_PID (scripts/steamos/speedbreaker.sh): the launcher's PID. The
     // game runs in a container, not as the launcher's child, so Steam
@@ -509,6 +532,7 @@ int main(int argc, char** argv)
                 // the game's main loop still runs to write it out.
                 timedemo::FinishCapture();
                 gpu::renderer::Shutdown();
+                report::ClearCrashMarker();
                 report::FlushLog();
                 std::_Exit(bench::Enabled() ? bench::ExitCode() : 0);
             }).detach();
@@ -681,6 +705,26 @@ int main(int argc, char** argv)
 
     if (!windowed)
     {
+        // No window (NFSMW_HEADLESS=1): the game runs until its entry point
+        // returns, or until a requested termination, which ends it as the
+        // window's quit path below does.
+        while (!s_guestReturned.load() && !quitsignals::Requested())
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        if (int sig = quitsignals::Requested())
+        {
+            fprintf(stderr, "[runtime] %s: quitting\n", quitsignals::Name(sig));
+            if (settings::Dirty())
+                settings::Save();
+            // As the window's quit path: a save being written finishes
+            // first, a timedemo's capture is written out, and a replay's
+            // benchmark status (interrupted) is the exit code.
+            vfs::WaitForStagedFiles(std::chrono::seconds(2));
+            timedemo::FinishCapture();
+            gpu::renderer::Shutdown();
+            report::ClearCrashMarker();
+            report::FlushLog();
+            std::_Exit(bench::Enabled() ? bench::ExitCode() : 0);
+        }
         pthread_join(thread, nullptr);
         report::FlushLog();
         return 0;
@@ -698,6 +742,8 @@ int main(int argc, char** argv)
     hid::NoteGameStarting();
     while (video::RunFrame())
         ;
+    if (int sig = quitsignals::Requested())
+        fprintf(stderr, "[runtime] %s: quitting, as the window's close button does\n", quitsignals::Name(sig));
     fprintf(stderr, "[runtime] window closed\n");
     if (settings::Dirty())
         settings::Save();
@@ -707,6 +753,9 @@ int main(int argc, char** argv)
     timedemo::FinishCapture();
     gpu::renderer::Shutdown();
     video::Shutdown();
+    // A clean end: no crash marker left (a crash in the shutdown above still
+    // reported one).
+    report::ClearCrashMarker();
     // The session log's last lines are still in its pipe: let them out
     // before _Exit takes the thread that copies them.
     report::FlushLog();

@@ -1,3 +1,7 @@
+AMD FidelityFX Super Resolution 1 (FSR 1): ffx_a.h and ffx_fsr1.h
+https://github.com/GPUOpen-Effects/FidelityFX-FSR (commit a21ffb8f6c13233ba336352bdff293894c706575, files ffx-fsr/ffx_a.h and ffx-fsr/ffx_fsr1.h)
+Vendored unmodified in runtime/thirdparty/fsr1; their shader code is compiled into SpeedBreaker.
+
 Copyright (c) 2021 Advanced Micro Devices, Inc. All rights reserved.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy

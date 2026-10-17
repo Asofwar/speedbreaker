@@ -344,7 +344,7 @@ namespace
             "the swap callback's uncapped argument comes before anything else it does");
 
         std::string main = Read(rt + "/main.cpp");
-        CHECK(Count(main, "timedemo::FinishCapture();") == 2, "a capture finishes on both ways out");
+        CHECK(Count(main, "timedemo::FinishCapture();") == 3, "a capture finishes on every way out (the window, the launcher gone, a quit signal without a window)");
         for (size_t at = main.find("timedemo::FinishCapture();"); at != std::string::npos; at = main.find("timedemo::FinishCapture();", at + 1))
         {
             size_t wait = main.rfind("vfs::WaitForStagedFiles(", at), renderer = main.find("gpu::renderer::Shutdown();", at);
@@ -352,7 +352,7 @@ namespace
                 "after the saves, before the renderer stops (the guest still runs)");
         }
         CHECK(Before(main, "timedemo::Start(sha);", "pthread_create(&thread"), "the timedemo starts before the guest");
-        CHECK(Count(main, "std::_Exit(bench::Enabled() ? bench::ExitCode() : 0);") == 2, "a benchmark's status as the exit code");
+        CHECK(Count(main, "std::_Exit(bench::Enabled() ? bench::ExitCode() : 0);") == 3, "a benchmark's status as the exit code (all three ways out)");
 
         std::string ui = Read(rt + "/ui/ui.cpp");
         CHECK(Count(ui, "XamNotifySystemUi(") == 2 && Before(ui, "if (!timedemo::OnSystemUi(true))", "XamNotifySystemUi(true);") &&

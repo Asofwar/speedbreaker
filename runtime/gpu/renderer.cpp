@@ -10099,8 +10099,131 @@ void main()
         // stretched in y alone it would be distorted by up to 1/sv. The rest
         // of the front end is clipped to the band (below).
         // Edge bars (gpu/edge_bars.h): the copies of a police vid-cam side
-        // bar, the intro's black frame or a menu's inset overlay that fill
-        // the screen past the 16:9 band, drawn right after it.
+        // bar that fill the screen past the 16:9 band, and of a black frame
+        // (the intro's cuts, the Blacklist bio's panel) that fill everything
+        // outside it, at 16:9 too, drawn right after it; the black around a
+        // full-band backdrop (the results screen), cleared right after it,
+        // at 16:9 too; and the Showcase's vignette, stretched to the screen's
+        // edges. NFSMW_BAR_FILL=0 turns all the edge fills off (an A/B
+        // switch).
+        // planEdgeFills: the plan for a front-end draw (its registers, what
+        // the rules below did, a reader for its ePolys): PlanFill's bars and
+        // black frames first, then PlanBackdrop's full-band picture, then
+        // PlanVignette's overlay (every screen shape; a bar fills nothing at
+        // 16:9).
+        // logEdgeFill: what a plan does, once per kind, screen shape and
+        // outcome, in every log (a tester's too).
+        static const bool barFill = [] { const char* v = std::getenv("NFSMW_BAR_FILL"); return !(v && v[0] == '0'); }();
+        auto planEdgeFills = [&](const float* c, float feY, float aspectX, float aspectY, bool feShader, bool leftAlone) {
+            xenos::xe_gpu_texture_fetch_t t0;
+            memcpy(&t0, &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], sizeof(t0));
+            const gpu::bars::Draw draw{ .prim = uint32_t(initiator.prim_type),
+                .count = count,
+                .c = c,
+                .frontEndY = feY,
+                .scaleX = aspectX,
+                .scaleY = aspectY,
+                .frontEndShader = feShader,
+                .leftAlone = leftAlone,
+                .occlusion = zpdCount,
+                .vte = vte.value,
+                .blend0 = s_regs[XE_GPU_REG_RB_BLENDCONTROL0] & 0x1FFF1FFF,
+                .t0Sampled = (s_ps->info.texture2DMask & 1) != 0,
+                .t0Width = uint32_t(t0.size_2d.width) + 1,
+                .t0Height = uint32_t(t0.size_2d.height) + 1,
+                .t0Format = uint32_t(t0.format),
+                .posScale = { pc.posScale[0], pc.posScale[1], pc.posScale[2], pc.posScale[3] },
+                .hostW = w * float(scaleX),
+                .hostH = h * float(scaleY),
+                .scissor = { scissor.offset.x, scissor.offset.y, scissor.offset.x + int32_t(scissor.extent.width),
+                    scissor.offset.y + int32_t(scissor.extent.height) } };
+            const uint32_t* vf = &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 95 * 2];
+            const uint32_t base = vf[0] & 0x1FFFFFFC, endian = vf[1] & 3;
+            const uint32_t words = (vf[1] >> 2) & 0xFFFFFF, first = s_regs[XE_GPU_REG_VGT_INDX_OFFSET];
+            auto read = [&](uint32_t k, uint32_t j, uint32_t& word) {
+                const uint32_t v = src.Get(k) + first;  // an ePoly: 8 words
+                if ((v + 1) * 8 > words)
+                    return false;
+                word = GpuSwap(LoadPhysical(base + (v * 8 + j) * 4), endian);
+                return true;
+            };
+            gpu::bars::Plan plan = gpu::bars::PlanFill(draw, read);
+            // The results screen's backdrop (and any opaque picture of that
+            // shape: the title's key art): what lies outside the picture,
+            // past the band and in the band's overscan rows above and below
+            // it, is cleared to black after it, where the world drawn behind
+            // it showed (gpu/edge_bars.h).
+            if (plan.fill == gpu::bars::Fill::None)
+                plan = gpu::bars::PlanBackdrop(draw, read);
+            // The Showcase's vignette (and any front-end overlay of its
+            // shape, clear in the middle): stretched to the screen's edges,
+            // where the garage showed undimmed round it (GitHub #19). Its
+            // texels as the GPU reads them: 32-bit, tiled or linear rows.
+            if (plan.fill == gpu::bars::Fill::None)
+            {
+                const uint32_t t0Base = (uint32_t(t0.base_address) << 12) & 0x1FFFFFFFu;
+                const uint32_t t0Pitch = uint32_t(t0.pitch) << 5;
+                auto texel = [&](uint32_t x, uint32_t y, uint32_t& word) {
+                    if (!t0Pitch || x >= draw.t0Width || y >= draw.t0Height || x >= t0Pitch)
+                        return false;
+                    word = GpuSwap(LoadPhysical(t0Base + gpu::bars::TexelOffset32(x, y, t0Pitch, t0.tiled != 0)), uint32_t(t0.endianness));
+                    return true;
+                };
+                plan = gpu::bars::PlanVignette(draw, read, texel);
+            }
+            return plan;
+        };
+        auto logEdgeFill = [&](const gpu::bars::Plan& barPlan, float aspectX, float aspectY) {
+            if (barPlan.fill == gpu::bars::Fill::None)
+                return;
+            static const bool logFrontEnd = std::getenv("NFSMW_LOG_FRONTEND") != nullptr;
+            // A match each frame skips building the line once its key is
+            // logged.
+            const uint32_t kind = uint32_t(barPlan.fill);
+            const bool blackout = barPlan.fill == gpu::bars::Fill::Blackout;
+            const bool backdrop = barPlan.fill == gpu::bars::Fill::Backdrop;
+            const bool vignette = barPlan.fill == gpu::bars::Fill::Vignette;
+            const gpu::bars::Box& box = barPlan.box;
+            const uint64_t key = (0x36ull << 56) | (uint64_t(kind) << 40) | (uint64_t(barPlan.rectCount) << 36) |
+                (uint64_t(std::lround(aspectX * 4096.0f)) << 18) | uint64_t(std::lround(aspectY * 4096.0f));
+            static uint64_t loggedKey[6] = { ~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull };
+            if (loggedKey[kind] != key)
+            {
+                loggedKey[kind] = key;
+                char fills[192];
+                if (barPlan.rectCount)
+                    snprintf(fills, sizeof(fills), "fills %u rectangle(s) %s, first [%d,%d)x[%d,%d) (host px)", barPlan.rectCount,
+                        backdrop ? "outside it (past the 16:9 band, and the band's overscan rows)"
+                            : blackout ? "outside it (past the 16:9 band, and the band's border round it)" : "past the 16:9 band", barPlan.rects[0].x0,
+                        barPlan.rects[0].x1, barPlan.rects[0].y0, barPlan.rects[0].y1);
+                else
+                    snprintf(fills, sizeof(fills), "%s", vignette ? "stretched to the screen's edges"
+                        : blackout || backdrop ? "fills nothing" : "reaches the screen edge: nothing to fill");
+                LogOnce(key,
+                    "edge bars: frame %llu vs_%016llx ps_%016llx: %s (clip x %.3f..%.3f y %.3f..%.3f, colour %08X; view scale x %.4f y %.4f) %s",
+                    (unsigned long long)s_frame, (unsigned long long)s_vs->hash, (unsigned long long)s_ps->hash,
+                    vignette ? "the Showcase's vignette (clear in the middle)" : backdrop ? "a full-band backdrop (black outside it)"
+                        : blackout ? "a black frame" : kind == uint32_t(gpu::bars::Fill::RightBar) ? "the right vid-cam bar" : "the left vid-cam bar",
+                    box.x0, box.x1, box.y0, box.y1, barPlan.argb, aspectX, aspectY, fills);
+            }
+            // NFSMW_LOG_FRONTEND=1: the first frame of each run of frames
+            // with a match, bars and black frames apart (one run per vid-cam
+            // scene and per cut; any other is a draw this should not take).
+            static uint64_t lastBarFrame[4] = { ~0ull - 1, ~0ull - 1, ~0ull - 1, ~0ull - 1 };
+            uint64_t& last = lastBarFrame[vignette ? 3 : backdrop ? 2 : blackout ? 1 : 0];
+            if (logFrontEnd && s_frame != last && s_frame != last + 1)
+            {
+                xenos::xe_gpu_texture_fetch_t t0;
+                memcpy(&t0, &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], sizeof(t0));
+                fprintf(stderr, "[frontend] edge bars: matching from frame %llu: %s x %.3f..%.3f y %.3f..%.3f colour %08X blend %08X t0 %08X %ux%u, %u rect(s)\n",
+                    (unsigned long long)s_frame, vignette ? "vignette" : backdrop ? "backdrop" : blackout ? "black frame"
+                        : kind == uint32_t(gpu::bars::Fill::RightBar) ? "right bar" : "left bar",
+                    box.x0, box.x1, box.y0, box.y1, barPlan.argb, s_regs[XE_GPU_REG_RB_BLENDCONTROL0] & 0x1FFF1FFF,
+                    (uint32_t(t0.base_address) << 12) & 0x1FFFFFFFu, uint32_t(t0.size_2d.width) + 1, uint32_t(t0.size_2d.height) + 1,
+                    barPlan.rectCount);
+            }
+            last = s_frame;
+        };
         gpu::bars::Plan barPlan;
         if (const float s = game::AspectScaleX(), sv = game::AspectScaleY(); s < 1.0f || sv < 1.0f)
         {
@@ -10394,115 +10517,27 @@ void main()
                     // past a 2.50:1 screen beside them. The intro's cut
                     // between two shots (~95 s) is a few frames of one black
                     // quad 0.970 x 0.939 of the 16:9 frame: the world shows
-                    // all round it. Such a quad (gpu::bars::PlanFill: one
-                    // black rectangle of the front-end shader the rules
-                    // above left alone; a bar a little past both band edges
-                    // in y, from inside the band to well past one side; a
-                    // black frame centred, short of the band's edges) is
-                    // drawn again after itself, stretched over the frame and
-                    // scissored to (its half of) what lies outside the band:
-                    // nothing inside the band changes. So is a menu's
-                    // translucent backdrop or vignette of the black frame's
-                    // shape (gpu::bars::PlanOverlay: any colour, alpha and
-                    // texture, alpha-blended; GitHub issue #19, the world
-                    // undimmed above and below the blacklist's and the
-                    // showcase car's screens on 16:10).
-                    // NFSMW_BAR_FILL=0 turns it off (an A/B switch).
-                    static const bool barFill = [] { const char* v = std::getenv("NFSMW_BAR_FILL"); return !(v && v[0] == '0'); }();
+                    // all round it (and the Blacklist bio's panel, 0.976 x
+                    // 0.985, for as long as it is up). Such a quad
+                    // (gpu::bars::PlanFill: one black rectangle of the
+                    // front-end shader the rules above left alone; a bar a
+                    // little past both band edges in y, from inside the band
+                    // to well past one side; a black frame centred, short of
+                    // the band's edges) is drawn again after itself,
+                    // stretched over the frame and scissored to (its half of)
+                    // what lies outside the band (a bar: nothing inside the
+                    // band changes) or to everything outside itself (a black
+                    // frame). The Showcase's vignette
+                    // (gpu::bars::PlanVignette) is drawn stretched to the
+                    // screen's edges instead (its own posScale).
+                    // NFSMW_BAR_FILL=0 turns it off (an A/B switch: barFill).
                     const uint32_t blend0 = s_regs[XE_GPU_REG_RB_BLENDCONTROL0] & 0x1FFF1FFF;
                     if (barFill)
                     {
-                        xenos::xe_gpu_texture_fetch_t t0;
-                        memcpy(&t0, &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], sizeof(t0));
-                        const gpu::bars::Draw draw{ .prim = prim,
-                            .count = count,
-                            .c = c,
-                            .frontEndY = feY,
-                            .scaleX = s,
-                            .scaleY = sv,
-                            .frontEndShader = feShader,
-                            .leftAlone = kX == 1.0f && kY == 1.0f && kCover == 1.0f && !clipped,
-                            .occlusion = zpdCount,
-                            .vte = vte.value,
-                            .blend0 = blend0,
-                            .t0Sampled = (s_ps->info.texture2DMask & 1) != 0,
-                            .t0Width = uint32_t(t0.size_2d.width) + 1,
-                            .t0Height = uint32_t(t0.size_2d.height) + 1,
-                            .posScale = { pc.posScale[0], pc.posScale[1], pc.posScale[2], pc.posScale[3] },
-                            .hostW = w * float(scaleX),
-                            .hostH = h * float(scaleY),
-                            .scissor = { scissor.offset.x, scissor.offset.y, scissor.offset.x + int32_t(scissor.extent.width),
-                                scissor.offset.y + int32_t(scissor.extent.height) } };
-                        const uint32_t base = vf[0] & 0x1FFFFFFC, endian = vf[1] & 3;
-                        const uint32_t words = (vf[1] >> 2) & 0xFFFFFF, first = s_regs[XE_GPU_REG_VGT_INDX_OFFSET];
-                        auto read = [&](uint32_t k, uint32_t j, uint32_t& word) {
-                            const uint32_t v = src.Get(k) + first;  // an ePoly: 8 words
-                            if ((v + 1) * 8 > words)
-                                return false;
-                            word = GpuSwap(LoadPhysical(base + (v * 8 + j) * 4), endian);
-                            return true;
-                        };
-                        barPlan = gpu::bars::PlanFill(draw, read);
-                        // The results screen's backdrop (and any opaque
-                        // picture of that shape: the title's key art): what
-                        // lies past the band and outside the picture is
-                        // cleared to black after it, where the world drawn
-                        // behind it showed (gpu/edge_bars.h).
-                        if (barPlan.fill == gpu::bars::Fill::None)
-                            barPlan = gpu::bars::PlanBackdrop(draw, read);
-                        // A menu's inset overlay (any colour, so last: an
-                        // opaque black one is a black frame above).
-                        if (barPlan.fill == gpu::bars::Fill::None)
-                            barPlan = gpu::bars::PlanOverlay(draw, read);
-                    }
-                    if (barPlan.fill != gpu::bars::Fill::None)
-                    {
-                        // Once per kind, screen shape and outcome, in every
-                        // log (a tester's too); a match each frame skips
-                        // building the line once its key is logged.
-                        const uint32_t kind = uint32_t(barPlan.fill);
-                        const bool blackout = barPlan.fill == gpu::bars::Fill::Blackout;
-                        const bool backdrop = barPlan.fill == gpu::bars::Fill::Backdrop;
-                        const bool overlay = barPlan.fill == gpu::bars::Fill::Overlay;
-                        const gpu::bars::Box& box = barPlan.box;
-                        const uint64_t key = (0x36ull << 56) | (uint64_t(kind) << 40) | (uint64_t(barPlan.rectCount) << 36) |
-                            (uint64_t(std::lround(s * 4096.0f)) << 18) | uint64_t(std::lround(sv * 4096.0f));
-                        static uint64_t loggedKey[6] = { ~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull };
-                        if (loggedKey[kind] != key)
-                        {
-                            loggedKey[kind] = key;
-                            char fills[96];
-                            if (barPlan.rectCount)
-                                snprintf(fills, sizeof(fills), "fills %u rectangle(s) past the 16:9 band, first [%d,%d)x[%d,%d) (host px)",
-                                    barPlan.rectCount, barPlan.rects[0].x0, barPlan.rects[0].x1, barPlan.rects[0].y0, barPlan.rects[0].y1);
-                            else
-                                snprintf(fills, sizeof(fills), "%s", blackout || backdrop || overlay ? "fills nothing" : "reaches the screen edge: nothing to fill");
-                            LogOnce(key,
-                                "edge bars: frame %llu vs_%016llx ps_%016llx: %s (clip x %.3f..%.3f y %.3f..%.3f, colour %08X; view scale x %.4f y %.4f) %s",
-                                (unsigned long long)s_frame, (unsigned long long)s_vs->hash, (unsigned long long)s_ps->hash,
-                                backdrop ? "a full-band backdrop (black past the band)" : blackout ? "a black frame"
-                                    : overlay ? "an inset overlay (a menu's backdrop or vignette)"
-                                    : kind == uint32_t(gpu::bars::Fill::RightBar) ? "the right vid-cam bar" : "the left vid-cam bar",
-                                box.x0, box.x1, box.y0, box.y1, barPlan.argb, s, sv, fills);
-                        }
-                        // NFSMW_LOG_FRONTEND=1: the first frame of each
-                        // run of frames with a match, bars, black frames,
-                        // backdrops and overlays apart (one run per vid-cam
-                        // scene, per cut and per menu screen; any other is a
-                        // draw this should not take).
-                        static uint64_t lastBarFrame[4] = { ~0ull - 1, ~0ull - 1, ~0ull - 1, ~0ull - 1 };
-                        uint64_t& last = lastBarFrame[overlay ? 3 : backdrop ? 2 : blackout ? 1 : 0];
-                        if (logFrontEnd && s_frame != last && s_frame != last + 1)
-                        {
-                            xenos::xe_gpu_texture_fetch_t t0;
-                            memcpy(&t0, &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], sizeof(t0));
-                            fprintf(stderr, "[frontend] edge bars: matching from frame %llu: %s x %.3f..%.3f y %.3f..%.3f colour %08X blend %08X t0 %08X %ux%u, %u rect(s)\n",
-                                (unsigned long long)s_frame, backdrop ? "backdrop" : blackout ? "black frame" : overlay ? "inset overlay"
-                                    : kind == uint32_t(gpu::bars::Fill::RightBar) ? "right bar" : "left bar",
-                                box.x0, box.x1, box.y0, box.y1, barPlan.argb, blend0, (uint32_t(t0.base_address) << 12) & 0x1FFFFFFFu,
-                                uint32_t(t0.size_2d.width) + 1, uint32_t(t0.size_2d.height) + 1, barPlan.rectCount);
-                        }
-                        last = s_frame;
+                        barPlan = planEdgeFills(c, feY, s, sv, feShader, kX == 1.0f && kY == 1.0f && kCover == 1.0f && !clipped);
+                        logEdgeFill(barPlan, s, sv);
+                        if (barPlan.fill == gpu::bars::Fill::Vignette)
+                            memcpy(pc.posScale, barPlan.posScale, sizeof(pc.posScale));
                     }
                     // The edge candidates (above) that still stop short of
                     // the screen's edge after the rules, each distinct line
@@ -10553,10 +10588,10 @@ void main()
                         uint32_t& perT0Edge = perKey[(uint64_t(t0) << 32) | (kind << 3) | edgeCode];
                         if (perT0Edge >= 4)
                             continue;
-                        const std::string action = barPlan.rectCount
+                        const std::string action = barPlan.fill == gpu::bars::Fill::Vignette ? std::string("vignette stretched to the screen's edges")
+                            : barPlan.rectCount
                             ? std::string(barPlan.fill == gpu::bars::Fill::Backdrop ? "backdrop fill"
-                                    : barPlan.fill == gpu::bars::Fill::Blackout ? "black frame fill"
-                                    : barPlan.fill == gpu::bars::Fill::Overlay ? "overlay fill" : "bar fill")
+                                    : barPlan.fill == gpu::bars::Fill::Blackout ? "black frame fill" : "bar fill")
                             : clipped ? std::format("clipped to rows {}..{}", scissor.offset.y, scissor.offset.y + int32_t(scissor.extent.height))
                             : kCover != 1.0f ? std::format("cover x{:.3f}", kCover)
                             : (kX != 1.0f || kY != 1.0f) ? std::format("widened x{:.3f} y{:.3f}", kX, kY)
@@ -10642,6 +10677,42 @@ void main()
                 }
             }
         }
+        else if (barFill)
+        {
+            // 16:9 (or a 16:9 picture letterboxed on another shape): none of
+            // the rules above has anything to do, and no bar needs a fill,
+            // but a black frame leaves a thin border of what is behind it all
+            // round it: filled with its copies (gpu::bars::BlackoutRects); a
+            // full-band backdrop (the results screen) leaves the race showing
+            // in the band's overscan rows above and below it: those are
+            // cleared to black (gpu::bars::OverscanRows); and the Showcase's
+            // vignette leaves a thin border of the garage undimmed all round
+            // it: it is stretched to the screen's edges
+            // (gpu::bars::PlanVignette).
+            // A front-end draw as above (the front-end matrix in c0..c3,
+            // ePolys at fetch constant 95, read by the vertex shader); nothing
+            // is measured, and only one quad gets as far as reading its
+            // vertices: over a small t0 its first colour only (a black frame
+            // needs black, gpu::bars::Candidate), over a large t0
+            // (gpu::bars::BackdropCandidate, VignetteCandidate) all four.
+            if (const float feX = game::FrontEndScaleX(); feX > 0.0f)
+            {
+                float c[16];
+                memcpy(c, &s_regs[XE_GPU_REG_SHADER_CONSTANT_000_X], sizeof(c));
+                const uint32_t* vf = &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 95 * 2];
+                if (std::fabs(c[0] - feX) <= feX * 1e-5f && c[1] == 0.0f && c[2] == 0.0f &&
+                    c[12] == 0.0f && c[13] == 0.0f && c[14] == 0.0f && c[15] == 1.0f && ((vf[0] & 3) == 3))
+                {
+                    const auto& vi = s_vs->info;
+                    const bool feShader = ((vi.vertexFetchConstants[95 / 32] >> (95 % 32)) & 1) &&
+                        (vi.constRelative || (vi.constUsed[0] & 0xFull) == 0xFull);
+                    barPlan = planEdgeFills(c, game::FrontEndScaleY(), s, sv, feShader, true);
+                    logEdgeFill(barPlan, s, sv);
+                    if (barPlan.fill == gpu::bars::Fill::Vignette)
+                        memcpy(pc.posScale, barPlan.posScale, sizeof(pc.posScale));
+                }
+            }
+        }
         // NFSMW_LOG_DRAWS=<seconds>: every draw of one frame (target, viewport,
         // scissor, textures, shaders), consecutive duplicates folded.
         if (s_logDrawsNow)
@@ -10653,8 +10724,9 @@ void main()
                     line += std::format(" {}:{:08X}", n, (s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + n * 6 + 1] & 0x1FFFF000u));
             if (barPlan.rectCount)
                 line += std::format(" +edge {} fill x{}", barPlan.fill == gpu::bars::Fill::Backdrop ? "backdrop"
-                    : barPlan.fill == gpu::bars::Fill::Blackout ? "black frame" : barPlan.fill == gpu::bars::Fill::Overlay ? "overlay" : "bar",
-                    barPlan.rectCount);
+                    : barPlan.fill == gpu::bars::Fill::Blackout ? "black frame" : "bar", barPlan.rectCount);
+            else if (barPlan.fill == gpu::bars::Fill::Vignette)
+                line += " +vignette stretched";
             static std::string last;
             static uint32_t repeats = 0;
             if (line == last)
@@ -11015,7 +11087,7 @@ void main()
                     ca[attachments].clearValue.color = { { 0.0f, 0.0f, 0.0f, 1.0f } };
                     attachments++;
                 }
-            VkClearRect cr[6]{};
+            VkClearRect cr[std::extent_v<decltype(gpu::bars::Plan::rects)>]{};
             for (uint32_t i = 0; i < barPlan.rectCount; i++)
             {
                 const gpu::bars::Rect& r = barPlan.rects[i];

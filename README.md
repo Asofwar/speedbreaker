@@ -71,12 +71,12 @@ and a settings menu you can open mid-race.
   on the console.
 - **The original look:** sunlit roads and shadows as on the console, the picture a real Xbox 360
   sends to a TV (the game's own display gamma), correct colours on Apple devices, proper car paint
-  and mirror reflections, and distant textures that don't shimmer. Anti-aliasing, sharpening, a
-  Brightness setting and up to 16x anisotropic filtering are also available.
+  and mirror reflections, and distant textures that don't shimmer. Anti-aliasing, sharpening,
+  FSR 1 upscaling, a Brightness setting and up to 16x anisotropic filtering are also available.
 - **A guided installer.** It finds your disc image, checks that it is the right game, and
   verifies all 49 files as it copies them. An interrupted install never leaves a broken game.
 - **Your controller, or the keyboard.** Controllers work as an Xbox 360 pad, with hot-plugging
-  and rumble support.
+  and rumble support. Every keyboard control can be reassigned in the settings.
 - **A settings menu that pauses the game.** Open it with F1, Back + Start, or a three-finger
   tap. Every change applies at once, and *Quit Game* leaves the game from a controller too.
 - **Suspend and resume on iPhone and iPad.** Switch away and the game freezes; come back and it
@@ -180,8 +180,9 @@ should say OK. What changed in each release is in [CHANGELOG.md](CHANGELOG.md).
    mkdir -p ~/Games && tar -xf ~/Downloads/SpeedBreaker-steamos-x86_64.tar.xz -C ~/Games
    ```
 
-   Keep it on internal storage or on an SD card formatted by SteamOS. To update later, unpack
-   the new download over the same folder ([How to update](#how-to-update)).
+   Keep it on internal storage or on an SD card formatted by SteamOS, and don't use `:`, `;` or
+   `$` in the folder names. To update later, unpack the new download over the same folder
+   ([How to update](#how-to-update)).
 
 2. **Add it to Steam.** Steam > Games > *Add a Non-Steam Game to My Library* > Browse. Set the
    file type to *All Files* and pick `~/Games/SpeedBreaker/speedbreaker.sh`, the launcher (the
@@ -236,8 +237,9 @@ The Steam Frame has its own download. You set it up on the Frame's desktop: open
    mkdir -p ~/Games && tar -xf ~/Downloads/SpeedBreaker-steamos-arm64.tar.xz -C ~/Games
    ```
 
-   This makes `~/Games/SpeedBreaker`. Keep it on the Frame's internal storage. To update later,
-   unpack the new download over the same folder ([How to update](#how-to-update)).
+   This makes `~/Games/SpeedBreaker`. Keep it on the Frame's internal storage, and don't use `:`,
+   `;` or `$` in the folder names. To update later, unpack the new download over the same folder
+   ([How to update](#how-to-update)).
 
 2. **Add it to Steam.** In the file manager, open `~/Games/SpeedBreaker`, right-click
    `speedbreaker.sh` and choose *Add to Steam*. Or, in Konsole:
@@ -299,8 +301,9 @@ its name>`, e.g. `NFSMW_GPU=intel %command%` in Steam's launch options.
 
 **Settings:** **F1** or **Cmd+,**, or Back + Start on a controller. The game starts in a window;
 Display > Fullscreen switches to full screen and decides how the game starts from then on. The
-window's green button (or Ctrl+Cmd+F) switches only until you quit. While you play, the mouse
-pointer hides after two seconds without moving. SpeedBreaker needs macOS 15 (Sequoia) or later.
+window's green button (or Ctrl+Cmd+F) switches only until you quit. In a window, the picture
+runs up under a transparent title bar, and the window's buttons show while you move the mouse
+over it. While you play, the mouse pointer hides after two seconds without moving. SpeedBreaker needs macOS 15 (Sequoia) or later.
 
 ### iPhone and iPad
 
@@ -344,7 +347,7 @@ is B, Square is X and Triangle is Y.
 
 | Xbox 360 control | Controller | Keyboard |
 |---|---|---|
-| Left stick | Left stick | A / D steer (the arrow keys also move it) |
+| Left stick | Left stick | A / D or Left / Right steer; Up / Down push it up and down |
 | Right trigger | Right trigger | W |
 | Left trigger | Left trigger | S |
 | A / B / X / Y | Bottom / right / left / top face button | Space / Backspace / Left Shift / Left Ctrl |
@@ -353,7 +356,7 @@ is B, Square is X and Triangle is Y.
 | Start | Start / Menu / Options | Enter |
 | Back | Back / View / Create | Esc |
 | Right stick | Right stick | O / L up and down, K / ; left and right |
-| Stick clicks | Press a stick in | C (right) |
+| Stick clicks | Press a stick in | Z (left), C (right) |
 
 - One player, one controller: the first one connected is used, and you can plug one in at any
   time. The keyboard always works as well.
@@ -361,7 +364,11 @@ is B, Square is X and Triangle is Y.
   you let go, a hold after a quarter of a second.
 - The game shifts gears with the right stick, so from the keyboard you shift with O and L.
   Holding both keys of a pair centres the stick.
-- There is no button remapping and no mouse control in game.
+- Every keyboard control can be reassigned: **Settings > Controls** (F1). Each control has two
+  keys: choose a row, Left or Right for its first or second key, press A or Enter, then the key
+  you want (Esc or B cancels). Y or Backspace clears a key, X or Delete puts the row's defaults
+  back, and *Reset page* restores this whole table. A key may drive several controls, as the
+  arrows do. There is no mouse control in game.
 
 **To open the settings:**
 
@@ -406,17 +413,21 @@ then Yes, puts it back.
 | Option | Choices | Default |
 |---|---|---|
 | Anti-Aliasing | On / Off | On |
-| Upscaling | Bicubic / Bilinear / FSR 1 | Bicubic. FSR 1 is AMD FidelityFX Super Resolution 1 (edge-adaptive upscaling, then RCAS sharpening), for an Internal Resolution below 1x. |
-| Sharpening | 0.00 to 1.00 | 0.30 (0 turns it off). With FSR 1 it sets RCAS's strength: 1.00 the most. |
+| Upscaling | Bicubic / Bilinear / FSR 1 | Bicubic. FSR 1 (AMD FidelityFX Super Resolution 1) keeps curves, wires and diagonals smooth when the picture is enlarged a lot, such as 1x on a 1440p or 4K screen; it is used only when the picture is enlarged, costs a little more GPU time, and makes foliage look slightly painted. Not on iPhone and iPad. |
+| Sharpening | 0.00 to 1.00 | 0.30 (0 turns it off). With FSR 1, the share of its sharpening pass's full strength. |
 | Anisotropic Filtering | Auto / Off / 2x / 4x / 8x / 16x / Original | Auto: 16x on dedicated graphics cards and M-series iPads, 4x elsewhere. Original uses each texture's own setting, as on the 360. |
 | Mipmaps | On / Off | On, so distant textures don't shimmer |
-| Internal Resolution | Auto / 0.5x (360p) / 0.625x (450p) / 0.75x (540p) / 1x (720p) / 1.5x (1080p) / 2x (1440p) / 3x (2160p) | Auto: enough to cover your screen, within what the device can afford (whole scales only: 1x, 2x, 3x, or 3x2 on an ultrawide). On iPhone and iPad, Auto always picks 1x. 0.75x and below render fewer pixels than the 360's 720p, to save power on a handheld: a softer picture, meant for Upscaling FSR 1. |
+| Internal Resolution | Auto / 1x (720p) / 1.5x (1080p) / 2x (1440p) / 3x (2160p) | Auto: enough to cover your screen, within what the device can afford (whole scales only: 1x, 2x, 3x, or 3x2 on an ultrawide). On iPhone and iPad, Auto always picks 1x. |
 
 **Audio:** Master Volume (100%), Mute (Off), and Mute in Background (Off), which silences the
 game while its window isn't in front.
 
 **Input:** Stick Deadzone (8%; raise it if the car steers by itself), Trigger Deadzone (2%), and
 Vibration (On).
+
+**Controls:** the keyboard keys for each Xbox 360 control, two per control, as in the table under
+[Controls](#controls). The keys are saved by name in `settings.toml`'s `[keys]` table (`w`,
+`left_shift`, `keypad_1`, or `none`; `runtime/user/key_names.h` lists them).
 
 **Advanced:** Asynchronous Shaders (On: an object is skipped for a frame or two while its shader
 compiles, instead of the game stuttering), Performance Overlay (Off: fps, frame times, and CPU
@@ -548,7 +559,7 @@ SpeedBreaker folder instead: `data/`, `data/game` and `cache/`.
 2. A notice says where the zip file went: your **Desktop** (on SteamOS, pick it up in Desktop
    Mode, or in the Desktop app on a Steam Frame), the **SpeedBreaker** folder in the Files app on
    iPhone and iPad, or the data folder above when there is no Desktop. Its name says which
-   version you were running, for example `speedbreaker-bug-report-v0.1.4-<date>_<time>.zip`.
+   version you were running, for example `speedbreaker-bug-report-v0.1.6-<date>_<time>.zip`.
 3. Open an [issue][issues], attach the zip, and say what you were doing, what you expected, what
    happened, and roughly how long into the session it happened.
 
@@ -642,9 +653,8 @@ The supported executable is 3,936,256 bytes, with SHA-256
   ```
 
 - **Other Linux distributions:** your distribution's equivalents of the package list above
-  (Clang 18 or newer: CMake stops with a message for another compiler, such as the GCC that is
-  the default `c++` on Fedora and Ubuntu). Untested so far. The GPU needs Vulkan 1.2 and BC
-  (DXT) texture support.
+  (Clang 18 or newer). Untested so far. The GPU needs Vulkan 1.2 and BC (DXT) texture support.
+- `gh`, logged in, is optional: it fetches Xenia's instruction tests.
 
 #### 2. Toolchain, your game files, recompilation
 
@@ -659,31 +669,10 @@ tools/extract-xiso/build/extract-xiso -d game/files -x /path/to/your-backup.iso
 shasum -a 256 game/files/default.xex
 # must print aebdf3c14d1e4e4ed2c130d94bc1a0e97bd6d5bf39bdfdef33c3909c9cc4ba4c
 
-# Translate the game's code into C++ (writes ppc/, and ppc/.inputs: what it was made from).
-scripts/recompile.sh
-```
-
-`setup_tools.sh` pins every tool (XenonRecomp's base commit and patches, extract-xiso's commit,
-FFmpeg's version and SHA-256, Xenia's instruction tests by commit and SHA-256) and records what
-each was built from in `tools/.stamps/`: run it again after a pull, and it remakes only what
-changed (a new or changed patch remakes XenonRecomp's `nfsmw` branch). `SKIP_XENIA=1` leaves out
-Xenia's instruction tests, which only `tests/run_instr_tests.sh` needs.
-
-`recompile.sh` checks the executable's SHA-256 and that XenonRecomp is built from the current
-patches, writes only the files that changed (so the next build recompiles only those), removes
-files an earlier run made that this one doesn't, and records the inputs in `ppc/.inputs`. CMake
-compares that record with the checkout whenever it configures (and `ninja` configures again when
-`config/` or the patches change), and stops if `ppc/` is out of date: after a pull that changes
-them, run `setup_tools.sh` and `recompile.sh` again (`-DSB_ALLOW_STALE_PPC=ON` builds the old
-`ppc/` anyway, with a warning). By hand, the same translation is
-
-```sh
+# Translate the game's code into C++ (writes ppc/).
 mkdir -p ppc
 tools/XenonRecomp/build/XenonRecomp/XenonRecomp config/nfsmw.toml tools/XenonRecomp/XenonUtils/ppc_context.h
 ```
-
-but it leaves no `ppc/.inputs` (CMake then warns that it can't tell whether `ppc/` is current),
-and keeps any old file the run no longer makes.
 
 #### 3. Build
 
@@ -708,11 +697,6 @@ ninja -C build/main SpeedBreaker
 
 Run `build/main/runtime/SpeedBreaker` from the repository root. With the whole disc extracted in
 `game/files`, it plays from there. Otherwise the first-run installer asks for your disc image.
-
-Optional, on Linux and SteamOS: profile-guided optimisation (`-DSB_PGO_PROFILE=<profile>`, a
-profile that `scripts/pgo_train.sh` trains with a recorded race) and ThinLTO (`-DSB_LTO=ON`,
-linked with `lld`) make the game's own code faster. Neither is on by default; the steps and
-what they gain are in [docs/timedemo.md](docs/timedemo.md#5-faster-builds).
 
 #### 4. Package it (optional)
 
@@ -750,26 +734,12 @@ what they gain are in [docs/timedemo.md](docs/timedemo.md#5-faster-builds).
 #### Tests
 
 The unit tests build with `-DSB_TESTS=ON` added to the `cmake` line, and
-`ctest --test-dir build/main` runs them. None of them needs game files; `write_watch_test` needs
-`ppc/` and `tools/XenonRecomp` (it is left out without them). The others build in a fresh clone
-with only Clang, CMake and Ninja, without `ppc/`, `tools/`, SDL3 or Vulkan, as CI builds them:
-
-```sh
-cmake -S . -B build/tests -G Ninja -DSB_TESTS_ONLY=ON -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
-ninja -C build/tests && ctest --test-dir build/tests -LE timing
-```
-
-`-LE timing` leaves out the tests labelled `timing` (`vblank_timer_test`), which measure this
-machine's scheduling against fixed thresholds: meaningful on a quiet machine, not on a shared CI
-runner.
-
-`tests/run_instr_tests.sh` checks the instructions SpeedBreaker's patches add to XenonRecomp,
-with Xenia's instruction tests (fetched by `setup_tools.sh`; `SKIP_XENIA=1` runs only our own)
-and ours (`tests/instr`, from `tests/gen_instr_tests.py`). It exits non-zero when a test doesn't
-assemble, the test program doesn't build, or a check fails. It needs LLVM's `llvm-mc` and
-`llvm-objdump` and `ld.lld`: on a Mac, Homebrew's `llvm` and `lld`; elsewhere, your
-distribution's (on Arch, the `llvm` and `lld` packages; the container above has only `lld`).
-`LLVM=<bin dir>` and `LLD=<ld.lld>` pick others.
+`ctest --test-dir build/main` runs them. `tests/run_instr_tests.sh` checks the instructions
+SpeedBreaker's patches add to XenonRecomp. It needs LLVM's `llvm-mc` and `llvm-objdump` and
+`ld.lld`: on a Mac, Homebrew's `llvm` and `lld`; elsewhere, your distribution's (on Arch, the
+`llvm` and `lld` packages; the container above has only `lld`). `LLVM=<bin dir>` and
+`LLD=<ld.lld>` pick others. So far it has been run on a Mac only. None of the tests needs game
+files; `write_watch_test` needs `ppc/`.
 
 ## Credits
 
@@ -788,6 +758,7 @@ research.
 | [SDL3](https://www.libsdl.org/) | Windows, input, audio, app lifecycle | zlib |
 | [Dear ImGui](https://github.com/ocornut/imgui) (Omar Cornut) | The installer and settings UI | MIT |
 | [Roboto](https://fonts.google.com/specimen/Roboto) (Google) | The UI font | Apache-2.0 |
+| [FidelityFX Super Resolution 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR) (AMD) | The FSR 1 Upscaling choice | MIT |
 | [o1heap](https://github.com/pavel-kirienko/o1heap) (Pavel Kirienko) | The guest heap allocator | MIT |
 | [glslang](https://github.com/KhronosGroup/glslang) and [SPIRV-Tools](https://github.com/KhronosGroup/SPIRV-Tools) (Khronos) | Shader compilation at runtime | BSD-3-Clause and others; Apache-2.0 |
 | [MoltenVK](https://github.com/KhronosGroup/MoltenVK) and the [Vulkan Loader](https://github.com/KhronosGroup/Vulkan-Loader) (Khronos) | Vulkan on Mac, iPhone and iPad | Apache-2.0 |

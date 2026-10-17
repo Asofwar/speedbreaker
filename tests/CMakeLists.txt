@@ -43,9 +43,14 @@ sb_test(depth_only_test ARGS ${RT}/gpu/renderer.cpp)
 # renderer.cpp is read to check its scaled-memory shaders use it.
 sb_test(render_scale_test ARGS ${RT}/gpu/renderer.cpp)
 # The police vid-cam's side bars, the intro's black frames, the results
-# backdrop and menus' inset overlays, and the fill past the 16:9 band
-# (gpu/edge_bars.h, header only).
+# screen's backdrop and what fills the screen round them (gpu/edge_bars.h,
+# header only).
 sb_test(edge_bars_test)
+# GitHub #19's menu borders (gpu/edge_bars.h, header only): the Showcase's
+# vignette stretched to the screen's edges, the Blacklist bio's black panel
+# filled all round, at every screen shape; renderer.cpp is read to check it
+# asks for and applies the plans on both paths.
+sb_test(menu_borders_test ARGS ${RT}/gpu/renderer.cpp)
 # Which of Xenos's two polygon offsets (front and back faces) a draw gets, and
 # when its depth bias is set in unorm24's steps (gpu/poly_offset.h, header
 # only); renderer.cpp is read to check Draw uses them.
@@ -116,8 +121,33 @@ sb_test(gpu_choice_test)
 # video::FitPicture's pictures.
 sb_test(glare_fit_test SOURCES ${RT}/video/picture_fit.cpp)
 # The post-processing's split at the 16:9 band's edge (video/band_filter.h,
-# video::BandOf) against the edge-bar fills and a model of the filters.
+# video::BandOf) against the edge-bar fills and a model of the filters
+# (FSR 1's EASU taps and RCAS neighbours too).
 sb_test(band_filter_test SOURCES ${RT}/video/picture_fit.cpp)
+# Settings > Graphics > Upscaling's FSR 1: which pass draws a frame
+# (video/upscale.h, header only, on video::FitPicture's pictures), Sharpening
+# as RCAS's strength, the constants against AMD's formulas, and the shaders'
+# GLSL (video/fsr1.cpp, with runtime/generated/fsr1_headers.inc): AMD's
+# headers compiled in unchanged, the band rules in their code, the
+# presenter's use of them. It writes the GLSL to fsr1_glsl for the check
+# after it.
+sb_test(fsr1_test SOURCES ${RT}/video/fsr1.cpp ${RT}/video/picture_fit.cpp
+    ARGS ${RT}/thirdparty/fsr1 ${RT}/video ${CMAKE_CURRENT_BINARY_DIR}/fsr1_glsl)
+target_include_directories(fsr1_test PRIVATE ${CMAKE_BINARY_DIR}/runtime/generated)
+# Those shaders compiled to SPIR-V for Vulkan, as the game's glslang does
+# (only where glslangValidator is installed).
+find_program(SB_GLSLANG_VALIDATOR glslangValidator)
+if(SB_GLSLANG_VALIDATOR)
+    foreach(shader easu.comp rcas.frag rcas_tone.frag)
+        add_test(NAME fsr1_glsl_check_${shader} COMMAND ${SB_GLSLANG_VALIDATOR} -V --target-env vulkan1.1
+            ${CMAKE_CURRENT_BINARY_DIR}/fsr1_glsl/${shader} -o ${CMAKE_CURRENT_BINARY_DIR}/fsr1_glsl/${shader}.spv)
+        set_tests_properties(fsr1_glsl_check_${shader} PROPERTIES DEPENDS fsr1_test)
+    endforeach()
+endif()
+# Upscaling's values in settings.toml (user/settings.cpp as the game links
+# it): "fsr1" read, saved and read back, the environment's override, an
+# unknown value; in a scratch folder.
+sb_test(settings_scaling_test SOURCES ${RT}/user/settings.cpp ARGS ${CMAKE_CURRENT_BINARY_DIR}/settings_scaling_scratch)
 # Internal Resolution Auto's budget on iPhones and iPads, chip by chip
 # (video/scale_budget.cpp), and the scale it makes on the phones' screens.
 sb_test(scale_budget_test SOURCES ${RT}/video/scale_budget.cpp ${RT}/video/picture_fit.cpp)
@@ -136,10 +166,16 @@ sb_test(vblank_timer_test SOURCES ${RT}/video/vblank_timer.cpp LABELS timing)
 # When the Mac shows a new frame at a set time after its vblank, and the
 # watchdog that turns it off (video/present_schedule.h, header only).
 sb_test(present_schedule_test)
-# The audio render thread's cadence (apu/audio.h's RenderCadence, header
-# only) against a simulated output device: following its clock, and the
-# watchdog for a device that stops taking audio (GitHub issue #20).
+# The audio render callback's cadence against the output device
+# (apu/audio_cadence.h, header only): a device that stops taking audio
+# doesn't stop the game's sound (GitHub issue #20: the sound stopped for good,
+# then the game hung after the race), and a working one is followed as before.
 sb_test(audio_cadence_test)
+# The present waiter uses a swapchain only while it is the current one, and
+# none is destroyed under such a use (video/swapchain_use.h, header only):
+# fake swapchains destroyed and made again under a waiting thread; presenter.cpp
+# is read to check every waiter call that takes a swapchain is inside a use.
+sb_test(swapchain_use_test ARGS ${RT}/video/presenter.cpp)
 sb_test(frame_rate_policy_test SOURCES ${RT}/video/frame_rate_policy.cpp)
 # When the presenter builds its swapchain again and at what size (an iPhone's
 # view turned portrait by SDL, sizes seen while inactive, SUBOPTIMAL), and the
@@ -278,6 +314,25 @@ sb_test(memory_status_test SOURCES ${RT}/kernel/memory_status.cpp ${RT}/platform
 # The version line in the log, and when the "What's new" note shows
 # (user/version_check.h, header only).
 sb_test(version_check_test)
+# The keys a Controls row can hold and their names in settings.toml
+# (user/key_names.h, header only), each row against SDL's scancode name.
+# The only test that links SDL3, so it keeps the build tree's path to it even
+# with -DCMAKE_SKIP_BUILD_RPATH=ON: the Steam Frame's cmake line
+# (scripts/steamos/README.md) keeps ~/deps/sdl3/lib out of the game that
+# way, and ctest runs the tests without LD_LIBRARY_PATH, so this one couldn't
+# load libSDL3 there (v0.1.5). Only this test: the game's own rpath is
+# unchanged (none on the Frame).
+find_package(SDL3 REQUIRED CONFIG)
+sb_test(key_names_test)
+target_link_libraries(key_names_test PRIVATE SDL3::SDL3)
+set_target_properties(key_names_test PROPERTIES SKIP_BUILD_RPATH OFF)
+# The Key options (Settings > Controls): the table, the [keys] names in the
+# file, and what Set accepts (user/settings.cpp and the toml++ XenonRecomp
+# vendors; no SDL).
+sb_test(settings_keys_test SOURCES ${RT}/user/settings.cpp)
+target_include_directories(settings_keys_test SYSTEM PRIVATE ${ROOT}/tools/XenonRecomp/thirdparty/tomlplusplus/include)
+# The keyboard's controls and how held keys become a pad (hid/key_map.h), header only.
+sb_test(key_map_test)
 # Check for Updates' logic: versions, GitHub's JSON, curl's output and the
 # release notes (update/check.cpp, self-contained).
 sb_test(update_check_test SOURCES ${RT}/update/check.cpp)
@@ -293,6 +348,15 @@ endif()
 # is read: the button and prompt gated, the focus on Cancel, B and Escape
 # cancelling, and the quit taking the window close's way out.
 sb_test(quit_game_test ARGS ${RT})
+# A requested termination (SIGTERM: a launcher's stop, a shutdown, kill;
+# SIGINT; SIGHUP) quits as the window's close button does, and only a session that
+# didn't end cleanly leaves its crash marker (platform/quit_signals.h,
+# report/crash_marker.h, header only): signals in child processes, the marker
+# in a scratch folder, SIGTERM vs SIGKILL end to end; main.cpp, presenter.cpp
+# and crash.cpp are read to check the quit paths use them. POSIX only (fork).
+if(NOT WIN32)
+    sb_test(clean_exit_test ARGS ${CMAKE_CURRENT_BINARY_DIR}/clean_exit_scratch ${RT})
+endif()
 # The jump tables XenonRecomp makes switches of (config/switch_tables.toml)
 # against the leaf functions' bounds (config/nfsmw.toml): no label or default
 # outside its function, and the tables a borrowed bounds check broke (the
