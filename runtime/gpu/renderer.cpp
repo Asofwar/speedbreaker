@@ -80,17 +80,23 @@ namespace gpu::renderer
         // by default where passes cost most, the tile GPUs: under MoltenVK
         // (iPad race frame: 46 -> 20 passes; heavy scenes ~4 ms less GPU
         // time) and Turnip on arm64 Linux (Steam Frame: 37 -> 21 passes,
-        // -0.3 ms GPU a busy frame); off elsewhere until measured there.
-        // Lighter passes (NFSMW_UNTILED_AREA, NFSMW_PASS_BARRIER): Apple only.
-        // On the Frame the smaller area cost +0.3 ms (Turnip chooses tiled
-        // or direct rendering by the area) and the barrier changed nothing.
-        // Each variable overrides.
-#if defined(__APPLE__) || (defined(__linux__) && defined(__aarch64__))
+        // -0.3 ms GPU a busy frame); and on x86-64 Linux, measured on the
+        // Steam Deck (below). Lighter passes (NFSMW_UNTILED_AREA,
+        // NFSMW_PASS_BARRIER): Apple and x86-64 Linux. On the Frame the
+        // smaller area cost +0.3 ms (Turnip chooses tiled or direct
+        // rendering by the area) and the barrier changed nothing.
+        // Steam Deck at a 5 W TDP limit, where its GPU (~300 MHz) bounds the
+        // race (alternated runs, 1x): both with NFSMW_RESOLVE_DEFER 33-36 ->
+        // 36-38 fps, GPU busy -1.4 to -2.4 ms a frame (fewer passes and the
+        // deferral alone: about half of it); the pictures as before
+        // (compare_shots.py --strict: 2 of 7 identical, the rest 3 levels
+        // off at most, PSNR 80 dB and up). Each variable overrides.
+#if defined(__APPLE__) || defined(__linux__)
         constexpr bool kFewerPasses = true;
 #else
         constexpr bool kFewerPasses = false;
 #endif
-#ifdef __APPLE__
+#if defined(__APPLE__) || (defined(__linux__) && defined(__x86_64__))
         constexpr bool kLighterPasses = true;
 #else
         constexpr bool kLighterPasses = false;
@@ -6178,7 +6184,9 @@ void main()
                 p.srcBase, p.rect, p.frame, p.seconds }).detach();
         }
 
-        // NFSMW_RESOLVE_DEFER=1 (shadow mode; off by default): a depth resolve
+        // NFSMW_RESOLVE_DEFER=1 (shadow mode; on by default on x86-64 Linux,
+        // where the Steam Deck measured it with the fewer and lighter passes,
+        // see kFewerPasses; NFSMW_RESOLVE_DEFER=0 turns it off): a depth resolve
         // into a cached texture of exactly its surface (Resolve's exact
         // fusion), at 1x, whose target the same resolve then clears whole,
         // stores its texels into that texture only (TEXTURE_ONLY). Its guest
@@ -6199,7 +6207,15 @@ void main()
         // would (a fault: the write watch asks for them and waits) and logs
         // what it found ([defer-check]: words whose stencil byte isn't 0 were
         // never a depth resolve's).
-        const int s_resolveDeferMode = [] { const char* v = std::getenv("NFSMW_RESOLVE_DEFER"); return v ? std::clamp(std::atoi(v), 0, 2) : 0; }();
+#if defined(__linux__) && defined(__x86_64__)
+        constexpr int kResolveDeferDefault = 1;
+#else
+        constexpr int kResolveDeferDefault = 0;
+#endif
+        const int s_resolveDeferMode = [] {
+            const char* v = std::getenv("NFSMW_RESOLVE_DEFER");
+            return v ? std::clamp(std::atoi(v), 0, 2) : kResolveDeferDefault;
+        }();
         const bool s_resolveDefer = s_resolveDeferMode != 0;
         struct DeferCheckRange { uint32_t base, bytes, endian; };
         std::mutex s_deferCheckMutex;
