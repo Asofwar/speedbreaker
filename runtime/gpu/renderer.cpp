@@ -6376,7 +6376,10 @@ void main()
             return v ? std::clamp(std::atoi(v), 0, 2) : kResolveDeferDefault;
         }();
         const bool s_resolveDefer = s_resolveDeferMode != 0;
-        // NFSMW_RESOLVE_DEFER_COLOR=1 (shadow mode; off by default): a colour
+        // NFSMW_RESOLVE_DEFER_COLOR=1 (shadow mode; on by default on x86-64
+        // Linux as NFSMW_RESOLVE_DEFER: a Steam Deck at 5 W, 5 alternated
+        // rounds, +1.7% fps, GPU busy -0.43 ms a frame, the pictures within
+        // compare_shots.py --strict; =0 turns it off): a colour
         // resolve into a cached texture (the exact fusion or a part of one,
         // NFSMW_FUSE_PARTIAL, NFSMW_DIRECT_CUBE), at 1x, of raw 32-bit texels
         // (no conversion), whose rectangle lies in the texture whole, stores
@@ -6396,7 +6399,10 @@ void main()
         // WRITEBACK_CHECK pass compares every word with the one written back
         // from the texture would be, and the write-back runs too (the same
         // words again): [defer-check] colour lines count the words that differ.
-        const int s_resolveDeferColorMode = [] { const char* v = std::getenv("NFSMW_RESOLVE_DEFER_COLOR"); return v ? std::clamp(std::atoi(v), 0, 2) : 0; }();
+        const int s_resolveDeferColorMode = [] {
+            const char* v = std::getenv("NFSMW_RESOLVE_DEFER_COLOR");
+            return v ? std::clamp(std::atoi(v), 0, 2) : kResolveDeferDefault;
+        }();
         const bool s_resolveDeferColor = s_resolveDeferColorMode == 1;
         struct ColourCheck
         {
