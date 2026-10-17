@@ -217,6 +217,10 @@ namespace gpu::renderer
         constexpr uint32_t kSharedPartBinding = 13;
         bool s_splitMemory = false;
         VkDescriptorBufferInfo s_sharedInfo[4]{};  // the binding(s): [0] alone, or the four parts
+        // The translated shaders' multiplication in the form Mesa folds into
+        // fmulz (shader_translator.cpp, SB_FMULZ): NFSMW_FMULZ=0|1, by default
+        // on with RADV. Set before the first shader is compiled.
+        bool s_fmulz = false;
 
         void SetSharedInfo()
         {
@@ -1593,7 +1597,8 @@ namespace gpu::renderer
         std::vector<uint32_t> CompileGlsl(const std::string& source, glslang_stage_t stage, std::string& log,
             const std::string& shaderPreamble = {})
         {
-            const std::string preamble = s_splitMemory ? "#define SPLIT_MEMORY\n" + shaderPreamble : shaderPreamble;
+            const std::string preamble = std::string(s_splitMemory ? "#define SPLIT_MEMORY\n" : "") +
+                (s_fmulz ? "#define SB_FMULZ\n" : "") + shaderPreamble;
             if (!s_shaderCacheEnabled)
                 return CompileGlslUncached(source, stage, log, preamble);
             std::filesystem::path file = ShaderCacheFile(source, stage, preamble);
@@ -8596,6 +8601,10 @@ void main()
             VkPhysicalDeviceProperties props;
             vkGetPhysicalDeviceProperties(s_vk->physical, &props);
             ReadRenderScale(props);
+            const char* fmulz = std::getenv("NFSMW_FMULZ");
+            s_fmulz = fmulz ? fmulz[0] == '1' : DriverId(props) == VK_DRIVER_ID_MESA_RADV;
+            if (s_fmulz)
+                fprintf(stderr, "[renderer] shader multiplications in the fmulz form (NFSMW_FMULZ=0: the select form)\n");
             const char* split = std::getenv("NFSMW_SPLIT_MEMORY");
             s_splitMemory = split ? split[0] == '1' : props.limits.maxStorageBufferRange < kSharedSize;
             if (s_splitMemory)
