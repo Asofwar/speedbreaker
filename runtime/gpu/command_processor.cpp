@@ -1,6 +1,7 @@
 // SpeedBreaker runtime. GPL-3.0-or-later (see COPYING).
 // PM4 packet semantics follow Xenia (gpu/command_processor.cc, BSD license).
 #include <stdafx.h>
+#include <debug/d3d_profile.h>  // study/hle-renderer
 #include "command_processor.h"
 
 #include <kernel/vmem.h>
@@ -19,6 +20,7 @@
 #include "gpu_clock.h"
 #include "zpd_report.h"
 #include "cp_doorbell.h"
+#include "cp_profile.h"  // study/hle-renderer
 #include <kernel/write_watch.h>
 #include <debug/timeline.h>
 #include <debug/bench.h>
@@ -577,6 +579,8 @@ namespace gpu
                 s_counter++;
                 timeline::Mark(timeline::Swap);
                 uint64_t frame = ++s_frames;
+                if (d3dprof::g_on)
+                    cpprof::Dump(frame);  // study/hle-renderer
                 // A timedemo shot's swap (NFSMW_BENCH_SHOTS; 0 otherwise): its
                 // front image is copied before anything else can replace it.
                 if (uint64_t shot = bench::g_shotSwap.load(std::memory_order_relaxed); shot && frame >= shot) [[unlikely]]
@@ -751,7 +755,10 @@ namespace gpu
                 uint32_t length = r.Read() & 0xFFFFF;
                 r.Skip(count - 2);
                 Reader ib{ Physical(ptr), length * 4 + 4, 0, length * 4 };  // +4: never wrap
+                cpprof::g_c.ibs++;
+                cpprof::g_ibDepth++;
                 ExecuteBuffer(ib, ctx);
+                cpprof::g_ibDepth--;
                 return true;
             }
 
@@ -1016,6 +1023,7 @@ namespace gpu
             case PM4_DRAW_INDX_2:
             {
                 s_draws++;
+                cpprof::g_c.draws++;
                 // DRAW_INDX: viz query id, VGT_DRAW_INITIATOR, then VGT_DMA_BASE
                 // and VGT_DMA_SIZE for DMA indices. DRAW_INDX_2 has no viz dword.
                 uint32_t used = 0;
@@ -1066,6 +1074,10 @@ namespace gpu
                     return true;
                 }
                 index += bases[type];
+                if (opcode == PM4_LOAD_ALU_CONSTANT)
+                    cpprof::g_c.loadAluDwords += size;
+                else
+                    cpprof::g_c.setConstDwords[type] += size;
                 if (BulkSafe(index, size))
                 {
                     if (opcode == PM4_LOAD_ALU_CONSTANT)
@@ -1151,6 +1163,42 @@ namespace gpu
                 uint32_t packet = r.Read();
                 if (packet == 0)
                     continue;
+                if (d3dprof::g_on)  // study/hle-renderer
+                {
+                    auto& c = cpprof::g_c;
+                    uint32_t dw = 1;
+                    switch (packet >> 30)
+                    {
+                    case 0:
+                    {
+                        uint32_t n = ((packet >> 16) & 0x3FFF) + 1;
+                        dw += n;
+                        c.t0Packets++;
+                        c.t0Regs += n;
+                        c.t0ByRange[cpprof::RangeOf(packet & 0x7FFF)] += n;
+                        break;
+                    }
+                    case 1: dw += 2; c.t1Packets++; break;
+                    case 2: c.t2Dwords++; break;
+                    case 3:
+                    {
+                        uint32_t op = (packet >> 8) & 0x7F, n = ((packet >> 16) & 0x3FFF) + 1;
+                        dw += n;
+                        c.t3Packets[op]++;
+                        c.t3Dwords[op] += n;
+                        if ((packet & 1) && ((s_binSelect & s_binMask) == 0 || op == PM4_XE_SWAP))
+                        {
+                            c.t3Skipped[op]++;
+                            if (op == PM4_DRAW_INDX || op == PM4_DRAW_INDX_2)
+                                c.drawsSkipped++;
+                        }
+                        break;
+                    }
+                    }
+                    c.dwords += dw;
+                    if (cpprof::g_ibDepth > 0)
+                        c.ibDwords += dw;
+                }
                 if ((packet >> 30) != 2)
                     Record(packet, r);
                 switch (packet >> 30)
@@ -1472,6 +1520,7 @@ namespace gpu
 extern "C" PPC_FUNC(__imp__sub_82596A00);
 PPC_FUNC(sub_82596A00)
 {
+    d3dprof::Scope d3dprofScope(0x82596A00, ctx, base);  // study/hle-renderer
     __imp__sub_82596A00(ctx, base);
     gpu::g_cpDoorbell.Ring();
 }
@@ -1479,6 +1528,7 @@ PPC_FUNC(sub_82596A00)
 extern "C" PPC_FUNC(__imp__sub_82596A20);
 PPC_FUNC(sub_82596A20)
 {
+    d3dprof::Scope d3dprofScope(0x82596A20, ctx, base);  // study/hle-renderer
     __imp__sub_82596A20(ctx, base);
     gpu::g_cpDoorbell.Ring();
 }

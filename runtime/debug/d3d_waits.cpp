@@ -7,6 +7,7 @@
 // waits off to short sleeps, to park them while the game is suspended, and
 // to report, with NFSMW_LOG_D3D_WAIT=1, which counter they poll and how often.
 #include <stdafx.h>
+#include <debug/d3d_profile.h>  // study/hle-renderer
 #include <kernel/function.h>
 #include <cpu/guest_time.h>
 #include <cpu/host_cpu.h>
@@ -47,6 +48,7 @@ namespace
 
 PPC_FUNC(sub_825A5B20)
 {
+    d3dprof::Scope d3dprofScope(0x825A5B20, ctx, base);  // study/hle-renderer
     // While the game is suspended the GPU work these loops wait for is held
     // back (Metal refuses it), and no guest time passes for the hang check:
     // sleep through it instead of spinning a core (Apple has no back-off).

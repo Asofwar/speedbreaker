@@ -45,6 +45,7 @@
 // guard (default 10, at most 12). Each movie leaves a [movie] line: its
 // frames by vblanks shown, and those held.
 #include <stdafx.h>
+#include <debug/d3d_profile.h>  // study/hle-renderer
 #include "timedemo.h"
 
 #include <cpu/guest_time.h>
@@ -115,6 +116,7 @@ PPC_FUNC(sub_826E8CF8)
 
 PPC_FUNC(sub_825985A0)
 {
+    d3dprof::Scope d3dprofScope(0x825985A0, ctx, base);  // study/hle-renderer
     // A timedemo's uncapped replay (game/timedemo.h): every swap goes as
     // soon as the GPU is done with it. With interval 0 the callback's count
     // of vblanks to wait is never above 0, so it compares the beam position

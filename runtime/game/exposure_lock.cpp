@@ -37,6 +37,7 @@
 // and normal play are untouched: the exposure is drawing only, nothing the
 // game's simulation or its Joylog sees.
 #include <stdafx.h>
+#include <debug/d3d_profile.h>  // study/hle-renderer
 #include "timedemo.h"
 
 #include <kernel/function.h>
@@ -61,6 +62,7 @@ namespace
 
 PPC_FUNC(sub_82589398)
 {
+    d3dprof::Scope d3dprofScope(0x82589398, ctx, base);  // study/hle-renderer
     if (uint32_t(ctx.lr) == kExposureLock && timedemo::Replaying())
     {
         static std::atomic<bool> s_said{ false };

@@ -1,5 +1,6 @@
 // SpeedBreaker runtime. GPL-3.0-or-later (see COPYING). See timeline.h.
 #include <stdafx.h>
+#include <debug/d3d_profile.h>  // study/hle-renderer
 #include "timeline.h"
 #include <cpu/guest_time.h>
 #include <kernel/function.h>
@@ -96,6 +97,7 @@ namespace
 extern "C" PPC_FUNC(__imp__sub_82597498);
 PPC_FUNC(sub_82597498)
 {
+    d3dprof::Scope d3dprofScope(0x82597498, ctx, base);  // study/hle-renderer
     timeline::Mark(timeline::GameWaitBegin, ctx.r4.u32);
     timeline::t_waitTargetMarked = false;
     int64_t start = NowNs();
@@ -107,6 +109,7 @@ PPC_FUNC(sub_82597498)
 extern "C" PPC_FUNC(__imp__sub_82593A58);
 PPC_FUNC(sub_82593A58)
 {
+    d3dprof::Scope d3dprofScope(0x82593A58, ctx, base);  // study/hle-renderer
     timeline::Mark(timeline::GamePresentBegin);
     static std::atomic<int64_t> lastPresent{ 0 };
     int64_t start = NowNs();
