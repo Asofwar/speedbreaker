@@ -1298,6 +1298,29 @@ void main()
         return;
     }
     vec2 texel = 1.0 / p.size;
+    if (p.bicubic == 2u)
+    {
+        // The picture's columns are the frame's (as wide, at a whole pixel:
+        // 1280x720 into a Steam Deck's 1280x800): each sample sits on its
+        // column's centre, f.x 0 (or 1 where uv rounds just below a centre),
+        // where Catmull-Rom's horizontal weights are 0, 1, 0, 0 (0, 0, 1, 0):
+        // one column, the one its middle tap reads. The same picture from
+        // that column (3 taps, not 9), the clamp's 4 texels as below and the
+        // bilinear sample on the column: 8 fetches, not 14.
+        vec2 pos = uv * p.size;
+        vec2 c = floor(pos - 0.5) + 0.5, f = pos - c;
+        float w2x = f.x * (0.5 + f.x * (2.0 - 1.5 * f.x)), w12x = 1.0 + f.x * f.x * (-2.5 + 1.5 * f.x) + w2x;
+        float x = (c.x + w2x / w12x) * texel.x;
+        float w0 = f.y * (-0.5 + f.y * (1.0 - 0.5 * f.y)), w3 = f.y * f.y * (-0.5 + 0.5 * f.y);
+        float w2 = f.y * (0.5 + f.y * (2.0 - 1.5 * f.y)), w12 = 1.0 + f.y * f.y * (-2.5 + 1.5 * f.y) + w2;
+        vec3 v = at(vec2(x, (c.y - 1.0) * texel.y)) * w0 + at(vec2(x, (c.y + w2 / w12) * texel.y)) * w12 +
+            at(vec2(x, (c.y + 2.0) * texel.y)) * w3;
+        vec2 corner = c * texel;
+        vec3 a = at(corner), b = at(corner + vec2(texel.x, 0.0)), d = at(corner + vec2(0.0, texel.y)), e = at(corner + texel);
+        vec3 lo = min(min(a, b), min(d, e)), hi = max(max(a, b), max(d, e));
+        color = vec4(clamp(v + p.sharpen * (v - at(vec2(x, uv.y))), lo, hi), 1.0);
+        return;
+    }
     vec3 c = catmullRom(uv, texel);
     // Sharpen against the bilinear sample, then clamp to the 2x2 texels
     // around the sample: detail gets crisper without halos or ringing.
@@ -4062,13 +4085,18 @@ void main()
                 else
                 {
                     bool bicubic = Bicubic() || fsrAsked;
+                    // 2: the picture as wide as the frame (its columns the
+                    // frame's, the viewport at a whole pixel): kScaleFs scales
+                    // down each column only, the same picture from half the
+                    // fetches (a Steam Deck's 1280x720 -> 1280x800).
+                    const uint32_t mode = !bicubic ? 0u : dw == int32_t(w) ? 2u : 1u;
                     struct
                     {
                         float width, height, sharpen;
                         uint32_t bicubic;
                         float band[4];
                         uint32_t bandOn;
-                    } pc = { float(w), float(h), Sharpen(), bicubic ? 1u : 0u, { float(band.x0), float(band.x1), float(band.y0), float(band.y1) },
+                    } pc = { float(w), float(h), Sharpen(), mode, { float(band.x0), float(band.x1), float(band.y0), float(band.y1) },
                         bandOn ? 1u : 0u };
                     if (fsr)
                         pc = { float(dw), float(dh), 0.0f, 0u, {}, 0u };  // EASU's image, 1:1: a plain copy
