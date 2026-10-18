@@ -21,6 +21,7 @@
 #include "zpd_report.h"
 #include "cp_doorbell.h"
 #include "cp_profile.h"  // study/hle-renderer
+#include "hle_resolve.h"  // study/hle-renderer
 #include <kernel/write_watch.h>
 #include <debug/timeline.h>
 #include <debug/bench.h>
@@ -1026,6 +1027,8 @@ namespace gpu
             {
                 s_draws++;
                 cpprof::g_c.draws++;
+                if (hle::Enabled())  // study/hle-renderer: where this packet is (its header)
+                    renderer::g_drawPacket = g_memory.MapVirtual(r.Here()) - 4;
                 // DRAW_INDX: viz query id, VGT_DRAW_INITIATOR, then VGT_DMA_BASE
                 // and VGT_DMA_SIZE for DMA indices. DRAW_INDX_2 has no viz dword.
                 uint32_t used = 0;

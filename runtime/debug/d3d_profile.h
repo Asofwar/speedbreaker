@@ -86,3 +86,21 @@ namespace d3dprof
         d3dprof::MakeSpaceAfter(base);                               \
         d3dprof::Leave(index, ctx, base);                            \
     }
+
+// A wrapper that also calls the HLE side channel's hooks (gpu/hle_resolve.h:
+// `enter` before the function, `leave` after it), counted or not.
+#define D3DPROF_WRAP_HLE(index, name, enter, leave)                  \
+    extern "C" PPC_FUNC(__imp__##name);                              \
+    PPC_FUNC(name)                                                   \
+    {                                                                \
+        enter(ctx, base);                                            \
+        if (!d3dprof::g_on)                                          \
+            __imp__##name(ctx, base);                                \
+        else                                                         \
+        {                                                            \
+            d3dprof::Enter(index, ctx, base);                        \
+            __imp__##name(ctx, base);                                \
+            d3dprof::Leave(index, ctx, base);                        \
+        }                                                            \
+        leave(ctx, base);                                            \
+    }

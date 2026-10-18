@@ -2,6 +2,7 @@
 // for each recompiled function in the D3D library range.
 #include <stdafx.h>
 #include "d3d_profile.h"
+#include <gpu/hle_resolve.h>
 
 namespace d3dprof
 {
@@ -749,7 +750,7 @@ D3DPROF_WRAP(551, sub_82591D80)
 D3DPROF_WRAP(552, sub_82591E58)
 D3DPROF_WRAP(553, sub_825921A8)
 D3DPROF_WRAP(554, sub_82592230)
-D3DPROF_WRAP(555, sub_82592340)
+D3DPROF_WRAP_HLE(555, sub_82592340, hle::ResolveEnter, hle::ResolveLeave)
 D3DPROF_WRAP(556, sub_82593040)
 D3DPROF_WRAP(557, sub_82593058)
 D3DPROF_WRAP(558, sub_82593060)
@@ -912,7 +913,7 @@ D3DPROF_WRAP(719, sub_82598FA8)
 D3DPROF_WRAP(720, sub_82598FC8)
 D3DPROF_WRAP(721, sub_825990F0)
 D3DPROF_WRAP(722, sub_825990F8)
-D3DPROF_WRAP(723, sub_82599488)
+D3DPROF_WRAP_HLE(723, sub_82599488, hle::EndTilingEnter, hle::EndTilingLeave)
 D3DPROF_WRAP(724, sub_825997E0)
 D3DPROF_WRAP(725, sub_82599890)
 D3DPROF_WRAP(726, sub_82599928)

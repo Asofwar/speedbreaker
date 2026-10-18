@@ -52,6 +52,7 @@
 // read waits as before.
 #include <stdafx.h>
 #include <debug/d3d_profile.h>  // study/hle-renderer
+#include <gpu/hle_resolve.h>     // study/hle-renderer
 #include "timedemo.h"
 
 #include <kernel/function.h>
@@ -104,6 +105,7 @@ namespace
 PPC_FUNC(sub_82589398)
 {
     d3dprof::Scope d3dprofScope(0x82589398, ctx, base);  // study/hle-renderer
+    hle::LockRect(ctx, base);                            // study/hle-renderer: textures the CPU reads
     if (uint32_t(ctx.lr) != kExposureLock)
     {
         __imp__sub_82589398(ctx, base);

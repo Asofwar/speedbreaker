@@ -12,6 +12,7 @@
 # - Guest memory in shadow mode, as on the Deck (RADV refuses the import):
 #   imported, lavapipe's own threads would touch write-watched pages and wait
 #   for the GPU, that is for themselves.
+# - NFSMW_BENCH_TIMEOUT well past the bench's 900 s: the window takes an hour.
 # - No submits to a starving GPU (NFSMW_STARVE_SUBMIT_US): lavapipe always
 #   starves, and they would split passes a Deck at 5 W keeps whole (its
 #   queue never empties). Counts of passes and barriers then compare.
@@ -32,4 +33,4 @@ HOME="/work/hle/home/$LABEL" DISPLAY=":$D" VK_DRIVER_FILES=/usr/share/vulkan/icd
     bash scripts/timedemo.sh run "$LABEL" 1 --build "$BUILD" \
     --race /work/race/race.jlg --out /work/hle/runs --timeout 14400 \
     NFSMW_ALLOW_MODIFIED_FILES=1 SDL_AUDIODRIVER=dummy NFSMW_BENCH_FROM=1530 NFSMW_SHARED_MEMORY=shadow \
-    NFSMW_STARVE_SUBMIT_US=100000000 NFSMW_BENCH_SHOTS=1600,2200,2800,3400,4000,4600,5200 "$@"
+    NFSMW_STARVE_SUBMIT_US=100000000 NFSMW_BENCH_TIMEOUT=14000 NFSMW_BENCH_SHOTS=1600,2200,2800,3400,4000,4600,5200 "$@"

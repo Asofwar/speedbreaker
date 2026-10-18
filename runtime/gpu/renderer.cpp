@@ -3,6 +3,7 @@
 // vulkan/vulkan_pipeline_cache.cc.
 #include <stdafx.h>
 #include "renderer.h"
+#include "hle_resolve.h"  // study/hle-renderer
 #include <cpu/guest_thread.h>
 #include <cpu/host_cpu.h>
 #include <cpu/guest_time.h>
@@ -56,6 +57,10 @@
 #include <memory>
 #include <unordered_map>
 
+namespace gpu::renderer
+{
+    uint32_t g_drawPacket = 0;  // study/hle-renderer (renderer.h)
+}
 namespace gpu::renderer
 {
     namespace
@@ -709,6 +714,36 @@ namespace gpu::renderer
             const char* comma = v ? std::strchr(v, ',') : nullptr;
             return comma ? std::max(std::atoi(comma + 1), 1) : 1;
         }();
+        // study/hle-renderer. NFSMW_HLE_STATS=<from>,<to> (renderer frames;
+        // the race's window is 4500,8100): per frame, what resolves move and
+        // what the frame's structure costs, printed at exit ([hle-stats]):
+        // bytes the resolves read from their targets, wrote into guest
+        // memory then, wrote into cached textures, and wrote into guest
+        // memory later (deferred ones, written back); passes, barriers
+        // (full, narrow), submits. NFSMW_HLE_RESOLVE_LOG=<frame>[,<frames>]:
+        // a [hle-resolve] line per resolve of those frames (phase 0's table).
+        struct HleStats
+        {
+            uint64_t frames = 0, resolves = 0, matched = 0, srcBytes = 0, guestBytes = 0, textureBytes = 0, writebackBytes = 0;
+            uint64_t passes = 0, fullBarriers = 0, narrowBarriers = 0, submits = 0, renamed = 0, presented = 0;
+        } s_hle;
+        bool s_hleCounting = false;
+        const std::pair<uint64_t, uint64_t> s_hleWindow = [] {
+            const char* v = std::getenv("NFSMW_HLE_STATS");
+            if (!v)
+                return std::pair<uint64_t, uint64_t>{ 0, 0 };
+            const char* comma = std::strchr(v, ',');
+            return std::pair<uint64_t, uint64_t>{ uint64_t(std::max(std::atoll(v), 0ll)), comma ? uint64_t(std::max(std::atoll(comma + 1), 0ll)) : UINT64_MAX };
+        }();
+        const std::pair<uint64_t, uint64_t> s_hleLogFrames = [] {
+            const char* v = std::getenv("NFSMW_HLE_RESOLVE_LOG");
+            if (!v)
+                return std::pair<uint64_t, uint64_t>{ UINT64_MAX, 0 };
+            const char* comma = std::strchr(v, ',');
+            return std::pair<uint64_t, uint64_t>{ uint64_t(std::max(std::atoll(v), 0ll)), comma ? uint64_t(std::max(std::atoi(comma + 1), 1)) : 1 };
+        }();
+        bool s_hleLogNow = false;
+        uint32_t s_hleLogIndex = 0;  // resolves logged this frame
         VkQueryPool s_passQueries = VK_NULL_HANDLE;
         // Per profiled pass, also what was recorded in the gap before it:
         // resolves, texture uploads, submissions, guest memory synced to the
@@ -1009,6 +1044,7 @@ namespace gpu::renderer
             s_recording = false;
             s_submissionCounter++;
             s_stats.submits++;
+            s_hle.submits += s_hleCounting;
             writewatch::Rearm();
         }
 
@@ -1444,6 +1480,7 @@ namespace gpu::renderer
             s_vertexPendingHi = 0;
             s_vertexPendingTextures.clear();
             s_narrowPassEnds = 0;
+            s_hle.fullBarriers += s_hleCounting;
         }
 
         // `src` stages' work (and, in Vulkan, everything logically earlier)
@@ -1451,6 +1488,7 @@ namespace gpu::renderer
         // before a vertex stage. Outside rendering only.
         void NarrowBarrier(VkPipelineStageFlags src, VkAccessFlags srcAccess)
         {
+            s_hle.narrowBarriers += s_hleCounting;
             VkMemoryBarrier mb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
             mb.srcAccessMask = srcAccess;
             mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
@@ -1520,6 +1558,7 @@ namespace gpu::renderer
         // dispatch: its shader writes before everything after.
         void ComputeBarrier()
         {
+            s_hle.narrowBarriers += s_hleCounting;
             VkMemoryBarrier mb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
             mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
             mb.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
@@ -2404,6 +2443,9 @@ namespace gpu::renderer
             ZpdEndSegment();  // a segment never outlives its pass
             s_vk->cmdEndRendering(s_cmd);
             s_passActive = false;
+            s_passBreak = why;
+            std::copy(s_passColor, s_passColor + 4, s_lastPassTargets);
+            s_lastPassTargets[4] = s_passDepth;
             if (s_profiling && s_passEndPending)
             {
                 vkCmdWriteTimestamp(s_cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s_passQueries, s_passInfos.back().query + 1);
@@ -2443,9 +2485,6 @@ namespace gpu::renderer
         // Guest rectangle [x0, x1) x [y0, y1) in host pixels at `scale`: its
         // edges' (gpu/render_scale.h; a negative edge is 0), so rectangles
         // that share a guest edge share the host one.
-            s_passBreak = why;
-            std::copy(s_passColor, s_passColor + 4, s_lastPassTargets);
-            s_lastPassTargets[4] = s_passDepth;
         VkRect2D HostRect(const gpu::RenderScale& scale, int32_t x0, int32_t y0, int32_t x1, int32_t y1)
         {
             const int32_t hx0 = scale.x.EdgeAt(x0), hy0 = scale.y.EdgeAt(y0), hx1 = scale.x.EdgeAt(x1), hy1 = scale.y.EdgeAt(y1);
@@ -2669,6 +2708,10 @@ namespace gpu::renderer
                 GapCounters now{ s_stats.resolves, s_stats.uploads, s_stats.submits, writewatch::GetGuardStats().uploadBytes };
                 s_passInfos.push_back({ desc, 0, s_slot, s_passQueryNext, uint32_t(now.resolves - s_gapLast.resolves),
                     uint32_t(now.uploads - s_gapLast.uploads), uint32_t(now.submits - s_gapLast.submits), (now.shadowBytes - s_gapLast.shadowBytes) / 1024 });
+                PassInfo& pi = s_passInfos.back();
+                pi.why = s_passBreak;
+                pi.same = std::equal(color, color + 4, s_lastPassTargets) && s_lastPassTargets[4] == depth;
+                pi.submitWhy = s_passBreakSubmit;
                 s_gapLast = now;
                 s_passQueryNext += 2;
                 s_passEndPending = true;
@@ -2676,6 +2719,7 @@ namespace gpu::renderer
             s_vk->cmdBeginRendering(s_cmd, &ri);
             s_passActive = true;
             s_stats.passes++;
+            s_hle.passes += s_hleCounting;
             for (const PendingClear& pc : inPass)
             {
                 VkClearAttachment ca{};
@@ -2708,10 +2752,6 @@ namespace gpu::renderer
             {
                 // Newest first, so `run` (the read, then each clear that runs
                 // now) holds every newer clear an older one must land under.
-                PassInfo& pi = s_passInfos.back();
-                pi.why = s_passBreak;
-                pi.same = std::equal(color, color + 4, s_lastPassTargets) && s_lastPassTargets[4] == depth;
-                pi.submitWhy = s_passBreakSubmit;
                 std::vector<VkRect2D> run{ *read };
                 for (size_t i = s_pendingClears.size(); i-- > 0;)
                 {
@@ -6552,6 +6592,8 @@ void main()
                 rc, colour ? s_dummy[0].view : d.sampleView, colour ? d.texture->storeViews[d.layer] : s_dummyStorage.view,
                 DummyStorage(s_scaled.pool));
             ResolveBarrier(d.rangeBase, d.rangeBytes, 0);
+            if (s_hleCounting)
+                s_hle.writebackBytes += (uint64_t(rc.width) * rc.height) << ResolveBppLog2(rc.format);
             ProfileComputeEnd();
             // Guarded as the resolve's own write would have been (its pages
             // stayed GPU-owned), and only then no longer owed: a CPU access
@@ -6669,9 +6711,28 @@ void main()
             return old;
         }
 
+        // study/hle-renderer: the D3D intent of the resolve running now
+        // (NFSMW_HLE_RESOLVE, gpu/hle_resolve.h), if one matched.
+        hle::Intent s_intent;
+        bool s_haveIntent = false;
+
+        // What one resolve did ([hle-resolve] lines, NFSMW_HLE_RESOLVE_LOG).
+        struct HleNote
+        {
+            bool copied = false, fused = false, partial = false, deferred = false, scaled = false, renamed = false, presented = false;
+            const char* unfused = nullptr;
+            uint32_t rangeBase = 0, rangeBytes = 0, format = 0;
+        };
+        void LogResolve(const HleNote& note, bool depthSource, uint32_t srcBase, uint32_t pitch, uint32_t msaa, int32_t x0, int32_t y0,
+            int32_t x1, int32_t y1, uint32_t destBase, bool clearColour, bool clearDepth, bool whole);
+
         void Resolve()
         {
             s_stats.resolves++;
+            s_haveIntent = hle::Match(g_drawPacket, s_regs[XE_GPU_REG_RB_COPY_DEST_BASE], s_intent);
+            s_hle.resolves += s_hleCounting;
+            s_hle.matched += s_hleCounting && s_haveIntent;
+            HleNote note;
             auto copyControl = Reg<reg::RB_COPY_CONTROL>();
             auto surfaceInfo = Reg<reg::RB_SURFACE_INFO>();
             uint32_t pitch = surfaceInfo.surface_pitch;
@@ -7175,6 +7236,22 @@ void main()
                         }
                     }
                     const bool textureOnly = defer || deferColour;
+                    if (s_hleCounting)
+                    {
+                        const uint64_t px = (uint64_t(rc.width) * rc.height) << bl;
+                        s_hle.srcBytes += px;
+                        s_hle.guestBytes += textureOnly ? 0 : px;
+                        s_hle.textureBytes += fused ? px : 0;
+                    }
+                    note.copied = true;
+                    note.fused = fused != nullptr;
+                    note.partial = partial;
+                    note.deferred = textureOnly;
+                    note.scaled = scaledWrite;
+                    note.unfused = unfused;
+                    note.rangeBase = rangeBase;
+                    note.rangeBytes = rangeBytes;
+                    note.format = format;
                     if (use)
                     {
                         std::lock_guard lock(s_resolveUseMutex);
@@ -7352,6 +7429,39 @@ void main()
             }
             if (copyControl.color_clear_enable && depthSource)
                 LogOnce(0x400, "color clear requested with a depth resolve source");
+            if (s_hleLogNow)
+            {
+                // Whether the rectangle covers the target's guest area (the
+                // EDRAM's view; D3D's own is the intent's wholeSurface).
+                const bool whole = r.x0 <= 0 && r.y0 <= 0 && r.x1 >= int32_t(source->guestWidth) && r.y1 >= int32_t(source->guestHeight);
+                LogResolve(note, depthSource, source->base, pitch, uint32_t(surfaceInfo.msaa_samples), r.x0, r.y0, r.x1, r.y1, destBase,
+                    copyControl.color_clear_enable && !depthSource, copyControl.depth_clear_enable, whole);
+            }
+        }
+
+        void LogResolve(const HleNote& note, bool depthSource, uint32_t srcBase, uint32_t pitch, uint32_t msaa, int32_t x0, int32_t y0,
+            int32_t x1, int32_t y1, uint32_t destBase, bool clearColour, bool clearDepth, bool whole)
+        {
+            std::string d3d = "none";
+            if (s_haveIntent)
+            {
+                const hle::Intent& in = s_intent;
+                d3d = std::format("flags {:03X}{}{} {} tex {:08X} {}x{} fmt {} dim {} pitch {} lvl {} slice {}{}{}", in.flags,
+                    in.clearColour() ? " clear-colour" : "", in.clearDepth() ? " clear-depth" : "",
+                    in.wholeSurface ? std::string("whole surface") : std::format("rect ({},{})-({},{})", in.rect[0], in.rect[1], in.rect[2], in.rect[3]),
+                    in.texBase, in.texWidth, in.texHeight, in.texFormat, in.texDimension, in.texPitch, in.level, in.slice,
+                    in.point ? std::format(" at ({},{})", in.pointX, in.pointY) : std::string(), in.inTiling ? " EndTiling" : "");
+                if (in.cpuLocked)
+                    d3d += " CPU-locked";
+            }
+            std::string what = !note.copied ? std::string("no copy")
+                : std::format("{}{}{}{}", note.fused ? (note.partial ? "fused (part)" : "fused") : std::format("unfused ({})", note.unfused ? note.unfused : "?"),
+                    note.deferred ? ", texture only (deferred)" : ", guest bytes now", note.scaled ? ", scaled" : "",
+                    note.renamed ? ", renamed" : note.presented ? ", to the presenter" : "");
+            fprintf(stderr, "[hle-resolve] frame %llu #%u %s b%u p%u msaa %u rect %dx%d@%d,%d%s -> %08X range %08X+%u fmt %u | %s | clear%s%s | d3d: %s\n",
+                (unsigned long long)s_frame, s_hleLogIndex++, depthSource ? "depth" : "colour", srcBase, pitch, msaa, x1 - x0, y1 - y0, x0, y0,
+                whole ? " (whole target)" : "", destBase, note.rangeBase, note.rangeBytes, note.format, what.c_str(),
+                clearColour ? " colour" : "", clearDepth ? " depth" : (clearColour ? "" : " none"), d3d.c_str());
         }
 
         void CreateComputePipeline(const char* glsl, const VkDescriptorSetLayoutBinding* bindings, uint32_t bindingCount,
@@ -11655,6 +11765,11 @@ void main()
             writewatch::SetWriterFrame(frame);
         }
         s_frame = frame;
+        // study/hle-renderer: NFSMW_HLE_STATS's window, NFSMW_HLE_RESOLVE_LOG's frames.
+        s_hleCounting = s_hleWindow.second > s_hleWindow.first && frame >= s_hleWindow.first && frame < s_hleWindow.second;
+        s_hle.frames += s_hleCounting;
+        s_hleLogNow = frame >= s_hleLogFrames.first && frame - s_hleLogFrames.first < s_hleLogFrames.second;
+        s_hleLogIndex = 0;
         if (s_vk)
             TrimTextureCache();
         if (s_vk)
@@ -11854,6 +11969,19 @@ void main()
         SavePipelineCache();
         SavePipelineKeys();
         ReportResolveUse("at exit");
+        if (s_hle.frames)  // study/hle-renderer (NFSMW_HLE_STATS)
+        {
+            const double n = double(s_hle.frames), mb = 1048576.0;
+            fprintf(stderr, "[hle-stats] %llu frames (%llu..%llu), a frame: %.1f resolves (%.1f with a D3D intent), read %.2f MB, "
+                "guest bytes %.2f MB now + %.2f MB written back later, texture stores %.2f MB; %.1f passes, %.1f full barriers, "
+                "%.1f narrow barriers, %.1f submits; renamed %.1f, to the presenter %.1f\n",
+                (unsigned long long)s_hle.frames, (unsigned long long)s_hleWindow.first, (unsigned long long)s_hleWindow.second,
+                double(s_hle.resolves) / n, double(s_hle.matched) / n, double(s_hle.srcBytes) / n / mb, double(s_hle.guestBytes) / n / mb,
+                double(s_hle.writebackBytes) / n / mb, double(s_hle.textureBytes) / n / mb, double(s_hle.passes) / n,
+                double(s_hle.fullBarriers) / n, double(s_hle.narrowBarriers) / n, double(s_hle.submits) / n, double(s_hle.renamed) / n,
+                double(s_hle.presented) / n);
+        }
+        hle::Report();
         ReportColourCheck("at exit");
         if (s_resolveDefer || s_resolveDeferColor)
         {

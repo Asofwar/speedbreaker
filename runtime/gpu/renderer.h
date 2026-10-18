@@ -40,6 +40,9 @@ namespace gpu::renderer
     // DRAW_INDX / DRAW_INDX_2 (VGT_DRAW_INITIATOR, and VGT_DMA_BASE/SIZE for
     // indexed draws). In copy mode this is a resolve.
     void Draw(uint32_t initiator, uint32_t dmaBase, uint32_t dmaSize);
+    // study/hle-renderer: the guest address of the draw packet Draw runs now
+    // (set by the command processor with NFSMW_HLE_RESOLVE, see gpu/hle_resolve.h).
+    extern uint32_t g_drawPacket;
 
     // Submit recorded work without waiting.
     void Submit();
