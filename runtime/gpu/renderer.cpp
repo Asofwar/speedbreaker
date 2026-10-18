@@ -4438,6 +4438,12 @@ void main()
             // resolve storing into it. The cache evicts the oldest
             // (TrimTextureCache), never one used since the last swap.
             uint64_t lastUsed = 0;
+            // NFSMW_RESOLVE_RENAME (off by default): sampled from this image
+            // instead of its own (a depth target's, which a resolve handed it
+            // whole: renamedFormat, its depth aspect), whose texels are stale
+            // meanwhile (MaterializeRename).
+            VkImage renamedImage = VK_NULL_HANDLE;
+            VkFormat renamedFormat = VK_FORMAT_UNDEFINED;
         };
         void LoadScaledTexture(Texture& t, uint32_t base, uint32_t pitchBlocks, uint32_t endian);
         bool ScaledTextureValid(uint32_t base, uint32_t size);
@@ -4744,8 +4750,36 @@ void main()
             return slot;
         }
 
+        // NFSMW_RESOLVE_RENAME: views of renamed images, by image and swizzle.
+        // Kept for good: the images are the depth targets' spares, a few,
+        // and command buffers in flight may still sample through any.
+        std::map<std::pair<VkImage, uint32_t>, VkImageView> s_renameViews;
+        uint64_t s_renames = 0, s_renameDrops = 0, s_renameMaterialized = 0;  // (counts, the [hle] line at exit)
+        void ForgetTextureLookups(const Texture* t);  // the cached lookups that hold `t` decided again (its views changed)
+
         VkImageView TextureView(Texture& t, uint32_t swizzle)
         {
+            if (t.renamedImage)
+            {
+                auto& view = s_renameViews[{ t.renamedImage, swizzle }];
+                if (!view)
+                {
+                    auto comp = [](uint32_t s) {
+                        static const VkComponentSwizzle c[8] = { VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_G, VK_COMPONENT_SWIZZLE_B,
+                            VK_COMPONENT_SWIZZLE_A, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ONE, VK_COMPONENT_SWIZZLE_IDENTITY,
+                            VK_COMPONENT_SWIZZLE_IDENTITY };
+                        return c[s & 7];
+                    };
+                    VkImageViewCreateInfo vci{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+                    vci.image = t.renamedImage;
+                    vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+                    vci.format = t.renamedFormat;
+                    vci.components = { comp(swizzle), comp(swizzle >> 3), comp(swizzle >> 6), comp(swizzle >> 9) };
+                    vci.subresourceRange = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
+                    Check(vkCreateImageView(s_dev, &vci, nullptr, &view), "vkCreateImageView(renamed texture)");
+                }
+                return view;
+            }
             auto& view = t.views[swizzle];
             if (view)
                 return view;
@@ -5048,6 +5082,12 @@ void main()
                     writewatch::Settle(base, size);
                     writewatch::Settle(mipBase, mipSize);
                     t.loadedSequence = writewatch::Current();
+                    if (t.renamedImage)  // NFSMW_RESOLVE_RENAME: this load writes its own image whole
+                    {
+                        t.renamedImage = VK_NULL_HANDLE;
+                        s_renameDrops++;
+                        ForgetTextureLookups(&t);
+                    }
                     HitchTimer hitchTimer(s_hitch.textureMs);
                     s_hitch.textures++;
                     if (t.scaled)
@@ -5340,6 +5380,20 @@ void main()
             c->memoOn = c->on && (g_cpOpt & CP_OPT_TEXTURE_MEMO);
             return c;
         }();
+
+        void ForgetTextureLookups(const Texture* t)
+        {
+            TextureCache& c = *s_textureCache;
+            for (auto& slots : c.slots)
+                for (TextureCacheEntry& e : slots)
+                    if (e.texture == t)
+                        e.generation = 0;
+            for (auto& ways : c.recent)
+                for (TextureCacheEntry& e : ways)
+                    if (e.texture == t)
+                        e.generation = 0;
+            c.memo.layout = nullptr;  // (the last draw's bindings may hold it)
+        }
 
         // Whether entry `e` is this lookup's: its key is the fetch constant,
         // the dimension, the cache's generation and, for a texture the
@@ -6496,6 +6550,20 @@ void main()
             return v ? std::clamp(std::atoi(v), 0, 2) : 0;
         }();
         const bool s_hleLazy = s_hleLazyMode == 1;
+        // NFSMW_RESOLVE_RENAME=1 (with NFSMW_RESOLVE_DEFER, off by default): a
+        // depth resolve of a whole target with its clear, into a cached
+        // texture exactly the target's size (shadow map 2), renames the
+        // target's image instead of copying it: NFSMW_RESOLVE_DEFER already
+        // hands the target a fresh image (the clear's) and keeps the old one
+        // for the guest bytes; now the texture samples that one too (its
+        // depth aspect), and the resolve's store into the texture is gone.
+        // The texture's own texels are stale meanwhile: a load of it drops
+        // the rename, a resolve into it that doesn't rename first copies
+        // them over (MaterializeRename). Its depth is the target's as drawn,
+        // not rounded to 24 bits as the store rounds it. Its views change
+        // each frame: the cached lookups of that texture alone are made
+        // again (ForgetTextureLookups).
+        const bool s_hleRename = [] { const char* v = std::getenv("NFSMW_RESOLVE_RENAME"); return v && v[0] == '1'; }();
         struct ColourCheck
         {
             VkBuffer buffer = VK_NULL_HANDLE;
@@ -6580,7 +6648,8 @@ void main()
 
         // A resolve shader pass over `rc`'s rectangle (8x8 groups): `src` its
         // source, `store` its texture binding, `pool` its pool binding.
-        void DispatchResolvePass(VkPipeline pipeline, const ResolveConstants& rc, VkImageView src, VkImageView store, VkDescriptorBufferInfo pool)
+        void DispatchResolvePass(VkPipeline pipeline, const ResolveConstants& rc, VkImageView src, VkImageView store, VkDescriptorBufferInfo pool,
+            bool tiles = false)  // (tiles: TEXTURE_ONLY's groups, a 32x32 tile each)
         {
             VkDescriptorImageInfo ii{ VK_NULL_HANDLE, src, VK_IMAGE_LAYOUT_GENERAL };
             VkDescriptorImageInfo ti{ VK_NULL_HANDLE, store, VK_IMAGE_LAYOUT_GENERAL };
@@ -6600,7 +6669,11 @@ void main()
             vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
             s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_resolveLayout, 0, AddSharedParts(w, 5), w);
             vkCmdPushConstants(s_cmd, s_resolveLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, s_resolvePush, &rc);
-            vkCmdDispatch(s_cmd, (rc.width + 7) / 8, (rc.height + 7) / 8, 1);
+            if (tiles)
+                vkCmdDispatch(s_cmd, ((rc.originX + int32_t(rc.width) - 1) >> 5) - (rc.originX >> 5) + 1,
+                    ((rc.originY + int32_t(rc.height) - 1) >> 5) - (rc.originY >> 5) + 1, 1);
+            else
+                vkCmdDispatch(s_cmd, (rc.width + 7) / 8, (rc.height + 7) / 8, 1);
         }
 
         // Records deferred resolve `i`'s guest bytes and takes it off the
@@ -6742,6 +6815,35 @@ void main()
             Begin();  // (the resolve may have submitted: SubmitIfStarving)
             ToGeneral(rt.image.image, aspect, 1);
             return old;
+        }
+
+        // NFSMW_RESOLVE_RENAME: texture `t` samples its own image again, its
+        // texels stored first from the renamed one as the resolve would have
+        // stored them (TEXTURE_ONLY with that resolve's constants).
+        struct RenameSource { ResolveConstants rc; VkImageView depthView; };
+        std::unordered_map<const Texture*, RenameSource> s_renameSources;
+        void MaterializeRename(Texture& t)
+        {
+            if (!t.renamedImage)
+                return;
+            if (auto it = s_renameSources.find(&t); it != s_renameSources.end())
+            {
+                if (!s_resolveTexturePipeline)
+                    MakeResolvePipeline(false, 1, 1, &s_resolveTexturePipeline, true);
+                EndPass(kBreakResolve);
+                Begin();
+                const ResolveConstants& rc = it->second.rc;
+                if (s_profiling)
+                    ProfileCompute(std::format("renamed {}x{} at {:08X}: its texels stored back (NFSMW_RESOLVE_RENAME)", rc.width, rc.height,
+                        t.guestStart).c_str());
+                DispatchResolvePass(s_resolveTexturePipeline, rc, it->second.depthView, t.storeViews[0], DummyStorage(s_scaled.pool), true);
+                ResolveBarrier(0, 0, t.guestStart);
+                ProfileComputeEnd();
+                s_renameMaterialized++;
+                s_renameSources.erase(it);
+            }
+            t.renamedImage = VK_NULL_HANDLE;
+            ForgetTextureLookups(&t);
         }
 
         void Resolve()
@@ -7263,7 +7365,34 @@ void main()
                         }
                     }
                     const bool textureOnly = defer || deferTexture;
-                    if (s_hleCounting)
+                    // NFSMW_RESOLVE_RENAME (see s_hleRename): the texture samples
+                    // the target's image as it stands (made a spare by the
+                    // defer below), so nothing is stored now. Depth sampled
+                    // through a filter only where its format allows it.
+                    static const bool renameSampleable = [] {
+                        VkFormatProperties fp;
+                        vkGetPhysicalDeviceFormatProperties(s_vk->physical, VK_FORMAT_D32_SFLOAT_S8_UINT, &fp);
+                        const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+                        return (fp.optimalTilingFeatures & need) == need;
+                    }();
+                    const bool rename = s_hleRename && defer && !cpulocks::LockedLately(fused->guestStart) && fused->levels == 1 && !fused->cube && !fused->volume && fused->convert == 4 &&
+                        fused->width == source->width && fused->height == source->height && source->vkFormat == VK_FORMAT_D32_SFLOAT_S8_UINT &&
+                        renameSampleable;
+                    // A renamed texture this resolve stores into after all:
+                    // its own texels again, the store's (a whole one, the
+                    // defer's), or the renamed image's first (any other).
+                    if (fused && fused->renamedImage && !rename)
+                    {
+                        if (defer)
+                        {
+                            fused->renamedImage = VK_NULL_HANDLE;
+                            s_renameDrops++;
+                            ForgetTextureLookups(fused);
+                        }
+                        else
+                            MaterializeRename(*fused);
+                    }
+                    if (s_hleCounting && !rename)
                     {
                         const uint64_t px = (uint64_t(rc.width) * rc.height) << bl;
                         s_hle.srcBytes += px;
@@ -7286,28 +7415,31 @@ void main()
                             rc.originY, pitch, format, rc.destBase, depthSource ? "depth " : "",
                             scaledWrite ? std::format("scaled {}", gpu::ScaleName(source->scale)).c_str()
                             : !source->scale.IsOne() ? "1x (from a scaled target)" : "1x", fused ? " fused" : "",
-                            textureOnly ? ", texture only (deferred)" : "");
+                            rename ? ", renamed (NFSMW_RESOLVE_RENAME)" : textureOnly ? ", texture only (deferred)" : "");
                         ProfileCompute(desc);
                     }
-                    vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, textureOnly ? s_resolveTexturePipeline : ResolvePipeline(coalesced, source->scale));
-                    s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_resolveLayout, 0, AddSharedParts(w, 5), w);
-                    vkCmdPushConstants(s_cmd, s_resolveLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, s_resolvePush, &rc);
-                    uint32_t perWord = bl >= 2 ? 1 : (4 >> bl);
-                    if (!(s_exp & 2) && textureOnly)  // a group a 32x32 tile of the destination
-                        vkCmdDispatch(s_cmd, ((r.x1 - 1) >> 5) - (r.x0 >> 5) + 1, ((r.y1 - 1) >> 5) - (r.y0 >> 5) + 1, 1);
-                    else if (!(s_exp & 2))
-                        vkCmdDispatch(s_cmd, coalesced ? (rc.width + 31) / 32 : (rc.width / perWord + 7) / 8,
-                            coalesced ? (rc.height + 1) / 2 : (rc.height + 7) / 8, 1);
-                    // Below 1x a scaled resolve's barrier is a 1x one's: its
-                    // pool writes are compute shader writes too, read by
-                    // compute (untiles, the front buffer) and fragment work,
-                    // never by a vertex stage. (A narrower one only where 1x
-                    // resolves get one, NFSMW_PASS_BARRIER 2 and up: Apple's
-                    // default; elsewhere ResolveBarrier is a full one too.)
-                    if (scaledWrite && !source->scale.Below())
-                        FullBarrier();  // (above 1x: as before)
-                    else
-                        ResolveBarrier(rangeBase, rangeBytes, fused ? fused->guestStart : 0);
+                    if (!rename)
+                    {
+                        vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, textureOnly ? s_resolveTexturePipeline : ResolvePipeline(coalesced, source->scale));
+                        s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_resolveLayout, 0, AddSharedParts(w, 5), w);
+                        vkCmdPushConstants(s_cmd, s_resolveLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, s_resolvePush, &rc);
+                        uint32_t perWord = bl >= 2 ? 1 : (4 >> bl);
+                        if (!(s_exp & 2) && textureOnly)  // a group a 32x32 tile of the destination
+                            vkCmdDispatch(s_cmd, ((r.x1 - 1) >> 5) - (r.x0 >> 5) + 1, ((r.y1 - 1) >> 5) - (r.y0 >> 5) + 1, 1);
+                        else if (!(s_exp & 2))
+                            vkCmdDispatch(s_cmd, coalesced ? (rc.width + 31) / 32 : (rc.width / perWord + 7) / 8,
+                                coalesced ? (rc.height + 1) / 2 : (rc.height + 7) / 8, 1);
+                        // Below 1x a scaled resolve's barrier is a 1x one's: its
+                        // pool writes are compute shader writes too, read by
+                        // compute (untiles, the front buffer) and fragment work,
+                        // never by a vertex stage. (A narrower one only where 1x
+                        // resolves get one, NFSMW_PASS_BARRIER 2 and up: Apple's
+                        // default; elsewhere ResolveBarrier is a full one too.)
+                        if (scaledWrite && !source->scale.Below())
+                            FullBarrier();  // (above 1x: as before)
+                        else
+                            ResolveBarrier(rangeBase, rangeBytes, fused ? fused->guestStart : 0);
+                    }
                     ProfileComputeEnd();
                     if (checkColour)
                         CheckColourWriteback(rc, fused, layer, rangeBase, rangeBytes);
@@ -7419,6 +7551,21 @@ void main()
                         auto [image, view] = SwapTargetImage(*source);
                         s_deferredResolves.push_back({ rangeBase, rangeBytes, rc, image, view, source->vkFormat, source->width, source->height });
                         s_deferredCount++;
+                        if (rename)
+                        {
+                            // (The image goes back to the spares with the
+                            // record; only a defer like this one takes a
+                            // spare, and it renames the texture to its own old
+                            // image, or drops the rename, first: see above.)
+                            fused->renamedImage = image.image;
+                            fused->renamedFormat = source->vkFormat;
+                            s_renameSources[fused] = { rc, view };
+                            ForgetTextureLookups(fused);
+                            s_renames++;
+                            s_hle.renamed += s_hleCounting;
+                            LogOnce(0x3430, "depth resolves of a whole surface with its clear rename the target's image into their texture "
+                                "(NFSMW_RESOLVE_RENAME; the first: %ux%u at %08X)", rc.width, rc.height, rc.destBase);
+                        }
                         if (s_resolveDeferMode == 2)
                         {
                             std::lock_guard lock(s_deferCheckMutex);
@@ -11969,6 +12116,9 @@ void main()
                 double(s_hle.fullBarriers) / n, double(s_hle.narrowBarriers) / n, double(s_hle.submits) / n, double(s_hle.renamed) / n,
                 double(s_hle.presented) / n);
         }
+        if (s_hleRename)
+            fprintf(stderr, "[renderer] renamed (NFSMW_RESOLVE_RENAME): %llu, dropped by a load or a whole store %llu, stored back %llu\n",
+                (unsigned long long)s_renames, (unsigned long long)s_renameDrops, (unsigned long long)s_renameMaterialized);
         ReportColourCheck("at exit");
         if (s_resolveDefer || s_resolveDeferColor || s_hleLazy)
         {
