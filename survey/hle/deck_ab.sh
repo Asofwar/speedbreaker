@@ -34,6 +34,17 @@ cap() {
 }
 FIRST_CAP="$(cap)"
 echo "[deck_ab] power cap at the start: $FIRST_CAP uW; A: the bundle as it is; B: ${B[*]}"
+# The game's data: $GAME_DIR (NFSMW_GAME_DIR; the dev folder's game/ on the
+# Deck), else the bundle's own install. The Deck's lock (~/sb-bench/.deck.lock,
+# as pwrrace.sh takes it) for the whole series; no series beside a game.
+EXTRA=()
+[ -n "${GAME_DIR:-}" ] && EXTRA+=("NFSMW_GAME_DIR=$GAME_DIR")
+# STEPS=<n>: a shorter measured window than timedemo.sh's 3600 steps (each
+# run still loads the race, ~1.5 min).
+[ -n "${STEPS:-}" ] && EXTRA+=("NFSMW_BENCH_STEPS=$STEPS")
+exec 9> "$HOME/sb-bench/.deck.lock"
+flock -w 900 9 || { echo "[deck_ab] the Deck stayed busy for 15 min: not measuring" >&2; exit 1; }
+if pgrep -f "lib/SpeedBreaker( |$)" > /dev/null; then echo "[deck_ab] a game is running: not measuring" >&2; exit 1; fi
 LOG="$OUT/$LABEL-caps.txt"
 mkdir -p "$OUT"
 : > "$LOG"
@@ -42,18 +53,21 @@ run() {  # run <side> <name> [VAR=value...]
     local before after
     before="$(cap)"
     rm -rf "${OUT:?}/$name-1"
-    scripts/timedemo.sh run "$name" 1 --bundle "$BUNDLE" --out "$OUT" "$@"
+    scripts/timedemo.sh run "$name" 1 --bundle "$BUNDLE" --out "$OUT" "${EXTRA[@]}" "$@"
     after="$(cap)"
     echo "$name $side cap_before=$before cap_after=$after" >> "$LOG"
     if [ "$before" != "$FIRST_CAP" ] || [ "$after" != "$FIRST_CAP" ]; then
         echo "[deck_ab] $name: the power cap moved ($before -> $after, first $FIRST_CAP): redo this comparison" >&2
     fi
 }
-# The pictures (capped, as the warm-ups).
-run A "${LABEL}WA" NFSMW_TIMEDEMO_UNCAPPED=0 NFSMW_BENCH_FROM=1530 "$SHOTS"
-run B "${LABEL}WB" NFSMW_TIMEDEMO_UNCAPPED=0 NFSMW_BENCH_FROM=1530 "$SHOTS" "${B[@]}"
-python3 scripts/compare_shots.py "$OUT/${LABEL}WA-1" "$OUT/${LABEL}WB-1" --strict --diff "$OUT/${LABEL}-shots-diff"
-echo "[deck_ab] compare_shots --strict: exit $?"
+# The pictures (capped, as the warm-ups). NO_SHOTS=1: none (a series whose
+# settings another one checked already).
+if [ -z "${NO_SHOTS:-}" ]; then
+    run A "${LABEL}WA" NFSMW_TIMEDEMO_UNCAPPED=0 NFSMW_BENCH_FROM=1530 "$SHOTS"
+    run B "${LABEL}WB" NFSMW_TIMEDEMO_UNCAPPED=0 NFSMW_BENCH_FROM=1530 "$SHOTS" "${B[@]}"
+    python3 scripts/compare_shots.py "$OUT/${LABEL}WA-1" "$OUT/${LABEL}WB-1" --strict --diff "$OUT/${LABEL}-shots-diff"
+    echo "[deck_ab] compare_shots --strict: exit $?"
+fi
 # The measured pairs.
 for i in $(seq 1 "$PAIRS"); do
     if [ $((i % 2)) -eq 1 ]; then
