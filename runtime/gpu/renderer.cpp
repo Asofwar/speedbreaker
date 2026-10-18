@@ -1730,11 +1730,19 @@ namespace gpu::renderer
             const std::string& preamble);
         std::atomic<uint64_t> s_shaderCacheHits{ 0 };
 
+        // NFSMW_SPIRV_OPT=1 (off by default): glslang runs SPIRV-Tools'
+        // optimizer on the SPIR-V it makes (its performance passes, as
+        // glslangValidator -O), which it otherwise leaves as generated. The
+        // drivers optimize again; whether this helps the GPU is what the
+        // flag is for (Steam Deck at 5 W). Kept apart in the shader cache
+        // (its preamble names it).
+        const bool s_spirvOpt = [] { const char* v = std::getenv("NFSMW_SPIRV_OPT"); return v && v[0] == '1'; }();
+
         std::vector<uint32_t> CompileGlsl(const std::string& source, glslang_stage_t stage, std::string& log,
             const std::string& shaderPreamble = {})
         {
             const std::string preamble = std::string(s_splitMemory ? "#define SPLIT_MEMORY\n" : "") +
-                (s_fmulz ? "#define SB_FMULZ\n" : "") + shaderPreamble;
+                (s_fmulz ? "#define SB_FMULZ\n" : "") + (s_spirvOpt ? "// NFSMW_SPIRV_OPT\n" : "") + shaderPreamble;
             if (!s_shaderCacheEnabled)
                 return CompileGlslUncached(source, stage, log, preamble);
             std::filesystem::path file = ShaderCacheFile(source, stage, preamble);
@@ -1812,7 +1820,14 @@ namespace gpu::renderer
             }
             else
             {
-                glslang_program_SPIRV_generate(program, stage);
+                if (s_spirvOpt)
+                {
+                    glslang_spv_options_t options{};
+                    options.disable_optimizer = false;
+                    glslang_program_SPIRV_generate_with_options(program, stage, &options);
+                }
+                else
+                    glslang_program_SPIRV_generate(program, stage);
                 spirv.resize(glslang_program_SPIRV_get_size(program));
                 glslang_program_SPIRV_get(program, spirv.data());
             }
