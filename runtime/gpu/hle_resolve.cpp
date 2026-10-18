@@ -21,6 +21,11 @@ namespace hle
         constexpr size_t kMaxPending = 512;
         std::mutex s_mutex;
         std::deque<Intent> s_pending;            // in the order the guest made them
+        // The last intents passed over or matched: predicated tiling runs a
+        // tile's packets once a tile, so a resolve in them comes again after
+        // the next call's has matched (the scene's depth, once a tile).
+        constexpr size_t kMaxRecent = 16;
+        std::deque<Intent> s_recent;
         // Textures' physical bases the CPU has locked, and when it last did: a
         // texture counts as read by the CPU while its last lock is under
         // kLockedFor old (the 64x64 brightness, every frame; not those
@@ -36,7 +41,7 @@ namespace hle
         thread_local int t_tiling = 0;           // inside EndTiling on this thread
         thread_local int t_depth = 0;            // Resolve calls open on this thread (it doesn't nest; kept safe)
         thread_local uint64_t t_open[4] = {};    // their intents' seq
-        struct Counts { uint64_t made = 0, byPacket = 0, byDest = 0, unmatched = 0, skipped = 0, dropped = 0, locks = 0; } s_counts;
+        struct Counts { uint64_t made = 0, byPacket = 0, byDest = 0, again = 0, unmatched = 0, skipped = 0, dropped = 0, locks = 0; } s_counts;
 
         uint32_t Physical(uint32_t address) { return address & 0x1FFFFFFF; }
 
@@ -47,7 +52,7 @@ namespace hle
             uint32_t d0 = PPC_LOAD_U32(tex + 16), d1 = PPC_LOAD_U32(tex + 20), d2 = PPC_LOAD_U32(tex + 24), d5 = PPC_LOAD_U32(tex + 36);
             in.texHeader = tex;
             in.texFormat = d1 & 0x3F;
-            in.texBase = (d1 >> 12) << 12;
+            in.texBase = Physical((d1 >> 12) << 12);  // (the fetch constant's address is in a window: A0000000 and up)
             in.texDimension = (d5 >> 9) & 3;  // 0 1D, 1 2D, 2 3D, 3 cube
             in.texPitch = ((d0 >> 22) & 0x1FF) * 32;
             if (in.texDimension == 2)
@@ -198,6 +203,15 @@ namespace hle
             }
         if (found == s_pending.size())
         {
+            // A tile's packets again: an intent already passed over.
+            for (auto it = s_recent.rbegin(); it != s_recent.rend(); ++it)
+                if (holds(*it, 0) && into(*it))
+                {
+                    out = *it;
+                    out.cpuLocked = out.cpuLocked || LockedLately(out.texBase);
+                    s_counts.again++;
+                    return true;
+                }
             s_counts.unmatched++;
             return false;
         }
@@ -205,8 +219,13 @@ namespace hle
         out.cpuLocked = out.cpuLocked || LockedLately(out.texBase);
         s_counts.skipped += found;
         (byPacket ? s_counts.byPacket : s_counts.byDest)++;
-        // Those before it are passed over; it stays first: one call can make
-        // more than one resolve (a predicated tile's each), all in its packets.
+        // Those before it are passed over (kept a while in s_recent); it
+        // stays first: one call can make more than one resolve (a predicated
+        // tile's each), all in its packets.
+        for (size_t i = 0; i < found; i++)
+            s_recent.push_back(s_pending[i]);
+        while (s_recent.size() > kMaxRecent)
+            s_recent.pop_front();
         s_pending.erase(s_pending.begin(), s_pending.begin() + ptrdiff_t(found));
         return true;
     }
@@ -217,9 +236,9 @@ namespace hle
             return;
         std::lock_guard lock(s_mutex);
         fprintf(stderr, "[hle] D3D resolve intents (NFSMW_HLE_RESOLVE): %llu made; resolves matched by their packet %llu, by destination %llu, "
-            "unmatched %llu; intents passed over %llu, dropped %llu; LockRect calls %llu (%zu textures)\n",
+            "again (a tile's packets) %llu, unmatched %llu; intents passed over %llu, dropped %llu; LockRect calls %llu (%zu textures)\n",
             (unsigned long long)s_counts.made, (unsigned long long)s_counts.byPacket, (unsigned long long)s_counts.byDest,
-            (unsigned long long)s_counts.unmatched, (unsigned long long)s_counts.skipped, (unsigned long long)s_counts.dropped,
+            (unsigned long long)s_counts.again, (unsigned long long)s_counts.unmatched, (unsigned long long)s_counts.skipped, (unsigned long long)s_counts.dropped,
             (unsigned long long)s_counts.locks, s_locked.size());
     }
 }

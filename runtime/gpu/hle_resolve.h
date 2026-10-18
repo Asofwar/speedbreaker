@@ -10,7 +10,8 @@
 // and where in the command buffer its packets went (the device's write
 // pointer, device+0, before and after the call). LockRect (sub_82589398)
 // marks the textures the CPU reads. The command processor's resolve takes the
-// intent whose packets hold the draw that triggers it (renderer::g_drawPacket),
+// intent whose packets hold the draw that triggers it (renderer::g_drawPacket;
+// one a tile's packets run again: an intent passed over lately),
 // or, should none, the first with that destination; intents passed over
 // (predicated tiles the renderer skips) are dropped.
 //
