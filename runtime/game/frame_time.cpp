@@ -32,8 +32,10 @@
 // #9). Further behind, the queue ran dry and the display waited, and the
 // frame gets the rest; a frame slower than the vblank (GPU-bound) gets its
 // count, its length rounded either way. Game time adds up to the vblanks
-// that fired, to within those few. It runs at the display's rate over 60:
-// 0.044% slow on a 59.97 Hz monitor, at most 2.5% (the lock's range). Frames
+// that fired, to within those few. It runs at the display's rate over 60
+// (over 120, 180 or 240 on such a display, whose refreshes a vblank is 2-4
+// of: video/vblank_lock.h): 0.044% slow on a 59.97 Hz monitor, at most 2.5%
+// (the lock's range). Frames
 // of more than 6 vblanks (a hitch, loading) keep their measured time; below
 // 20 fps, where they are the frame rate's own, only those over half a second
 // do, the rest get 6 (the stepper's own cap) and later frames give back what

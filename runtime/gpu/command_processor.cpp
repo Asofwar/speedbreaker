@@ -1126,7 +1126,23 @@ namespace gpu
         {
             const video::RefreshEstimate& d = s.display;
             std::string line;
-            if (s.locked)
+            if (s.locked && d.multiple >= 2)
+            {
+                // Every 2nd-4th refresh of a 120-240 Hz display (video/vblank_lock.h),
+                // and how long new frames stayed on screen since the lock.
+                const uint64_t frames = s.even + s.shorter + s.longer;
+                line = std::format("locked to every {} refresh of the display: {:.4f} Hz, the vblank at {:.4f} Hz (fit {} presents over {:.1f} s, "
+                    "rms {:.2f} ms, {} set aside); vblank {:.2f} ms before its refresh, error {:+.3f} ms; vblank to screen {:.1f} ms (median), "
+                    "to ready {:.1f} ms (99%); new frames shown on the refresh {} after their vblank's ({}); on screen for {} refreshes "
+                    "{:.2f}%, fewer {}, more {} (of {})",
+                    d.multiple == 2 ? "2nd" : d.multiple == 3 ? "3rd" : "4th", 1e9 / d.periodNs, 1e9 / s.periodNs, d.samples, d.spanNs / 1e9,
+                    d.rmsNs / 1e6, d.rejected, s.leadNs / 1e6, s.errorNs / 1e6, s.latencyNs / 1e6, s.readyNs / 1e6, d.multiple + s.extra,
+                    s.extraChanges == 0 ? std::string("the next, as at first")
+                        : s.extraMissed ? std::format("later: {} of the last 120 missed theirs", s.extraMissed)
+                                        : std::string("earlier: the last 600 were ready in time for it"),
+                    d.multiple, frames ? 100.0 * double(s.even) / double(frames) : 0.0, s.shorter, s.longer, frames);
+            }
+            else if (s.locked)
                 line = std::format("locked to the display: {:.4f} Hz (fit {} presents over {:.1f} s, rms {:.2f} ms, {} set aside); "
                     "vblank {:.2f} ms before its refresh, error {:+.3f} ms; vblank to screen {:.1f} ms (median), to present {:.1f} ms (99%); {} slips",
                     1e9 / d.periodNs, d.samples, d.spanNs / 1e9, d.rmsNs / 1e6, d.rejected, s.leadNs / 1e6, s.errorNs / 1e6,
@@ -1135,9 +1151,9 @@ namespace gpu
                 line = std::format("free-running every {:.3f} ms: the display follows the vblank (variable refresh?), "
                     "so there is no refresh to lock to", s.periodNs / 1e6);
             else if (d.samples)
-                line = std::format("free-running every {:.3f} ms; display {}: {:.4f} Hz (fit {} presents over {:.1f} s, rms {:.2f} ms, {} set aside)",
+                line = std::format("free-running every {:.3f} ms; display {}: {:.4f} Hz (fit {} presents over {:.1f} s, rms {:.2f} ms, {} set aside{})",
                     s.periodNs / 1e6, d.valid ? "measured (lock off)" : "not accepted", 1e9 / d.periodNs, d.samples, d.spanNs / 1e9,
-                    d.rmsNs / 1e6, d.rejected);
+                    d.rmsNs / 1e6, d.rejected, d.multiple >= 2 ? std::format("; fitted as {} refreshes a vblank", d.multiple) : std::string());
             else
                 line = std::format("free-running every {:.3f} ms", s.periodNs / 1e6);
             if (video::VblankTiming::Summary t = timing.Summarize(); t.count)
@@ -1173,7 +1189,7 @@ namespace gpu
                 next = now();
             } while (guesttime::Suspended() || guesttime::PausedNs() != paused);
             bool locked = false;
-            uint64_t slips = 0, count = 0;
+            uint64_t slips = 0, count = 0, holdChanges = 0;
             while (true)
             {
                 next = clock.Next(next);
@@ -1201,11 +1217,12 @@ namespace gpu
                 DispatchInterrupt(thread.ppcContext, 0, 2);
                 timing.Add(fired - next, now() - fired);
                 auto status = clock.GetStatus();
-                if (status.locked != locked || status.slips != slips || ++count % 3600 == 0)
+                if (status.locked != locked || status.slips != slips || status.extraChanges != holdChanges || ++count % 3600 == 0)
                 {
                     LogVblank(status, timing, timerName);
                     locked = status.locked;
                     slips = status.slips;
+                    holdChanges = status.extraChanges;
                 }
             }
         }
