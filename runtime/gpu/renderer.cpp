@@ -5734,6 +5734,8 @@ layout(std430, set = 0, binding = 2) buffer ScaledPool { uint s_pool[]; };
 layout(std430, set = 0, binding = 3) readonly buffer ScaledTable { uint s_table[]; };
 #ifdef TEXTURE_WRITEBACK
 layout(set = 0, binding = 4, r32ui) readonly uniform uimage2D t_image;
+#elif defined(FRONT_DIRECT)
+layout(set = 0, binding = 4, rgba8) writeonly uniform image2D t_image;  // NFSMW_HLE_PRESENT: the presenter's front image
 #else
 layout(set = 0, binding = 4, r32ui) writeonly uniform uimage2D t_image;
 #endif
@@ -6077,6 +6079,30 @@ void main()
         (unorm(px(gx + 2u, gy).r, 255.0) << 16) | (unorm(px(gx + 3u, gy).r, 255.0) << 24);
     uint m = swapWord(w, p.endian);
     memStore(word, m);
+#ifdef FRONT_DIRECT
+    // NFSMW_HLE_PRESENT (study/hle-renderer): the resolve into the front
+    // buffer also stores the pixel as the front buffer's conversion
+    // (kFrontGlsl) would read this word: its endianness (texEndian), format
+    // (texConvert) and swizzle (slotWords), within its size (texWidth,
+    // texHeight).
+    if (bl == 2u && x < p.texWidth && y < p.texHeight)
+    {
+        uint v = swapWord(m, p.texEndian);
+        float c[6];
+        if (p.texConvert == 7u || p.texConvert == 54u)
+        {
+            c[0] = float(v & 0x3FFu) / 1023.0; c[1] = float((v >> 10) & 0x3FFu) / 1023.0;
+            c[2] = float((v >> 20) & 0x3FFu) / 1023.0; c[3] = float(v >> 30) / 3.0;
+        }
+        else
+        {
+            for (int i = 0; i < 4; i++) c[i] = float((v >> (8 * i)) & 0xFFu) / 255.0;
+        }
+        c[4] = 0.0; c[5] = 1.0;
+        vec3 rgb = vec3(c[min(p.slotWords & 7u, 5u)], c[min((p.slotWords >> 3) & 7u, 5u)], c[min((p.slotWords >> 6) & 7u, 5u)]);
+        imageStore(t_image, ivec2(int(x), int(y)), vec4(rgb, 1.0));
+    }
+#else
     // A cached direct 1x texture of this surface: its texel as the untile
     // would read the word (its endianness, D24 -> float). Or (TEX_OFFSET) one
     // holding it whole tiles in: 32-bit texels make a 4 KB tile, and
@@ -6099,6 +6125,7 @@ void main()
         imageStore(t_image, ivec2(int(x), int(y)), uvec4(o, 0u, 0u, 0u));
 #endif
     }
+#endif  // FRONT_DIRECT
 }
 #endif
 )";
@@ -6851,6 +6878,25 @@ void main()
         hle::Intent s_intent;
         bool s_haveIntent = false;
 
+        // NFSMW_HLE_PRESENT=1 (study/hle-renderer, phase 1.4; with
+        // NFSMW_HLE_RESOLVE=1, off by default): the resolve into the front
+        // buffer, a whole 1x one of 32-bit texels into a front buffer a swap
+        // presented lately, also stores the picture into the presenter's
+        // front image, as the swap's conversion would from those guest bytes
+        // (FRONT_DIRECT): the swap then presents that image as it is, without
+        // its conversion (a read of the front buffer's guest bytes, a
+        // dispatch and a full barrier). The guest bytes are still written:
+        // the front image can't give them back (its alpha is 1).
+        const bool s_hlePresent = [] { const char* v = std::getenv("NFSMW_HLE_PRESENT"); return v && v[0] == '1' && hle::Enabled(); }();
+        struct FrontSeen { uint32_t base = 0, pitch = 0, width = 0, height = 0, endian = 0, format = 0, swizzle = 0; uint64_t frame = 0; };
+        FrontSeen s_frontSeen[4];  // the last front buffers presented (tiled, 1x), by base
+        struct FrontDirect { bool pending = false; uint32_t base = 0; uint64_t frame = 0; VkImage image = VK_NULL_HANDLE; };
+        FrontDirect s_frontDirect;  // a front image the resolve stored this frame's picture into
+        VkPipeline s_resolveFrontPipeline = VK_NULL_HANDLE;  // FRONT_DIRECT (made at its first use)
+        // The unscaled front image ring's next image, claimed now for a
+        // resolve's FRONT_DIRECT store (false: no ring of that size yet).
+        bool ClaimFrontForResolve(uint32_t width, uint32_t height, VkImage& image, VkImageView& view);
+
         // What one resolve did ([hle-resolve] lines, NFSMW_HLE_RESOLVE_LOG).
         struct HleNote
         {
@@ -7437,19 +7483,49 @@ void main()
                     }
                     if (textureOnly && !s_resolveTexturePipeline)
                         MakeResolvePipeline(false, 1, 1, &s_resolveTexturePipeline, true);
+                    // NFSMW_HLE_PRESENT (see s_hlePresent).
+                    const FrontSeen* front = nullptr;
+                    if (s_hlePresent && s_haveIntent && !s_intent.cpuLocked && !depthSource && bl == 2 && !scaledWrite && !fused && !textureOnly &&
+                        !coalesced && source->scale.IsOne() && (rc.destBase & 0xFFFu) == 0 && r.x0 == 0 && r.y0 == 0)
+                        for (const FrontSeen& f : s_frontSeen)
+                            if (f.base == rc.destBase && f.pitch == rc.destPitch && f.frame + 4 >= s_frame && uint32_t(r.x1) >= f.width &&
+                                uint32_t(r.y1) >= f.height)
+                                front = &f;
+                    VkImage frontImage = VK_NULL_HANDLE;
+                    VkDescriptorImageInfo fi{ VK_NULL_HANDLE, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL };
+                    if (front && ClaimFrontForResolve(front->width, front->height, frontImage, fi.imageView))
+                    {
+                        if (!s_resolveFrontPipeline)
+                            MakeResolvePipeline(false, 1, 1, &s_resolveFrontPipeline, false, 3);
+                        rc.texEndian = front->endian;
+                        rc.texConvert = front->format;
+                        rc.texWidth = front->width;
+                        rc.texHeight = front->height;
+                        rc.slotWords = front->swizzle;
+                        w[4].pImageInfo = &fi;
+                        FullBarrier();  // (as the swap's conversion: after the presenter's last read of the image)
+                        note.presented = true;
+                        s_hle.presented += s_hleCounting;
+                        LogOnce(0x3420, "the resolve into the front buffer stores the picture into the front image too (NFSMW_HLE_PRESENT; "
+                            "the first: %ux%u at %08X)", front->width, front->height, rc.destBase);
+                    }
+                    else
+                        front = nullptr;
                     if (s_profiling)
                     {
                         char desc[160];
-                        snprintf(desc, sizeof(desc), "resolve %ux%u@%d,%d p%u fmt %u to %08X %s%s%s%s", rc.width, rc.height, rc.originX,
+                        snprintf(desc, sizeof(desc), "resolve %ux%u@%d,%d p%u fmt %u to %08X %s%s%s%s%s", rc.width, rc.height, rc.originX,
                             rc.originY, pitch, format, rc.destBase, depthSource ? "depth " : "",
                             scaledWrite ? std::format("scaled {}", gpu::ScaleName(source->scale)).c_str()
                             : !source->scale.IsOne() ? "1x (from a scaled target)" : "1x", fused ? " fused" : "",
-                            rename ? ", renamed (NFSMW_HLE_RENAME)" : textureOnly ? ", texture only (deferred)" : "");
+                            rename ? ", renamed (NFSMW_HLE_RENAME)" : textureOnly ? ", texture only (deferred)" : "",
+                            front ? ", to the presenter" : "");
                         ProfileCompute(desc);
                     }
                     if (!rename)
                     {
-                        vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, textureOnly ? s_resolveTexturePipeline : ResolvePipeline(coalesced, source->scale));
+                        vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, textureOnly ? s_resolveTexturePipeline
+                            : front ? s_resolveFrontPipeline : ResolvePipeline(coalesced, source->scale));
                         s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_resolveLayout, 0, AddSharedParts(w, 5), w);
                         vkCmdPushConstants(s_cmd, s_resolveLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, s_resolvePush, &rc);
                         uint32_t perWord = bl >= 2 ? 1 : (4 >> bl);
@@ -7470,6 +7546,8 @@ void main()
                             ResolveBarrier(rangeBase, rangeBytes, fused ? fused->guestStart : 0);
                     }
                     ProfileComputeEnd();
+                    if (front)
+                        s_frontDirect = { true, rc.destBase, s_frame, frontImage };
                     if (checkColour)
                         CheckColourWriteback(rc, fused, layer, rangeBase, rangeBytes);
                     if (s_logShadowMap && depthSource && pitch == 1600 && bl == 2)
@@ -8200,6 +8278,20 @@ void main()
             const char* v = std::getenv("NFSMW_FRONT_IMAGES");
             return v ? std::clamp(std::atoi(v), 1, gpu::kMaxFrontImages) : gpu::kFrontImages;
         }();
+
+        bool ClaimFrontForResolve(uint32_t width, uint32_t height, VkImage& image, VkImageView& view)
+        {
+            FrontRing& ring = s_front;
+            if (ring.width != width || ring.height != height || !ring.images[0].image)
+                return false;
+            std::array<VkImage, gpu::kMaxFrontImages> handles{};
+            for (int i = 0; i < s_frontImages; i++)
+                handles[i] = ring.images[i].image;
+            const Image& front = ring.images[video::ClaimFrontImage(handles.data(), s_frontImages)];
+            image = front.image;
+            view = front.view;
+            return true;
+        }
         // The image the last PresentFrontBuffer wrote, for ReadBackFrontImage
         // (the timedemo's shots); null once destroyed.
         struct LastFront
@@ -8248,12 +8340,14 @@ void main()
         // The resolve shader for sources whose scale has these denominators
         // (1, 2, 4 or 8 each; the shader's SB_DEN_X, SB_DEN_Y), into `out`;
         // `textureOnly`: its TEXTURE_ONLY variant, `writeback` 1 its
-        // TEXTURE_WRITEBACK one, 2 that with WRITEBACK_CHECK (whole scales).
+        // TEXTURE_WRITEBACK one, 2 that with WRITEBACK_CHECK (whole scales),
+        // 3 FRONT_DIRECT (NFSMW_HLE_PRESENT).
         void MakeResolvePipeline(bool coalesced, uint32_t denX, uint32_t denY, VkPipeline* out, bool textureOnly, uint32_t writeback)
         {
             std::string log;
             std::string preamble = coalesced ? "#define COALESCED\n" : textureOnly ? "#define TEXTURE_ONLY\n"
-                : writeback == 2 ? "#define TEXTURE_WRITEBACK\n#define WRITEBACK_CHECK\n" : writeback ? "#define TEXTURE_WRITEBACK\n" : "";
+                : writeback == 2 ? "#define TEXTURE_WRITEBACK\n#define WRITEBACK_CHECK\n" : writeback == 3 ? "#define FRONT_DIRECT\n"
+                : writeback ? "#define TEXTURE_WRITEBACK\n" : "";
             if (s_resolvePush != offsetof(ResolveConstants, texX))
                 preamble += "#define TEX_OFFSET\n";
             if (denX != 1)
@@ -11716,7 +11810,28 @@ void main()
             pc.scaled = 1;
             s_scaled.untiledBytes += uint64_t(outW) * outH * 4;
         }
-        else
+        // NFSMW_HLE_PRESENT (study/hle-renderer): this front buffer as a
+        // resolve may store it into a front image (FRONT_DIRECT, see
+        // s_hlePresent), and whether one did this frame: then that image is
+        // the picture, written already.
+        int directImage = -1;
+        if (!scaled && pc.tiled && !showTexture[0] && s_hlePresent)
+        {
+            FrontSeen* slot = &s_frontSeen[0];
+            for (FrontSeen& f : s_frontSeen)
+                if (f.frame < slot->frame)
+                    slot = &f;
+            for (FrontSeen& f : s_frontSeen)
+                if (f.base == pc.base)
+                    slot = &f;
+            *slot = { pc.base, pc.pitch, width, height, pc.endian, pc.format, pc.swizzle, s_frame };
+            if (s_frontDirect.pending && s_frontDirect.base == pc.base && s_frontDirect.frame == s_frame)
+                for (int i = 0; i < s_frontImages; i++)
+                    if (ring.images[i].image == s_frontDirect.image)
+                        directImage = i;
+        }
+        s_frontDirect.pending = false;
+        if (!scaled && directImage < 0)
             EnsureShadow(pc.base, frontBytes);
         EndPass(kBreakPresent);
         Begin();
@@ -11726,32 +11841,47 @@ void main()
         // refresh), nor (while another is free) the frame waiting for it,
         // which stays takeable until here. The presenter can't take the
         // image chosen until SubmitFrontImage hands it over, after the write.
+        // (NFSMW_HLE_PRESENT: the one the resolve claimed and wrote.)
         std::array<VkImage, gpu::kMaxFrontImages> handles{};
         for (int i = 0; i < s_frontImages; i++)
             handles[i] = ring.images[i].image;
-        Image& front = ring.images[video::ClaimFrontImage(handles.data(), s_frontImages)];
-        VkDescriptorImageInfo ii{ VK_NULL_HANDLE, front.view, VK_IMAGE_LAYOUT_GENERAL };
-        VkDescriptorBufferInfo pool = DummyStorage(s_scaled.pool);
-        VkDescriptorBufferInfo table = DummyStorage(s_scaled.table);
-        VkWriteDescriptorSet w[7] = {
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &s_sharedInfo[0], nullptr },
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ii, nullptr, nullptr },
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &pool, nullptr },
-            { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &table, nullptr },
-        };
-        ComputeWorkRecorded();
-        if (s_profiling)
-            ProfileCompute(std::format("front buffer {}x{} at {:08X}{}", outW, outH, pc.base, scaled ? " (scaled memory)" : "").c_str());
-        vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_frontPipeline);
-        s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_frontLayout, 0, AddSharedParts(w, 4), w);
-        vkCmdPushConstants(s_cmd, s_frontLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-        vkCmdDispatch(s_cmd, (outW + 7) / 8, (outH + 7) / 8, 1);
-        GuardGpu(pc.base, frontBytes, false, "front buffer");
-        FullBarrier();
-        ProfileComputeEnd();
-        SubmitRecorded(7);  // the presenter's blit comes later in queue order
-        video::SubmitFrontImage(front.image, outW, outH, width, height);
-        s_lastFront = { front.image, outW, outH };
+        Image& front = ring.images[directImage >= 0 ? directImage : video::ClaimFrontImage(handles.data(), s_frontImages)];
+        if (directImage >= 0)
+        {
+            if (s_profiling)
+            {
+                ProfileCompute(std::format("front buffer {}x{} at {:08X}: the resolve's (NFSMW_HLE_PRESENT)", outW, outH, pc.base).c_str());
+                ProfileComputeEnd();
+            }
+            SubmitRecorded(7);
+            video::SubmitFrontImage(front.image, outW, outH, width, height);
+            s_lastFront = { front.image, outW, outH };
+        }
+        else
+        {
+            VkDescriptorImageInfo ii{ VK_NULL_HANDLE, front.view, VK_IMAGE_LAYOUT_GENERAL };
+            VkDescriptorBufferInfo pool = DummyStorage(s_scaled.pool);
+            VkDescriptorBufferInfo table = DummyStorage(s_scaled.table);
+            VkWriteDescriptorSet w[7] = {
+                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 0, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &s_sharedInfo[0], nullptr },
+                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ii, nullptr, nullptr },
+                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 2, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &pool, nullptr },
+                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 3, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, nullptr, &table, nullptr },
+            };
+            ComputeWorkRecorded();
+            if (s_profiling)
+                ProfileCompute(std::format("front buffer {}x{} at {:08X}{}", outW, outH, pc.base, scaled ? " (scaled memory)" : "").c_str());
+            vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_frontPipeline);
+            s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_frontLayout, 0, AddSharedParts(w, 4), w);
+            vkCmdPushConstants(s_cmd, s_frontLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+            vkCmdDispatch(s_cmd, (outW + 7) / 8, (outH + 7) / 8, 1);
+            GuardGpu(pc.base, frontBytes, false, "front buffer");
+            FullBarrier();
+            ProfileComputeEnd();
+            SubmitRecorded(7);  // the presenter's blit comes later in queue order
+            video::SubmitFrontImage(front.image, outW, outH, width, height);
+            s_lastFront = { front.image, outW, outH };
+        }
         // Back at 1x (a live change): the host-resolution images are no
         // longer needed. The presenter has this frame to show instead.
         if (!scaled && s_frontScaled.width && s_renderScale.IsOne())
