@@ -830,6 +830,9 @@ namespace gpu::renderer
         uint8_t s_passBreakSubmit = 0;            // and, a submit, its site
         const void* s_lastPassTargets[5] = {};    // that pass's colour targets and depth
         void EndPass(PassBreak why = kBreakOther);
+        // NFSMW_RESOLVE_RENAME: a target's image is destroyed: views of it
+        // go, and a texture renamed to it samples its own image again.
+        void ForgetRenamedImage(VkImage image);
         // Bumped when the command buffer's graphics state is unknown (a new
         // command buffer; without CP_OPT_KEEP_BINDINGS also compute work,
         // which shares the push constants).
@@ -2409,6 +2412,7 @@ namespace gpu::renderer
 
         void DestroyTarget(RenderTarget& rt)
         {
+            ForgetRenamedImage(rt.image.image);
             if (rt.sampleView && rt.sampleView != rt.image.view)
                 vkDestroyImageView(s_dev, rt.sampleView, nullptr);
             rt.sampleView = VK_NULL_HANDLE;
@@ -6594,7 +6598,9 @@ void main()
         //   alignment only (the bloom chain's 320x180 and 160x90 at 184 and
         //   96 rows: D3D resolves those surfaces whole, the hardware's
         //   rectangle is 8-pixel aligned): the words past it, outside the
-        //   texture, stay as they were.
+        //   texture, stay as they were. Nothing reads them in the race
+        //   (NFSMW_RESOLVE_USE: those resolves' bytes are all dead); the
+        //   check below doesn't compare them.
         // NFSMW_RESOLVE_LAZY=2 checks it as NFSMW_RESOLVE_DEFER_COLOR=2 does:
         // stored as before, then compared with what the write-back writes.
         const int s_hleLazyMode = [] {
@@ -6616,6 +6622,12 @@ void main()
         // each frame: the cached lookups of that texture alone are made
         // again (ForgetTextureLookups).
         const bool s_hleRename = [] { const char* v = std::getenv("NFSMW_RESOLVE_RENAME"); return v && v[0] == '1'; }();
+        // A depth image going back to the spares (its deferred resolve
+        // written, replaced or out of room): a texture renamed to it gets its
+        // own texels first, else the next defer to take that spare as its
+        // target would draw into what the texture samples. `except`: the
+        // texture this very resolve renames again.
+        void ReleaseRenamedImage(VkImage image, const Texture* except = nullptr);
         struct ColourCheck
         {
             VkBuffer buffer = VK_NULL_HANDLE;
@@ -6760,7 +6772,10 @@ void main()
             writewatch::MarkGpuOwned(d.rangeBase, d.rangeBytes);
             writewatch::DeferredWritten(d.rangeBase, d.rangeBytes);
             if (!colour)
+            {
+                ReleaseRenamedImage(d.image.image);
                 s_spareTargets.push_back({ d.image, d.sampleView, d.format, d.width, d.height });
+            }
             LogOnce(0x3300, "deferred resolve to %08X (%ux%u) written: something reads its guest bytes", rc.destBase, rc.width, rc.height);
         }
 
@@ -6873,7 +6888,7 @@ void main()
         // texels stored first from the renamed one as the resolve would have
         // stored them (TEXTURE_ONLY with that resolve's constants).
         struct RenameSource { ResolveConstants rc; VkImageView depthView; };
-        std::unordered_map<const Texture*, RenameSource> s_renameSources;
+        std::unordered_map<Texture*, RenameSource> s_renameSources;
         void MaterializeRename(Texture& t)
         {
             if (!t.renamedImage)
@@ -6898,6 +6913,42 @@ void main()
             ForgetTextureLookups(&t);
         }
 
+        void ReleaseRenamedImage(VkImage image, const Texture* except)
+        {
+            std::vector<Texture*> renamed;
+            for (auto& [t, source] : s_renameSources)
+                if (t != except && t->renamedImage == image)
+                    renamed.push_back(t);
+            for (Texture* t : renamed)
+                MaterializeRename(*t);
+        }
+
+        void ForgetRenamedImage(VkImage image)
+        {
+            if (!image)
+                return;
+            for (auto it = s_renameViews.begin(); it != s_renameViews.end();)
+                if (it->first.first == image)
+                {
+                    vkDestroyImageView(s_dev, it->second, nullptr);
+                    it = s_renameViews.erase(it);
+                }
+                else
+                    ++it;
+            for (auto it = s_renameSources.begin(); it != s_renameSources.end();)
+                if (it->first->renamedImage == image)
+                {
+                    // (Its own texels are stale: the next resolve into it
+                    // stores them, every frame for shadow map 2.)
+                    it->first->renamedImage = VK_NULL_HANDLE;
+                    ForgetTextureLookups(it->first);
+                    s_renameDrops++;
+                    it = s_renameSources.erase(it);
+                }
+                else
+                    ++it;
+        }
+
         // NFSMW_RESOLVE_PRESENT=1 (off by default): the resolve into the front
         // buffer, a whole 1x one of 32-bit texels into a front buffer a swap
         // presented lately, also stores the picture into the presenter's
@@ -6905,12 +6956,26 @@ void main()
         // (FRONT_DIRECT): the swap then presents that image as it is, without
         // its conversion (a read of the front buffer's guest bytes and a
         // dispatch; its full barrier moves to the resolve). The guest bytes
-        // are still written:
-        // the front image can't give them back (its alpha is 1).
+        // are still written: the front image can't give them back (its alpha
+        // is 1). Claimed at the resolve, the image takes back a frame waiting
+        // for the presenter a moment before the swap would. A front buffer
+        // written again before the swap (a resolve, the CPU), or presented
+        // in another format, takes the conversion as before.
         const bool s_hlePresent = [] { const char* v = std::getenv("NFSMW_RESOLVE_PRESENT"); return v && v[0] == '1'; }();
         struct FrontSeen { uint32_t base = 0, pitch = 0, width = 0, height = 0, endian = 0, format = 0, swizzle = 0; uint64_t frame = 0; };
         FrontSeen s_frontSeen[4];  // the last front buffers presented (tiled, 1x), by base
-        struct FrontDirect { bool pending = false; uint32_t base = 0; uint64_t frame = 0; VkImage image = VK_NULL_HANDLE; };
+        // (And what it was stored as: a front buffer written since, by a
+        // resolve or the CPU, or presented otherwise, takes the conversion.)
+        struct FrontDirect
+        {
+            bool pending = false;
+            uint32_t base = 0;
+            uint64_t frame = 0;
+            VkImage image = VK_NULL_HANDLE;
+            uint64_t written = 0;  // the resolve's write sequence
+            uint32_t rangeBase = 0, rangeBytes = 0;
+            FrontSeen as;
+        };
         FrontDirect s_frontDirect;  // a front image the resolve stored this frame's picture into
         VkPipeline s_resolveFrontPipeline = VK_NULL_HANDLE;  // FRONT_DIRECT (made at its first use)
         // The unscaled front image ring's next image, claimed now for a
@@ -7446,7 +7511,8 @@ void main()
                         const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
                         return (fp.optimalTilingFeatures & need) == need;
                     }();
-                    const bool rename = s_hleRename && defer && !cpulocks::LockedLately(fused->guestStart) && fused->levels == 1 && !fused->cube && !fused->volume && fused->convert == 4 &&
+                    const bool rename = s_hleRename && defer && !cpulocks::LockedLately(fused->guestStart) && rc.endian == fused->endian &&
+                        fused->levels == 1 && !fused->cube && !fused->volume && fused->convert == 4 &&
                         fused->width == source->width && fused->height == source->height && source->vkFormat == VK_FORMAT_D32_SFLOAT_S8_UINT &&
                         renameSampleable;
                     // A renamed texture this resolve stores into after all:
@@ -7540,9 +7606,14 @@ void main()
                         else
                             ResolveBarrier(rangeBase, rangeBytes, fused ? fused->guestStart : 0);
                     }
+                    else
+                        ResolveBarrier(0, 0, fused->guestStart);  // (its texture now holds the pass's depth writes)
                     ProfileComputeEnd();
                     if (front)
-                        s_frontDirect = { true, rc.destBase, s_frame, frontImage };
+                        s_frontDirect = { true, rc.destBase, s_frame, frontImage, 0, rangeBase, rangeBytes, *front };
+                    else if (s_frontDirect.pending && uint64_t(rangeBase) < uint64_t(s_frontDirect.rangeBase) + s_frontDirect.rangeBytes &&
+                        uint64_t(s_frontDirect.rangeBase) < uint64_t(rangeBase) + rangeBytes)
+                        s_frontDirect.pending = false;  // another resolve into it
                     if (checkColour)
                         CheckColourWriteback(rc, fused, layer, rangeBase, rangeBytes);
                     if (s_logShadowMap && depthSource && pitch == 1600 && bl == 2)
@@ -7561,6 +7632,8 @@ void main()
                                     siblings.push_back(q);
                     }
                     uint64_t written = writewatch::MarkWritten(rangeBase, rangeBytes, writewatch::Writer::kResolve, rc.destBase);
+                    if (front)
+                        s_frontDirect.written = written;
                     // The fused texture holds this write: its pages' sequence
                     // now, and any write after it is newer (0: per-page
                     // sequences, NFSMW_WATCH_RANGES=0, so it is loaded again).
@@ -7614,7 +7687,10 @@ void main()
                         s_deferReplaced++;
                         writewatch::DeferredWritten(replaced->rangeBase, replaced->rangeBytes);
                         if (!replaced->texture)
+                        {
+                            ReleaseRenamedImage(replaced->image.image, rename ? fused : nullptr);
                             s_spareTargets.push_back({ replaced->image, replaced->sampleView, replaced->format, replaced->width, replaced->height });
+                        }
                     }
                     for (const DeferredResolve& c : covered)
                     {
@@ -11757,6 +11833,7 @@ void main()
             }
             ring.width = outW;
             ring.height = outH;
+            s_frontDirect.pending = false;  // (its image is gone)
             fprintf(stderr, "[renderer] front images %ux%u (%s), %d of them\n", outW, outH, scaled ? "host resolution" : "1x", s_frontImages);
         }
         if (scaled)
@@ -11786,7 +11863,10 @@ void main()
                 if (f.base == pc.base)
                     slot = &f;
             *slot = { pc.base, pc.pitch, width, height, pc.endian, pc.format, pc.swizzle, s_frame };
-            if (s_frontDirect.pending && s_frontDirect.base == pc.base && s_frontDirect.frame == s_frame)
+            const FrontSeen& as = s_frontDirect.as;
+            if (s_frontDirect.pending && s_frontDirect.base == pc.base && s_frontDirect.frame == s_frame && as.pitch == pc.pitch &&
+                as.width == width && as.height == height && as.endian == pc.endian && as.format == pc.format && as.swizzle == pc.swizzle &&
+                s_frontDirect.written && !writewatch::WrittenSince(pc.base, frontBytes, s_frontDirect.written))
                 for (int i = 0; i < s_frontImages; i++)
                     if (ring.images[i].image == s_frontDirect.image)
                         directImage = i;
@@ -11802,24 +11882,15 @@ void main()
         // refresh), nor (while another is free) the frame waiting for it,
         // which stays takeable until here. The presenter can't take the
         // image chosen until SubmitFrontImage hands it over, after the write.
-        // (NFSMW_RESOLVE_PRESENT: the one the resolve claimed and wrote.)
-        std::array<VkImage, gpu::kMaxFrontImages> handles{};
-        for (int i = 0; i < s_frontImages; i++)
-            handles[i] = ring.images[i].image;
-        Image& front = ring.images[directImage >= 0 ? directImage : video::ClaimFrontImage(handles.data(), s_frontImages)];
-        if (directImage >= 0)
+        // (NFSMW_RESOLVE_PRESENT: the one the resolve claimed and wrote,
+        // directImage, written already: handed over as it is.)
+        Image* written = nullptr;
+        if (directImage < 0)
         {
-            if (s_profiling)
-            {
-                ProfileCompute(std::format("front buffer {}x{} at {:08X}: the resolve's (NFSMW_RESOLVE_PRESENT)", outW, outH, pc.base).c_str());
-                ProfileComputeEnd();
-            }
-            SubmitRecorded(7);
-            video::SubmitFrontImage(front.image, outW, outH, width, height);
-            s_lastFront = { front.image, outW, outH };
-        }
-        else
-        {
+            std::array<VkImage, gpu::kMaxFrontImages> handles{};
+            for (int i = 0; i < s_frontImages; i++)
+                handles[i] = ring.images[i].image;
+            Image& front = ring.images[video::ClaimFrontImage(handles.data(), s_frontImages)];
             VkDescriptorImageInfo ii{ VK_NULL_HANDLE, front.view, VK_IMAGE_LAYOUT_GENERAL };
             VkDescriptorBufferInfo pool = DummyStorage(s_scaled.pool);
             VkDescriptorBufferInfo table = DummyStorage(s_scaled.table);
@@ -11842,7 +11913,22 @@ void main()
             SubmitRecorded(7);  // the presenter's blit comes later in queue order
             video::SubmitFrontImage(front.image, outW, outH, width, height);
             s_lastFront = { front.image, outW, outH };
+            written = &front;
         }
+        else
+        {
+            Image& front = ring.images[directImage];
+            if (s_profiling)
+            {
+                ProfileCompute(std::format("front buffer {}x{} at {:08X}: the resolve's (NFSMW_RESOLVE_PRESENT)", outW, outH, pc.base).c_str());
+                ProfileComputeEnd();
+            }
+            SubmitRecorded(7);
+            video::SubmitFrontImage(front.image, outW, outH, width, height);
+            s_lastFront = { front.image, outW, outH };
+            written = &front;
+        }
+        Image& front = *written;
         // Back at 1x (a live change): the host-resolution images are no
         // longer needed. The presenter has this frame to show instead.
         if (!scaled && s_frontScaled.width && s_renderScale.IsOne())
@@ -12056,11 +12142,11 @@ void main()
             writewatch::SetWriterFrame(frame);
         }
         s_frame = frame;
+        if (s_vk)
+            TrimTextureCache();
         // NFSMW_RESOLVE_STATS's window.
         s_hleCounting = s_hleWindow.second > s_hleWindow.first && frame >= s_hleWindow.first && frame < s_hleWindow.second;
         s_hle.frames += s_hleCounting;
-        if (s_vk)
-            TrimTextureCache();
         if (s_vk)
             PrewarmStep();  // (until the key list's pipelines are made)
         if (s_zpdOn)

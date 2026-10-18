@@ -19,6 +19,10 @@ namespace cpulocks
     {
         if (!texture)
             return;
+        // A level whose type bits are 4 stands for its parent at +44 (as
+        // sub_82589398 takes it; game/exposure_lock.cpp).
+        if ((PPC_LOAD_U32(texture) & 0x00070000) == 0x00040000 && PPC_LOAD_U32(texture + 44))
+            texture = PPC_LOAD_U32(texture + 44);
         // D3DBaseTexture: the fetch constant at +16; its second word holds
         // the base address (>> 12), in a physical window (A0000000 and up).
         const uint32_t physical = ((PPC_LOAD_U32(texture + 20) >> 12) << 12) & 0x1FFFFFFF;
