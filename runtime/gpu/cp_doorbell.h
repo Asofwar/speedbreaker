@@ -136,4 +136,66 @@ namespace gpu
 
     // The command processor's (gpu/command_processor.cpp sleeps on it).
     inline Doorbell g_cpDoorbell;
+
+    // A doorbell for any number of waiters: guest threads in D3D's GPU wait
+    // loops (debug/d3d_waits.cpp), which poll guest memory the GPU side
+    // stores to (a fence, the ring's read pointer write-back) or an
+    // interrupt handler does. Each such store rings it after it is made
+    // (command_processor.cpp). A waiter reads Rings() before its check of
+    // what it waits for, and after a check that found it not done yet Waits
+    // on that count: a ring since then ends the Wait at once.
+    class alignas(64) WaitBell
+    {
+    public:
+        // Any thread, after a store a waiter may check (async-signal-safe).
+        void Ring()
+        {
+            // Sequentially consistent against Wait's announcement: either this
+            // sees a sleeper (and wakes them all), or the sleeper's count read
+            // after announcing itself sees this ring (and it doesn't sleep).
+            m_rings.fetch_add(1, std::memory_order_seq_cst);
+            if (m_sleepers.load(std::memory_order_seq_cst) != 0) [[unlikely]]
+                Wake();
+        }
+
+        uint32_t Rings() const
+        {
+            return m_rings.load(std::memory_order_seq_cst);
+        }
+
+        // Sleeps until a ring after `rings` was read, or for `timeout`.
+        void Wait(uint32_t rings, std::chrono::nanoseconds timeout)
+        {
+            m_sleepers.fetch_add(1, std::memory_order_seq_cst);
+            if (timeout.count() > 0 && m_rings.load(std::memory_order_seq_cst) == rings)
+            {
+#ifdef __linux__
+                struct timespec ts{ time_t(timeout.count() / 1'000'000'000), long(timeout.count() % 1'000'000'000) };
+                syscall(SYS_futex, Word(), FUTEX_WAIT_PRIVATE, rings, &ts, nullptr, 0);
+#else
+                std::this_thread::sleep_for(timeout);
+#endif
+            }
+            m_sleepers.fetch_sub(1, std::memory_order_relaxed);
+        }
+
+    private:
+        void Wake()
+        {
+#ifdef __linux__
+            syscall(SYS_futex, Word(), FUTEX_WAKE_PRIVATE, 0x7FFFFFFF, nullptr, nullptr, 0);
+#endif
+        }
+
+        uint32_t* Word()
+        {
+            return reinterpret_cast<uint32_t*>(&m_rings);
+        }
+
+        std::atomic<uint32_t> m_rings{ 0 };
+        std::atomic<uint32_t> m_sleepers{ 0 };
+    };
+
+    // Stores the game's D3D waits poll for (see WaitBell).
+    inline WaitBell g_gpuProgress;
 }

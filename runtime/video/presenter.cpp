@@ -11,6 +11,7 @@
 #include <game/ultrawide.h>
 #include "gpu_choice.h"
 #include "present_schedule.h"
+#include "swapchain_use.h"
 #include "picture_fit.h"
 #include "frame_rate.h"
 #include "swapchain_policy.h"
@@ -19,14 +20,20 @@
 #include <cpu/guest_time.h>
 #include "vblank_lock.h"
 #include "display_tone.h"
+#include "fsr1.h"
+#include "upscale.h"
 #include <gpu/front_ring.h>
 #include <ui/ui.h>
 #if defined(__APPLE__) && TARGET_OS_IOS
 #include <platform/ios_ui.h>
 #endif
+#if defined(__APPLE__) && !TARGET_OS_IOS
+#include <platform/macos_window.h>
+#endif
 #include <user/settings.h>
 #include <report/report.h>
 #include <platform/thermal.h>
+#include <platform/quit_signals.h>
 #include <kernel/memory_status.h>
 
 #include <SDL3/SDL.h>
@@ -111,12 +118,20 @@ namespace video
             VkDeviceSize stagingSize = 0;
             VkImageView sourceView = VK_NULL_HANDLE;  // this frame's view of the presented image
             bool timed = false;                       // wrote its post-processing timestamps
+            upscale::Pass pass = upscale::Pass::Bicubic;  // the pass it drew with (NFSMW_UPSCALE_AB)
         } s_frames[FRAMES_IN_FLIGHT];
         // NFSMW_GPU_TIMING=1: 3 timestamps per frame slot around the
         // post-processing (before, after AA, after the scale and UI pass).
         VkQueryPool s_timestamps = VK_NULL_HANDLE;
         double s_timestampPeriod = 1.0;
         std::atomic<uint64_t> s_postFrames{ 0 }, s_postAaNs{ 0 }, s_postNs{ 0 };
+        // NFSMW_UPSCALE_AB=1 (a diagnostic, with NFSMW_GPU_TIMING=1): frames
+        // the FSR 1 setting enlarges alternate between FSR 1 and bicubic, one
+        // frame each, and an [upscale-ab] line every 600 timed frames gives
+        // each pass's post-processing GPU time per frame (anti-aliasing and
+        // the UI included, as in [perf]): the same scenes, the same clocks.
+        const bool s_upscaleAb = [] { const char* v = std::getenv("NFSMW_UPSCALE_AB"); return v && v[0] == '1'; }();
+        uint64_t s_abFrames[3]{}, s_abNs[3]{}, s_abAaNs[3]{};  // by upscale::Pass; main thread
         std::vector<VkSemaphore> s_renderDone;  // one per swapchain image
         std::mutex s_queueMutex;
         VulkanContext s_context{};
@@ -444,15 +459,17 @@ namespace video
         // screen for more refreshes than the game gave it vblanks (repeated).
         // The waits run beside presents to the same swapchain, as the
         // extension is used: the WSIs synchronise the two internally (Mesa's,
-        // MoltenVK's), though the spec leaves that to the caller. Destroying
-        // a swapchain waits until no wait is on it.
+        // MoltenVK's), though the spec leaves that to the caller. The waiter
+        // uses a swapchain (its waits, the driver's reports) only through
+        // s_swapchainUse, and destroying one waits until no use is on it
+        // (video/swapchain_use.h).
         bool s_presentTiming = false;
         PFN_vkWaitForPresentKHR s_waitForPresent = nullptr;
         uint64_t s_presentId = 0;  // main thread: the last present's
         struct PresentTiming
         {
             uint64_t id;
-            VkSwapchainKHR swapchain;
+            uint64_t swapchain;  // its generation (s_swapchainUse)
             int64_t presented;  // vkQueuePresentKHR (ns, steady clock)
             int64_t vblank;     // a new game frame: the guest vblank it followed; 0: a redraw
         };
@@ -462,8 +479,10 @@ namespace video
         std::mutex& s_timingMutex = *new std::mutex;
         std::condition_variable& s_timingCv = *new std::condition_variable;
         std::deque<PresentTiming>& s_timings = *new std::deque<PresentTiming>;  // presented, not yet seen on screen
-        std::mutex s_waitSwapchainMutex;      // held by the waiter while it waits
-        VkSwapchainKHR s_waitSwapchain = VK_NULL_HANDLE;  // the one it may wait on
+        // The swapchain the waiter may use (never destroyed either), and its
+        // generation (main thread; 0: none).
+        SwapchainUse<VkSwapchainKHR>& s_swapchainUse = *new SwapchainUse<VkSwapchainKHR>;
+        uint64_t s_swapchainGeneration = 0;
         FILE* s_timingLog = nullptr;          // NFSMW_VBLANK_LOG=<file>: one CSV line per present
 
         // macOS: a new frame may be shown a set time after the guest vblank
@@ -488,8 +507,9 @@ namespace video
         uint32_t s_displayTimingId = 0;  // main thread
         // The decision and the watchdog (main thread: Wanted; the waiter:
         // the driver's reports), and the frames shown at a time not reported
-        // on yet: present id -> the time asked for (steady clock).
-        std::mutex s_scheduleMutex;
+        // on yet: present id -> the time asked for (steady clock). The
+        // mutex is never destroyed (the waiter may be in it at exit).
+        std::mutex& s_scheduleMutex = *new std::mutex;
         PresentSchedule s_schedule;
         struct ScheduledPresent
         {
@@ -526,18 +546,23 @@ namespace video
         // for): the driver's reports on the presents shown since the last
         // call, to NFSMW_VBLANK_LOG's .actual.csv and, for frames shown at a
         // time, to the watchdog; and `t`, if shown at a time, counted as
-        // presented (the driver reports it a present or so later).
+        // presented (the driver reports it a present or so later). The
+        // reports are read only while `t`'s swapchain is the current one,
+        // and it isn't destroyed under the read: a swapchain destroyed since
+        // the wait (a fullscreen toggle, a resize) has none left to read.
         void ReadDriverReports(const PresentTiming& t)
         {
             uint32_t count = 0;
             std::vector<VkPastPresentationTimingGOOGLE> past;
-            if (s_pastTiming(s_device, t.swapchain, &count, nullptr) == VK_SUCCESS && count)
-            {
-                past.resize(count);
-                if (s_pastTiming(s_device, t.swapchain, &count, past.data()) < VK_SUCCESS)
-                    count = 0;
-                past.resize(count);
-            }
+            s_swapchainUse.Use(t.swapchain, [&](VkSwapchainKHR swapchain) {
+                if (s_pastTiming(s_device, swapchain, &count, nullptr) == VK_SUCCESS && count)
+                {
+                    past.resize(count);
+                    if (s_pastTiming(s_device, swapchain, &count, past.data()) < VK_SUCCESS)
+                        count = 0;
+                    past.resize(count);
+                }
+            });
             const int64_t hostToSteady = HostToSteadyNs();
             bool tripped = false;
             {
@@ -640,16 +665,26 @@ namespace video
                     t = s_timings.front();
                 }
                 int64_t start = NowNs();
-                VkResult r = VK_ERROR_OUT_OF_DATE_KHR;
-                {
-                    std::lock_guard lock(s_waitSwapchainMutex);
-                    if (t.swapchain == s_waitSwapchain)
-                        r = s_waitForPresent(s_device, t.swapchain, t.id, 50'000'000);
-                }
-                // (Out of the swapchain lock: the main thread takes it to
-                // build a swapchain.)
+                VkResult r = VK_ERROR_OUT_OF_DATE_KHR;  // its swapchain is gone
+                s_swapchainUse.Use(t.swapchain, [&](VkSwapchainKHR swapchain) {
+                    r = s_waitForPresent(s_device, swapchain, t.id, 50'000'000);
+                });
                 if (r == VK_ERROR_DEVICE_LOST)
-                    DeviceLost("vkWaitForPresentKHR (the present waiter)");
+                {
+                    // Not necessarily the device's: on a Steam Deck in Game
+                    // Mode at a 5 W TDP limit the present wait returned it
+                    // now and then (2 of 7 races) with nothing in the
+                    // kernel's log, no GPU timeout or reset. A device really
+                    // lost fails the renderer's fence waits and the
+                    // presenter's acquire, submit and present too, which say
+                    // so (DeviceLost); here only that frame's timing goes.
+                    static std::atomic<uint64_t> s_lostWaits{ 0 };
+                    const uint64_t n = s_lostWaits.fetch_add(1, std::memory_order_relaxed) + 1;
+                    if ((n & (n - 1)) == 0)  // the 1st, 2nd, 4th, 8th...
+                        fprintf(stderr, "[video] vkWaitForPresentKHR returned VK_ERROR_DEVICE_LOST for present %llu (%llu so far): "
+                                        "its timing dropped; the device draws on unless its own calls fail\n",
+                            (unsigned long long)t.id, (unsigned long long)n);
+                }
                 int64_t now = NowNs();
                 {
                     std::lock_guard lock(s_timingMutex);
@@ -723,10 +758,10 @@ namespace video
         void DestroySwapchain()
         {
             {
-                std::lock_guard wait(s_waitSwapchainMutex);  // the waiter is off it after this
-                s_waitSwapchain = VK_NULL_HANDLE;
+                s_swapchainUse.Retire();  // the waiter is off it after this, and stays off
                 std::lock_guard lock(s_timingMutex);
-                std::erase_if(s_timings, [](const PresentTiming& t) { return t.swapchain == s_swapchain; });
+                std::erase_if(s_timings, [](const PresentTiming& t) { return t.swapchain == s_swapchainGeneration; });
+                s_swapchainGeneration = 0;
             }
             for (VkSemaphore s : s_renderDone)
                 vkDestroySemaphore(s_device, s, nullptr);
@@ -876,10 +911,7 @@ namespace video
                         !s_vsync && info.presentMode == VK_PRESENT_MODE_FIFO_KHR ? "; the surface offers nothing else" : "");
                 }
             }
-            {
-                std::lock_guard lock(s_waitSwapchainMutex);
-                s_waitSwapchain = s_swapchain;
-            }
+            s_swapchainGeneration = s_swapchainUse.Publish(s_swapchain);
             if (s_uiReady)
                 ui::SetFormat(s_swapFormat);
             s_swapPolicy.Created({ s_swapExtent.width, s_swapExtent.height });
@@ -1096,14 +1128,8 @@ namespace video
         // bicubic with optional sharpening, clamped to the 2x2 source texels
         // around each sample so it can't ring.
         // NFSMW_AA=0 turns the anti-aliasing off; NFSMW_SCALING=linear (or
-        // bicubic, the default; or fsr1, below); NFSMW_SHARPEN=<0..1> (default
-        // 0.3). If the pipelines can't be built, frames are blitted as before.
-        // Upscaling FSR 1 (for an internal resolution below 720p, which this
-        // scaling would only blur): the anti-aliasing as before, then AMD
-        // FidelityFX Super Resolution 1's EASU (compute) from the frame to an
-        // image of the picture's size, then its RCAS sharpening as the
-        // fragment pass into the window (kEasuCs, kRcasFs: ported from AMD's
-        // reference, THIRD_PARTY_NOTICES.md).
+        // bicubic, the default); NFSMW_SHARPEN=<0..1> (default 0.3). If the
+        // pipelines can't be built, frames are blitted as before.
         const char* kFullscreenVs = R"(#version 460
 layout(location = 0) out vec2 uv;
 void main()
@@ -1284,6 +1310,29 @@ void main()
         return;
     }
     vec2 texel = 1.0 / p.size;
+    if (p.bicubic == 2u)
+    {
+        // The picture's columns are the frame's (as wide, at a whole pixel:
+        // 1280x720 into a Steam Deck's 1280x800): each sample sits on its
+        // column's centre, f.x 0 (or 1 where uv rounds just below a centre),
+        // where Catmull-Rom's horizontal weights are 0, 1, 0, 0 (0, 0, 1, 0):
+        // one column, the one its middle tap reads. The same picture from
+        // that column (3 taps, not 9), the clamp's 4 texels as below and the
+        // bilinear sample on the column: 8 fetches, not 14.
+        vec2 pos = uv * p.size;
+        vec2 c = floor(pos - 0.5) + 0.5, f = pos - c;
+        float w2x = f.x * (0.5 + f.x * (2.0 - 1.5 * f.x)), w12x = 1.0 + f.x * f.x * (-2.5 + 1.5 * f.x) + w2x;
+        float x = (c.x + w2x / w12x) * texel.x;
+        float w0 = f.y * (-0.5 + f.y * (1.0 - 0.5 * f.y)), w3 = f.y * f.y * (-0.5 + 0.5 * f.y);
+        float w2 = f.y * (0.5 + f.y * (2.0 - 1.5 * f.y)), w12 = 1.0 + f.y * f.y * (-2.5 + 1.5 * f.y) + w2;
+        vec3 v = at(vec2(x, (c.y - 1.0) * texel.y)) * w0 + at(vec2(x, (c.y + w2 / w12) * texel.y)) * w12 +
+            at(vec2(x, (c.y + 2.0) * texel.y)) * w3;
+        vec2 corner = c * texel;
+        vec3 a = at(corner), b = at(corner + vec2(texel.x, 0.0)), d = at(corner + vec2(0.0, texel.y)), e = at(corner + texel);
+        vec3 lo = min(min(a, b), min(d, e)), hi = max(max(a, b), max(d, e));
+        color = vec4(clamp(v + p.sharpen * (v - at(vec2(x, uv.y))), lo, hi), 1.0);
+        return;
+    }
     vec3 c = catmullRom(uv, texel);
     // Sharpen against the bilinear sample, then clamp to the 2x2 texels
     // around the sample: detail gets crisper without halos or ringing.
@@ -1384,259 +1433,6 @@ void main()
 #endif
         const bool s_fastScale = [] { const char* v = std::getenv("NFSMW_FAST_SCALE"); return v ? v[0] == '1' : kFastScaleByDefault; }();
 
-        // AMD FidelityFX Super Resolution 1 (FSR 1), from AMD's reference
-        // ffx_fsr1.h and ffx_a.h (GPUOpen-Effects/FidelityFX-FSR v1.0.2,
-        // commit a21ffb8f; MIT: LICENSES/FidelityFX-FSR-MIT.txt), its 32-bit
-        // GLSL paths ported line for line: EASU (FsrEasuF, FsrEasuTapF,
-        // FsrEasuSetF; FsrEasuCon's con0 comes from the CPU, ScaleFsr) and
-        // RCAS (FsrRcasF, no denoise, no alpha). ffx_a.h's approximate
-        // reciprocals are kept bit for bit (rcpLo, rsqLo, rcpMed).
-        // Where they differ from the reference, and why:
-        //   - EASU reads its 12 texels with texelFetch, clamped to the image
-        //     (the reference's gathers with clamp-to-edge read the same 12),
-        //     so each tap can also be kept to the span of the 16:9 band's three
-        //     that the output pixel's centre falls in (Hor+, Vert+:
-        //     band_filter.h's ClampTexel), as the AA pass and the bicubic
-        //     scaling keep theirs. A strip of black bars or a letterboxed movie
-        //     then doesn't bleed into the band, nor the band into the strips.
-        //   - RCAS's neighbours past the image's edge, or in another span than
-        //     the pixel (decided in integers in both passes, so they agree),
-        //     read the pixel itself: the span's edge, clamped.
-        //   - RCAS's two limiters divide by the ring's 4 x max and 4 x min - 4,
-        //     which are 0 where the ring is all black or all white: the
-        //     reference makes a NaN there (0 x inf), which AMD's GPUs drop in
-        //     the max() after it; other GPUs (Metal) need not, so the divisors
-        //     are kept off 0 by 2^-16 (no 8-bit picture comes nearer: the
-        //     smallest step is 1/255).
-        // The EASU pass: the frame (anti-aliased, or as rendered) in, an image
-        // of the picture's size out. con0: FsrEasuCon's (an output pixel to
-        // its position in the input, texels); inSize, outSize: the images';
-        // band: the 16:9 band's columns x..y and rows z..w in input texels
-        // (video::BandOf), used when bandOn is 1.
-        const char* kEasuCs = R"(#version 460
-layout(local_size_x = 8, local_size_y = 8) in;
-layout(set = 0, binding = 0) uniform sampler2D src;
-layout(set = 0, binding = 1, rgba8) uniform writeonly image2D dst;
-layout(push_constant) uniform P { vec4 con0; ivec2 inSize; ivec2 outSize; ivec4 band; uint bandOn; } p;
-
-// The texels a tap may read (inclusive): the image, or this pixel's span.
-ivec2 spanLo, spanHi;
-
-// Which of [0, lo), [lo, hi), [hi, inSize) output pixel i's centre falls in,
-// at (i + 0.5) x inSize / outSize input texels: compared in integers, exactly.
-int spanIndex(int i, int lo, int hi, int inSize, int outSize)
-{
-    int t = (2 * i + 1) * inSize;
-    return t < 2 * lo * outSize ? 0 : t < 2 * hi * outSize ? 1 : 2;
-}
-
-ivec2 spanOf(int index, int lo, int hi, int size)
-{
-    return index == 0 ? ivec2(0, lo) : index == 1 ? ivec2(lo, hi) : ivec2(hi, size);
-}
-
-vec3 tap(ivec2 t)
-{
-    return texelFetch(src, clamp(t, spanLo, spanHi), 0).rgb;
-}
-
-// ffx_a.h: APrxLoRcpF1, APrxLoRsqF1.
-float rcpLo(float a) { return uintBitsToFloat(0x7ef07ebbu - floatBitsToUint(a)); }
-float rsqLo(float a) { return uintBitsToFloat(0x5f347d74u - (floatBitsToUint(a) >> 1u)); }
-
-// FsrEasuTapF: one tap of the kernel, an approximate lanczos(2) rotated
-// along the edge and stretched across it.
-void easuTap(inout vec3 aC, inout float aW, vec2 off, vec2 dir, vec2 len, float lob, float clp, vec3 c)
-{
-    vec2 v;
-    v.x = (off.x * (dir.x)) + (off.y * dir.y);
-    v.y = (off.x * (-dir.y)) + (off.y * dir.x);
-    v *= len;
-    float d2 = v.x * v.x + v.y * v.y;
-    d2 = min(d2, clp);
-    float wB = float(2.0 / 5.0) * d2 + float(-1.0);
-    float wA = lob * d2 + float(-1.0);
-    wB *= wB;
-    wA *= wA;
-    wB = float(25.0 / 16.0) * wB + float(-(25.0 / 16.0 - 1.0));
-    float w = wB * wA;
-    aC += c * w;
-    aW += w;
-}
-
-// FsrEasuSetF: the edge's direction and length from the luma cross around
-// one of the 2x2 texels nearest the position, weighted bilinearly.
-void easuSet(inout vec2 dir, inout float len, vec2 pp, bool biS, bool biT, bool biU, bool biV, float lA, float lB, float lC,
-    float lD, float lE)
-{
-    float w = 0.0;
-    if (biS) w = (1.0 - pp.x) * (1.0 - pp.y);
-    if (biT) w = pp.x * (1.0 - pp.y);
-    if (biU) w = (1.0 - pp.x) * pp.y;
-    if (biV) w = pp.x * pp.y;
-    float dc = lD - lC;
-    float cb = lC - lB;
-    float lenX = max(abs(dc), abs(cb));
-    lenX = rcpLo(lenX);
-    float dirX = lD - lB;
-    dir.x += dirX * w;
-    lenX = clamp(abs(dirX) * lenX, 0.0, 1.0);
-    lenX *= lenX;
-    len += lenX * w;
-    float ec = lE - lC;
-    float ca = lC - lA;
-    float lenY = max(abs(ec), abs(ca));
-    lenY = rcpLo(lenY);
-    float dirY = lE - lA;
-    dir.y += dirY * w;
-    lenY = clamp(abs(dirY) * lenY, 0.0, 1.0);
-    lenY *= lenY;
-    len += lenY * w;
-}
-
-void main()
-{
-    ivec2 ip = ivec2(gl_GlobalInvocationID.xy);
-    if (ip.x >= p.outSize.x || ip.y >= p.outSize.y)
-        return;
-    spanLo = ivec2(0);
-    spanHi = p.inSize - 1;
-    if (p.bandOn != 0u)
-    {
-        ivec2 sx = spanOf(spanIndex(ip.x, p.band.x, p.band.y, p.inSize.x, p.outSize.x), p.band.x, p.band.y, p.inSize.x);
-        ivec2 sy = spanOf(spanIndex(ip.y, p.band.z, p.band.w, p.inSize.y, p.outSize.y), p.band.z, p.band.w, p.inSize.y);
-        spanLo = ivec2(sx.x, sy.x);
-        spanHi = max(ivec2(sx.y, sy.y) - 1, spanLo);
-    }
-    // FsrEasuF: the position of 'f' and the 12 texels around it.
-    //    b c
-    //  e f g h
-    //  i j k l
-    //    n o
-    vec2 pp = vec2(ip) * p.con0.xy + p.con0.zw;
-    vec2 fp = floor(pp);
-    pp -= fp;
-    ivec2 f0 = ivec2(fp);
-    vec3 b = tap(f0 + ivec2(0, -1)), c = tap(f0 + ivec2(1, -1));
-    vec3 e = tap(f0 + ivec2(-1, 0)), f = tap(f0), g = tap(f0 + ivec2(1, 0)), h = tap(f0 + ivec2(2, 0));
-    vec3 i = tap(f0 + ivec2(-1, 1)), j = tap(f0 + ivec2(0, 1)), k = tap(f0 + ivec2(1, 1)), l = tap(f0 + ivec2(2, 1));
-    vec3 n = tap(f0 + ivec2(0, 2)), o = tap(f0 + ivec2(1, 2));
-    // The simplest luma (times 2, in 2 FMAs).
-    float bL = b.b * 0.5 + (b.r * 0.5 + b.g), cL = c.b * 0.5 + (c.r * 0.5 + c.g);
-    float eL = e.b * 0.5 + (e.r * 0.5 + e.g), fL = f.b * 0.5 + (f.r * 0.5 + f.g);
-    float gL = g.b * 0.5 + (g.r * 0.5 + g.g), hL = h.b * 0.5 + (h.r * 0.5 + h.g);
-    float iL = i.b * 0.5 + (i.r * 0.5 + i.g), jL = j.b * 0.5 + (j.r * 0.5 + j.g);
-    float kL = k.b * 0.5 + (k.r * 0.5 + k.g), lL = l.b * 0.5 + (l.r * 0.5 + l.g);
-    float nL = n.b * 0.5 + (n.r * 0.5 + n.g), oL = o.b * 0.5 + (o.r * 0.5 + o.g);
-    vec2 dir = vec2(0.0);
-    float len = 0.0;
-    easuSet(dir, len, pp, true, false, false, false, bL, eL, fL, gL, jL);
-    easuSet(dir, len, pp, false, true, false, false, cL, fL, gL, hL, kL);
-    easuSet(dir, len, pp, false, false, true, false, fL, iL, jL, kL, nL);
-    easuSet(dir, len, pp, false, false, false, true, gL, jL, kL, lL, oL);
-    // Normalize with the approximation, and clean up close to zero.
-    vec2 dir2 = dir * dir;
-    float dirR = dir2.x + dir2.y;
-    bool zro = dirR < float(1.0 / 32768.0);
-    dirR = rsqLo(dirR);
-    dirR = zro ? 1.0 : dirR;
-    dir.x = zro ? 1.0 : dir.x;
-    dir *= vec2(dirR);
-    // Length {0 to 2} to {0 to 1}, shaped with a square.
-    len = len * 0.5;
-    len *= len;
-    // The kernel stretched from 1.0 (horizontal or vertical) to sqrt(2.0) on
-    // the diagonal; across an edge, x lerps to that, y to 2x.
-    float stretch = (dir.x * dir.x + dir.y * dir.y) * rcpLo(max(abs(dir.x), abs(dir.y)));
-    vec2 len2 = vec2(1.0 + (stretch - 1.0) * len, 1.0 + -0.5 * len);
-    // The window: from +-sqrt(2.0) to just past 2.0 with the edge's amount.
-    float lob = 0.5 + float((1.0 / 4.0 - 0.04) - 0.5) * len;
-    float clp = rcpLo(lob);
-    // Accumulated, then kept between the 2x2 nearest's min and max (no ringing).
-    vec3 min4 = min(min(f, min(g, j)), k);
-    vec3 max4 = max(max(f, max(g, j)), k);
-    vec3 aC = vec3(0.0);
-    float aW = 0.0;
-    easuTap(aC, aW, vec2(0.0, -1.0) - pp, dir, len2, lob, clp, b);
-    easuTap(aC, aW, vec2(1.0, -1.0) - pp, dir, len2, lob, clp, c);
-    easuTap(aC, aW, vec2(-1.0, 1.0) - pp, dir, len2, lob, clp, i);
-    easuTap(aC, aW, vec2(0.0, 1.0) - pp, dir, len2, lob, clp, j);
-    easuTap(aC, aW, vec2(0.0, 0.0) - pp, dir, len2, lob, clp, f);
-    easuTap(aC, aW, vec2(-1.0, 0.0) - pp, dir, len2, lob, clp, e);
-    easuTap(aC, aW, vec2(1.0, 1.0) - pp, dir, len2, lob, clp, k);
-    easuTap(aC, aW, vec2(2.0, 1.0) - pp, dir, len2, lob, clp, l);
-    easuTap(aC, aW, vec2(2.0, 0.0) - pp, dir, len2, lob, clp, h);
-    easuTap(aC, aW, vec2(1.0, 0.0) - pp, dir, len2, lob, clp, g);
-    easuTap(aC, aW, vec2(1.0, 2.0) - pp, dir, len2, lob, clp, o);
-    easuTap(aC, aW, vec2(0.0, 2.0) - pp, dir, len2, lob, clp, n);
-    imageStore(dst, ip, vec4(min(max4, max(min4, aC * vec3(1.0 / aW))), 1.0));
-}
-)";
-
-        // The RCAS pass: EASU's image, drawn 1:1 into the picture's part of
-        // the window (the viewport is its size). outSize: that image's;
-        // inSize and band: the EASU pass's input and band, for the spans;
-        // con: FsrRcasCon's sharpness, 2^-stops (Sharpening, ScaleFsr).
-        // As the scale shaders, its main can be wrapped by the tone's
-        // (ToneVariant): the output is `color`.
-        const char* kRcasFs = R"(#version 460
-layout(location = 0) in vec2 uv;
-layout(location = 0) out vec4 color;
-layout(set = 0, binding = 0) uniform sampler2D src;
-layout(push_constant) uniform P { ivec2 outSize; ivec2 inSize; ivec4 band; float con; uint bandOn; } p;
-
-// As kEasuCs's: which span output pixel i's centre falls in.
-int spanIndex(int i, int lo, int hi, int inSize, int outSize)
-{
-    int t = (2 * i + 1) * inSize;
-    return t < 2 * lo * outSize ? 0 : t < 2 * hi * outSize ? 1 : 2;
-}
-
-// ffx_a.h: APrxMedRcpF1.
-float rcpMed(float a)
-{
-    float b = uintBitsToFloat(0x7ef19fffu - floatBitsToUint(a));
-    return b * (-b * a + 2.0);
-}
-
-void main()
-{
-    ivec2 ip = clamp(ivec2(uv * vec2(p.outSize)), ivec2(0), p.outSize - 1);
-    // FsrRcasF's 3x3 cross:
-    //    b
-    //  d e f
-    //    h
-    vec3 e = texelFetch(src, ip, 0).rgb;
-    bool bIn = ip.y > 0, hIn = ip.y + 1 < p.outSize.y, dIn = ip.x > 0, fIn = ip.x + 1 < p.outSize.x;
-    if (p.bandOn != 0u)
-    {
-        int sx = spanIndex(ip.x, p.band.x, p.band.y, p.inSize.x, p.outSize.x);
-        int sy = spanIndex(ip.y, p.band.z, p.band.w, p.inSize.y, p.outSize.y);
-        bIn = bIn && spanIndex(ip.y - 1, p.band.z, p.band.w, p.inSize.y, p.outSize.y) == sy;
-        hIn = hIn && spanIndex(ip.y + 1, p.band.z, p.band.w, p.inSize.y, p.outSize.y) == sy;
-        dIn = dIn && spanIndex(ip.x - 1, p.band.x, p.band.y, p.inSize.x, p.outSize.x) == sx;
-        fIn = fIn && spanIndex(ip.x + 1, p.band.x, p.band.y, p.inSize.x, p.outSize.x) == sx;
-    }
-    vec3 b = bIn ? texelFetch(src, ip + ivec2(0, -1), 0).rgb : e;
-    vec3 d = dIn ? texelFetch(src, ip + ivec2(-1, 0), 0).rgb : e;
-    vec3 f = fIn ? texelFetch(src, ip + ivec2(1, 0), 0).rgb : e;
-    vec3 h = hIn ? texelFetch(src, ip + ivec2(0, 1), 0).rgb : e;
-    // Min and max of the ring.
-    vec3 mn4 = min(min(b, min(d, f)), h);
-    vec3 mx4 = max(max(b, max(d, f)), h);
-    // Limiters (high precision reciprocals), each channel: the lobe that
-    // would take the cross just to 0 or to 1.
-    vec2 peakC = vec2(1.0, -1.0 * 4.0);
-    vec3 hitMin = min(mn4, e) * (1.0 / max(4.0 * mx4, vec3(1.0 / 65536.0)));
-    vec3 hitMax = (peakC.x - max(mx4, e)) * (1.0 / min(4.0 * mn4 + peakC.y, vec3(-1.0 / 65536.0)));
-    vec3 lobeRGB = max(-hitMin, hitMax);
-    float lobe = max(float(-(0.25 - (1.0 / 16.0))), min(max(lobeRGB.r, max(lobeRGB.g, lobeRGB.b)), 0.0)) * p.con;
-    // Resolve, with the medium precision reciprocal (no visible tonality change).
-    float rcpL = rcpMed(4.0 * lobe + 1.0);
-    color = vec4((lobe * b + lobe * d + lobe * h + lobe * f + e) * rcpL, 1.0);
-}
-)";
-
         // Brightness and the 360's display gamma (video/display_tone.h): the
         // scale shader in use, its main renamed scaleMain, then this main,
         // which looks each channel of its result up in the tone table (256
@@ -1694,14 +1490,6 @@ void main()
             int32_t brightness = 0;
             bool ramp = false;
             uint64_t rampGeneration = 0;
-            // The RCAS pass's tone variant (Upscaling FSR 1), made the first
-            // time both are in use (EnsureToneRcas): its own layout, as RCAS's
-            // push constants aren't the scale shaders'.
-            bool rcasTried = false, rcasReady = false;
-            VkPipelineLayout rcasLayout = VK_NULL_HANDLE;
-            VkShaderModule rcasFs = VK_NULL_HANDLE;
-            VkPipeline rcasPipeline = VK_NULL_HANDLE;
-            VkFormat rcasFormat = VK_FORMAT_UNDEFINED;
         } s_tone;
 
         struct PostState
@@ -1719,35 +1507,11 @@ void main()
             VkDeviceMemory aaMemory = VK_NULL_HANDLE;
             VkImageView aaView = VK_NULL_HANDLE;
             uint32_t aaWidth = 0, aaHeight = 0;
-            // Upscaling FSR 1 (kEasuCs, kRcasFs), made the first time a frame
-            // asks for it (EnsureFsr): EASU's pipeline (the AA pass's set
-            // layout: a sampled image in, a storage image out) and RCAS's for
-            // the swapchain's format (the scale pass's set layout), and EASU's
-            // image, at the picture's size.
-            bool fsrTried = false, fsrReady = false;
-            VkPipelineLayout easuLayout = VK_NULL_HANDLE, rcasLayout = VK_NULL_HANDLE;
-            VkPipeline easu = VK_NULL_HANDLE, rcas = VK_NULL_HANDLE;
-            VkFormat rcasFormat = VK_FORMAT_UNDEFINED;
-            VkShaderModule rcasFs = VK_NULL_HANDLE;
-            VkImage easuImage = VK_NULL_HANDLE;
-            VkDeviceMemory easuMemory = VK_NULL_HANDLE;
-            VkImageView easuView = VK_NULL_HANDLE;
-            uint32_t easuWidth = 0, easuHeight = 0;
-            // An EASU pass has read the AA image: the barrier before the next
-            // AA write waits for compute reads too.
-            bool easuEver = false;
         } s_post;
         // Read every frame: the settings menu changes them live.
         bool AaEnabled() { return settings::GetBool(settings::Id::AntiAliasing); }
         bool Bicubic() { return settings::GetInt(settings::Id::Scaling) == int32_t(settings::ScalingMode::Bicubic); }
-        bool Fsr1() { return settings::GetInt(settings::Id::Scaling) == int32_t(settings::ScalingMode::Fsr1); }
         float Sharpen() { return std::clamp(settings::GetFloat(settings::Id::Sharpening), 0.0f, 1.0f); }
-        // FSR 1's RCAS strength from Sharpening, in AMD's stops (FsrRcasCon:
-        // 0 the most, each stop halves it): 2 x (1 - Sharpening), so 1.00 is
-        // RCAS's maximum, the default 0.30 is 1.4 stops (x0.38), 0.50 one
-        // stop; AMD's samples use 0.2 stops (Sharpening 0.90). 0 skips RCAS
-        // (the EASU image is copied as it is): no sharpening, as for bicubic.
-        float RcasStops(float sharpen) { return 2.0f * (1.0f - sharpen); }
 
         VkShaderModule PostModule(const char* glsl, int stage)
         {
@@ -1882,63 +1646,24 @@ void main()
             if (!EnsureScalePipeline())
                 return false;
             s_post.ready = true;
+            const int32_t mode = settings::GetInt(settings::Id::Scaling);
+            fprintf(stderr, "[video] post-processing: %s, %s scaling%s%s\n", AaEnabled() ? "anti-aliasing" : "no anti-aliasing",
+                mode == int32_t(settings::ScalingMode::Fsr1) ? "FSR 1 (enlarging; else bicubic)" : Bicubic() ? "bicubic" : "linear",
+                mode != int32_t(settings::ScalingMode::Linear) ? std::format(", sharpen {:.2f}", Sharpen()).c_str() : "",
+                s_fastScale ? " (NFSMW_FAST_SCALE: 7 fetches)" : "");
             return true;
         }
 
-        // The "[video] post-processing:" line: the chain a frame goes through,
-        // logged with the first frame and again whenever it changes (a
-        // setting, the frame's size, the picture's: the front image is at
-        // the internal resolution, 1280x720 in menus and movies drawn at 1x).
-        // fsrAsked: Upscaling FSR 1; fsr: its passes run (else bicubic, and
-        // why); rcas: its RCAS pass too (Sharpening above 0).
-        void LogPostChain(bool fsrAsked, bool fsr, bool rcas, uint32_t w, uint32_t h, int32_t dw, int32_t dh)
+        void EnsureAaImage(uint32_t width, uint32_t height)
         {
-            struct Chain
-            {
-                bool aa, fsrAsked, fsr, rcas;
-                int32_t mode, sharpen;
-                uint32_t w, h;
-                int32_t dw, dh;
-                bool operator==(const Chain&) const = default;
-            };
-            static Chain last{};
-            static bool logged = false;
-            const Chain now{ AaEnabled(), fsrAsked, fsr, rcas, settings::GetInt(settings::Id::Scaling), int32_t(std::lround(Sharpen() * 100.0f)), w, h,
-                dw, dh };
-            if (logged && now == last)
-                return;
-            logged = true;
-            last = now;
-            std::string scaling;
-            if (fsr)
-                scaling = std::format("FSR 1: EASU {}x{} -> {}x{}, {}", w, h, dw, dh,
-                    rcas ? std::format("RCAS {:.2f} stops (Sharpening {:.2f})", RcasStops(Sharpen()), Sharpen()) : std::string("no RCAS (Sharpening 0)"));
-            else
-            {
-                const bool bicubic = Bicubic() || fsrAsked;
-                scaling = std::format("{} scaling{} {}x{} -> {}x{}{}", bicubic ? "bicubic" : "linear",
-                    bicubic ? std::format(", sharpen {:.2f},", Sharpen()) : std::string(), w, h, dw, dh,
-                    s_fastScale && bicubic ? " (NFSMW_FAST_SCALE: 7 fetches)" : "");
-                if (fsrAsked)
-                    scaling += !s_post.fsrReady && s_post.fsrTried ? " (Upscaling FSR 1: its pipelines couldn't be made)"
-                        : " (Upscaling FSR 1: the picture isn't larger than the frame)";
-            }
-            fprintf(stderr, "[video] post-processing: %s, %s\n", now.aa ? "anti-aliasing" : "no anti-aliasing", scaling.c_str());
-        }
-
-        // An RGBA8 image a compute pass writes and the next pass samples (the
-        // AA pass's, EASU's), made again at a new size once nothing uses it.
-        void EnsurePostImage(VkImage& image, VkDeviceMemory& memory, VkImageView& view, uint32_t& imageWidth, uint32_t& imageHeight,
-            uint32_t width, uint32_t height)
-        {
-            if (image && imageWidth == width && imageHeight == height)
+            if (s_post.aaImage && s_post.aaWidth == width && s_post.aaHeight == height)
                 return;
             WaitIdle();
-            if (image)
+            if (s_post.aaImage)
             {
-                vkDestroyImageView(s_device, view, nullptr);
-                vkDestroyImage(s_device, image, nullptr);
-                vkFreeMemory(s_device, memory, nullptr);
+                vkDestroyImageView(s_device, s_post.aaView, nullptr);
+                vkDestroyImage(s_device, s_post.aaImage, nullptr);
+                vkFreeMemory(s_device, s_post.aaMemory, nullptr);
             }
             VkImageCreateInfo ii{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
             ii.imageType = VK_IMAGE_TYPE_2D;
@@ -1949,100 +1674,22 @@ void main()
             ii.samples = VK_SAMPLE_COUNT_1_BIT;
             ii.tiling = VK_IMAGE_TILING_OPTIMAL;
             ii.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-            vkCreateImage(s_device, &ii, nullptr, &image);
+            vkCreateImage(s_device, &ii, nullptr, &s_post.aaImage);
             VkMemoryRequirements req;
-            vkGetImageMemoryRequirements(s_device, image, &req);
+            vkGetImageMemoryRequirements(s_device, s_post.aaImage, &req);
             VkMemoryAllocateInfo ai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
             ai.allocationSize = req.size;
             ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-            vkAllocateMemory(s_device, &ai, nullptr, &memory);
-            vkBindImageMemory(s_device, image, memory, 0);
+            vkAllocateMemory(s_device, &ai, nullptr, &s_post.aaMemory);
+            vkBindImageMemory(s_device, s_post.aaImage, s_post.aaMemory, 0);
             VkImageViewCreateInfo vci{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
-            vci.image = image;
+            vci.image = s_post.aaImage;
             vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
             vci.format = VK_FORMAT_R8G8B8A8_UNORM;
             vci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-            vkCreateImageView(s_device, &vci, nullptr, &view);
-            imageWidth = width;
-            imageHeight = height;
-        }
-
-        void EnsureAaImage(uint32_t width, uint32_t height)
-        {
-            EnsurePostImage(s_post.aaImage, s_post.aaMemory, s_post.aaView, s_post.aaWidth, s_post.aaHeight, width, height);
-        }
-
-        void EnsureEasuImage(uint32_t width, uint32_t height)
-        {
-            EnsurePostImage(s_post.easuImage, s_post.easuMemory, s_post.easuView, s_post.easuWidth, s_post.easuHeight, width, height);
-        }
-
-        // Upscaling FSR 1's pipelines (kEasuCs, kRcasFs), RCAS's for the
-        // swapchain's format (made again if it changes, as the scale
-        // pipeline). False when they can't be made: the frame is then scaled
-        // bicubic, as with Upscaling Bicubic, and the post-processing line
-        // says so.
-        bool EnsureFsr()
-        {
-            if (!s_post.fsrTried)
-            {
-                s_post.fsrTried = true;
-                VkPushConstantRange easuRange{ VK_SHADER_STAGE_COMPUTE_BIT, 0, 52 }, rcasRange{ VK_SHADER_STAGE_FRAGMENT_BIT, 0, 40 };
-                VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-                plci.setLayoutCount = 1;
-                plci.pSetLayouts = &s_post.aaSet;
-                plci.pushConstantRangeCount = 1;
-                plci.pPushConstantRanges = &easuRange;
-                if (!Check(vkCreatePipelineLayout(s_device, &plci, nullptr, &s_post.easuLayout), "EASU pipeline layout"))
-                    return false;
-                plci.pSetLayouts = &s_post.scaleSet;
-                plci.pPushConstantRanges = &rcasRange;
-                if (!Check(vkCreatePipelineLayout(s_device, &plci, nullptr, &s_post.rcasLayout), "RCAS pipeline layout"))
-                    return false;
-                VkShaderModule cs = PostModule(kEasuCs, 2);
-                s_post.rcasFs = PostModule(kRcasFs, 1);
-                if (!cs || !s_post.rcasFs)
-                {
-                    fprintf(stderr, "[video] FSR 1: a shader failed to compile: bicubic scaling instead\n");
-                    return false;
-                }
-                VkComputePipelineCreateInfo cpci{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-                cpci.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, cs, "main", nullptr };
-                cpci.layout = s_post.easuLayout;
-                const VkResult made = vkCreateComputePipelines(s_device, VK_NULL_HANDLE, 1, &cpci, nullptr, &s_post.easu);
-                vkDestroyShaderModule(s_device, cs, nullptr);
-                if (made != VK_SUCCESS)
-                {
-                    fprintf(stderr, "[video] FSR 1: the EASU pipeline couldn't be made (%d): bicubic scaling instead\n", int(made));
-                    s_post.easu = VK_NULL_HANDLE;
-                    return false;
-                }
-                s_post.fsrReady = true;
-            }
-            if (!s_post.fsrReady)
-                return false;
-            if (s_post.rcas && s_post.rcasFormat == s_swapFormat)
-                return true;
-            if (s_post.rcas)
-                vkDestroyPipeline(s_device, s_post.rcas, nullptr);
-            s_post.rcas = MakeScalePipeline(s_post.rcasFs, s_post.rcasLayout);
-            if (!s_post.rcas)
-            {
-                fprintf(stderr, "[video] FSR 1: the RCAS pipeline couldn't be made: bicubic scaling instead\n");
-                s_post.fsrReady = false;
-                return false;
-            }
-            s_post.rcasFormat = s_swapFormat;
-            return true;
-        }
-
-        // FsrEasuCon's con0 for a w x h frame scaled to a dw x dh picture
-        // (the whole input image is the viewport): an output pixel's position
-        // in the input, as AMD's CPU code computes it.
-        std::array<float, 4> EasuCon0(uint32_t w, uint32_t h, int32_t dw, int32_t dh)
-        {
-            const float rx = 1.0f / float(dw), ry = 1.0f / float(dh);
-            return { float(w) * rx, float(h) * ry, 0.5f * float(w) * rx - 0.5f, 0.5f * float(h) * ry - 0.5f };
+            vkCreateImageView(s_device, &vci, nullptr, &s_post.aaView);
+            s_post.aaWidth = width;
+            s_post.aaHeight = height;
         }
 
         // The tone pipeline's pieces, made the first time Brightness or the
@@ -2145,49 +1792,6 @@ void main()
             return true;
         }
 
-        // The RCAS pass's tone variant, after EnsureTone (its set layout and
-        // table): for Upscaling FSR 1 with Brightness or the 360's gamma on,
-        // which the default is. False if it can't be made: that frame's RCAS
-        // is then left out (the EASU image copied through the tone pipeline).
-        bool EnsureToneRcas()
-        {
-            if (!s_tone.ready)
-                return false;
-            if (!s_tone.rcasTried)
-            {
-                s_tone.rcasTried = true;
-                std::string glsl = ToneVariant(kRcasFs);
-                VkPushConstantRange range{ VK_SHADER_STAGE_FRAGMENT_BIT, 0, 40 };  // kRcasFs's P
-                VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
-                plci.setLayoutCount = 1;
-                plci.pSetLayouts = &s_tone.set;
-                plci.pushConstantRangeCount = 1;
-                plci.pPushConstantRanges = &range;
-                if (glsl.empty() || !Check(vkCreatePipelineLayout(s_device, &plci, nullptr, &s_tone.rcasLayout), "tone RCAS pipeline layout") ||
-                    !(s_tone.rcasFs = PostModule(glsl.c_str(), 1)))
-                {
-                    fprintf(stderr, "[video] tone: no RCAS variant; FSR 1 shows its EASU image unsharpened\n");
-                    return false;
-                }
-                s_tone.rcasReady = true;
-            }
-            if (!s_tone.rcasReady)
-                return false;
-            if (s_tone.rcasPipeline && s_tone.rcasFormat == s_swapFormat)
-                return true;
-            if (s_tone.rcasPipeline)
-                vkDestroyPipeline(s_device, s_tone.rcasPipeline, nullptr);
-            s_tone.rcasPipeline = MakeScalePipeline(s_tone.rcasFs, s_tone.rcasLayout);
-            if (!s_tone.rcasPipeline)
-            {
-                fprintf(stderr, "[video] tone: the RCAS variant's pipeline couldn't be made; FSR 1 shows its EASU image unsharpened\n");
-                s_tone.rcasReady = false;
-                return false;
-            }
-            s_tone.rcasFormat = s_swapFormat;
-            return true;
-        }
-
         // Before the scale pass: whether this frame's picture goes through
         // the tone table (Settings > Display > Brightness, Xbox 360 Display
         // Gamma), with the table brought up to date in `cmd` when its inputs
@@ -2226,6 +1830,492 @@ void main()
             s_tone.ramp = useRamp;
             s_tone.rampGeneration = rampGeneration;
             return true;
+        }
+
+        // ---------------------------------------------------------------
+        // Settings > Graphics > Upscaling's FSR 1 (video/fsr1.h; when it is
+        // used: video/upscale.h): EASU (compute) from the anti-aliased frame
+        // into s_fsr.image, the picture's size on the screen, then RCAS
+        // (fragment) where the bicubic pass draws, with the tone table and
+        // then the UI after it as before. Made the first time a frame is
+        // enlarged with it; if that fails, those frames take the bicubic
+        // pass (logged once).
+        struct FsrState
+        {
+            bool tried = false, ready = false, toneTried = false;
+            VkDescriptorSetLayout easuSet = VK_NULL_HANDLE, rcasSet = VK_NULL_HANDLE;
+            VkPipelineLayout easuLayout = VK_NULL_HANDLE, rcasLayout = VK_NULL_HANDLE;
+            VkPipeline easu = VK_NULL_HANDLE;
+            VkShaderModule rcasFs = VK_NULL_HANDLE, rcasToneFs = VK_NULL_HANDLE;
+            VkPipeline rcas = VK_NULL_HANDLE, rcasTone = VK_NULL_HANDLE;
+            VkFormat rcasFormat = VK_FORMAT_UNDEFINED, rcasToneFormat = VK_FORMAT_UNDEFINED;  // the swapchain's they were made for
+            // EASU's picture, the size of the picture on the screen.
+            VkImage image = VK_NULL_HANDLE;
+            VkDeviceMemory memory = VK_NULL_HANDLE;
+            VkImageView view = VK_NULL_HANDLE;
+            uint32_t width = 0, height = 0;
+        } s_fsr;
+
+        // The shaders' push constants (their P in video/fsr1.cpp).
+        struct EasuPush
+        {
+            uint32_t con[16];  // FsrEasuCon's con0..con3
+            int32_t band[4];   // the 16:9 band's columns x0..x1 and rows y0..y1 (video::BandOf)
+            int32_t outW, outH, srcW, srcH;
+            uint32_t bandOn;
+        };
+        static_assert(sizeof(EasuPush) == 100);
+        struct RcasPush
+        {
+            uint32_t con[4];  // FsrRcasCon's (con[0] 0: no sharpening)
+            int32_t band[4];
+            int32_t originX, originY, outW, outH, srcW, srcH;
+            uint32_t bandOn;
+        };
+        static_assert(sizeof(RcasPush) == 60);
+
+        bool EnsureFsr()
+        {
+            if (s_fsr.tried)
+                return s_fsr.ready;
+            s_fsr.tried = true;
+            auto start = std::chrono::steady_clock::now();
+            VkDescriptorSetLayoutBinding easuBindings[2] = {
+                { 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+                { 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr },
+            };
+            // RCAS: EASU's picture, and the tone table (its tone variant).
+            VkDescriptorSetLayoutBinding rcasBindings[2] = {
+                { 0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr },
+                { 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr },
+            };
+            VkDescriptorSetLayoutCreateInfo dslci{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+            dslci.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+            dslci.bindingCount = 2;
+            dslci.pBindings = easuBindings;
+            VkDescriptorSetLayoutCreateInfo rcasDslci = dslci;
+            rcasDslci.pBindings = rcasBindings;
+            VkPushConstantRange easuRange{ VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(EasuPush) };
+            VkPushConstantRange rcasRange{ VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(RcasPush) };
+            VkPipelineLayoutCreateInfo plci{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+            plci.setLayoutCount = 1;
+            plci.pSetLayouts = &s_fsr.easuSet;
+            plci.pushConstantRangeCount = 1;
+            plci.pPushConstantRanges = &easuRange;
+            VkPipelineLayoutCreateInfo rcasPlci = plci;
+            rcasPlci.pSetLayouts = &s_fsr.rcasSet;
+            rcasPlci.pPushConstantRanges = &rcasRange;
+            if (!Check(vkCreateDescriptorSetLayout(s_device, &dslci, nullptr, &s_fsr.easuSet), "FSR 1 EASU set layout") ||
+                !Check(vkCreateDescriptorSetLayout(s_device, &rcasDslci, nullptr, &s_fsr.rcasSet), "FSR 1 RCAS set layout") ||
+                !Check(vkCreatePipelineLayout(s_device, &plci, nullptr, &s_fsr.easuLayout), "FSR 1 EASU pipeline layout") ||
+                !Check(vkCreatePipelineLayout(s_device, &rcasPlci, nullptr, &s_fsr.rcasLayout), "FSR 1 RCAS pipeline layout"))
+            {
+                fprintf(stderr, "[video] FSR 1 is off: its pipeline layouts couldn't be made; bicubic upscaling instead\n");
+                return false;
+            }
+            VkShaderModule cs = PostModule(fsr1::EasuGlsl().c_str(), 2);
+            s_fsr.rcasFs = PostModule(fsr1::RcasGlsl().c_str(), 1);
+            if (!cs || !s_fsr.rcasFs)
+            {
+                fprintf(stderr, "[video] FSR 1 is off: its shaders didn't compile; bicubic upscaling instead\n");
+                return false;
+            }
+            VkComputePipelineCreateInfo cpci{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+            cpci.stage = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, cs, "main", nullptr };
+            cpci.layout = s_fsr.easuLayout;
+            const bool made = Check(vkCreateComputePipelines(s_device, VK_NULL_HANDLE, 1, &cpci, nullptr, &s_fsr.easu), "FSR 1 EASU pipeline");
+            vkDestroyShaderModule(s_device, cs, nullptr);
+            if (!made)
+            {
+                fprintf(stderr, "[video] FSR 1 is off: its EASU pipeline couldn't be made; bicubic upscaling instead\n");
+                return false;
+            }
+            s_fsr.ready = true;
+            fprintf(stderr, "[video] FSR 1: EASU and RCAS compiled in %.0f ms\n",
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+            return true;
+        }
+
+        // RCAS's pipeline for the swapchain's format, plain or with the tone
+        // table (Brightness, the 360's display gamma); VK_NULL_HANDLE if it
+        // can't be made (the frame then takes the bicubic pass).
+        VkPipeline RcasPipeline(bool tone)
+        {
+            if (tone && !s_fsr.toneTried)
+            {
+                s_fsr.toneTried = true;
+                const std::string glsl = ToneVariant(fsr1::RcasGlsl().c_str());
+                s_fsr.rcasToneFs = glsl.empty() ? VK_NULL_HANDLE : PostModule(glsl.c_str(), 1);
+                if (!s_fsr.rcasToneFs)
+                    fprintf(stderr, "[video] FSR 1: the RCAS shader with Brightness couldn't be made; bicubic upscaling while the tone is in use\n");
+            }
+            VkShaderModule fs = tone ? s_fsr.rcasToneFs : s_fsr.rcasFs;
+            VkPipeline& pipeline = tone ? s_fsr.rcasTone : s_fsr.rcas;
+            VkFormat& format = tone ? s_fsr.rcasToneFormat : s_fsr.rcasFormat;
+            if (!fs)
+                return VK_NULL_HANDLE;
+            if (pipeline && format == s_swapFormat)
+                return pipeline;
+            if (pipeline)
+                vkDestroyPipeline(s_device, pipeline, nullptr);
+            pipeline = MakeScalePipeline(fs, s_fsr.rcasLayout);
+            format = pipeline ? s_swapFormat : VK_FORMAT_UNDEFINED;
+            return pipeline;
+        }
+
+        void EnsureFsrImage(uint32_t width, uint32_t height)
+        {
+            if (s_fsr.image && s_fsr.width == width && s_fsr.height == height)
+                return;
+            WaitIdle();
+            if (s_fsr.image)
+            {
+                vkDestroyImageView(s_device, s_fsr.view, nullptr);
+                vkDestroyImage(s_device, s_fsr.image, nullptr);
+                vkFreeMemory(s_device, s_fsr.memory, nullptr);
+            }
+            VkImageCreateInfo ii{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+            ii.imageType = VK_IMAGE_TYPE_2D;
+            ii.format = VK_FORMAT_R8G8B8A8_UNORM;
+            ii.extent = { width, height, 1 };
+            ii.mipLevels = 1;
+            ii.arrayLayers = 1;
+            ii.samples = VK_SAMPLE_COUNT_1_BIT;
+            ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+            ii.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+            vkCreateImage(s_device, &ii, nullptr, &s_fsr.image);
+            VkMemoryRequirements req;
+            vkGetImageMemoryRequirements(s_device, s_fsr.image, &req);
+            VkMemoryAllocateInfo ai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+            ai.allocationSize = req.size;
+            ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            vkAllocateMemory(s_device, &ai, nullptr, &s_fsr.memory);
+            vkBindImageMemory(s_device, s_fsr.image, s_fsr.memory, 0);
+            VkImageViewCreateInfo vci{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+            vci.image = s_fsr.image;
+            vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            vci.format = VK_FORMAT_R8G8B8A8_UNORM;
+            vci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+            vkCreateImageView(s_device, &vci, nullptr, &s_fsr.view);
+            s_fsr.width = width;
+            s_fsr.height = height;
+        }
+
+        // EASU: the w x h frame (scaleInput) enlarged to dw x dh in
+        // s_fsr.image, ready for RCAS's reads. Outside a rendering pass.
+        void RecordEasu(VkCommandBuffer cmd, VkImageView scaleInput, uint32_t w, uint32_t h, int32_t dw, int32_t dh,
+            const video::FrameBand& band, bool bandOn)
+        {
+            EnsureFsrImage(uint32_t(dw), uint32_t(dh));
+            // After the last frame's RCAS read it.
+            Barrier(cmd, s_fsr.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT,
+                VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+            VkDescriptorImageInfo in{ s_post.sampler, scaleInput, VK_IMAGE_LAYOUT_GENERAL };
+            VkDescriptorImageInfo out{ VK_NULL_HANDLE, s_fsr.view, VK_IMAGE_LAYOUT_GENERAL };
+            VkWriteDescriptorSet writes[2] = {
+                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 0, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &in, nullptr, nullptr },
+                { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &out, nullptr, nullptr },
+            };
+            EasuPush pc{};
+            const std::array<uint32_t, 16> con = fsr1::EasuConstants(w, h, uint32_t(dw), uint32_t(dh));
+            std::copy(con.begin(), con.end(), pc.con);
+            pc.band[0] = band.x0;
+            pc.band[1] = band.x1;
+            pc.band[2] = band.y0;
+            pc.band[3] = band.y1;
+            pc.outW = dw;
+            pc.outH = dh;
+            pc.srcW = int32_t(w);
+            pc.srcH = int32_t(h);
+            pc.bandOn = bandOn ? 1u : 0u;
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_fsr.easu);
+            s_post.pushDescriptorSet(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_fsr.easuLayout, 0, 2, writes);
+            vkCmdPushConstants(cmd, s_fsr.easuLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+            vkCmdDispatch(cmd, (uint32_t(dw) + 7) / 8, (uint32_t(dh) + 7) / 8, 1);
+            Barrier(cmd, s_fsr.image, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT,
+                VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+        }
+
+        // Inside a rendering pass on the swapchain image (or a capture's
+        // image of its format): the picture at dx, dy, dw x dh, by `pass`
+        // (FSR 1: RCAS over RecordEasu's image, with `rcas` its pipeline),
+        // through the tone table when `tone`.
+        void DrawPicture(VkCommandBuffer cmd, upscale::Pass pass, VkPipeline rcas, bool tone, VkImageView scaleInput, uint32_t w,
+            uint32_t h, const video::FrameBand& band, bool bandOn, int32_t dx, int32_t dy, int32_t dw, int32_t dh, float sharpen)
+        {
+            VkViewport viewport{ float(dx), float(dy), float(dw), float(dh), 0.0f, 1.0f };
+            VkRect2D scissor{ { dx, dy }, { uint32_t(dw), uint32_t(dh) } };
+            vkCmdSetViewport(cmd, 0, 1, &viewport);
+            vkCmdSetScissor(cmd, 0, 1, &scissor);
+            const bool fsr = pass == upscale::Pass::Fsr1;
+            const VkPipelineLayout layout = fsr ? s_fsr.rcasLayout : tone ? s_tone.layout : s_post.scaleLayout;
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, fsr ? rcas : tone ? s_tone.pipeline : s_post.scale);
+            VkDescriptorImageInfo in{ s_post.sampler, fsr ? s_fsr.view : scaleInput, VK_IMAGE_LAYOUT_GENERAL };
+            VkWriteDescriptorSet write{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 0, 0, 1,
+                VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &in, nullptr, nullptr };
+            if (tone)
+            {
+                VkDescriptorImageInfo table{ s_post.sampler, s_tone.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+                VkWriteDescriptorSet writes[2] = { write, write };
+                writes[1].dstBinding = 1;
+                writes[1].pImageInfo = &table;
+                s_post.pushDescriptorSet(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 2, writes);
+            }
+            else
+                s_post.pushDescriptorSet(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &write);
+            if (fsr)
+            {
+                RcasPush pc{};
+                const std::array<uint32_t, 4> con = fsr1::RcasConstants(upscale::RcasStops(sharpen));
+                std::copy(con.begin(), con.end(), pc.con);
+                pc.band[0] = band.x0;
+                pc.band[1] = band.x1;
+                pc.band[2] = band.y0;
+                pc.band[3] = band.y1;
+                pc.originX = dx;
+                pc.originY = dy;
+                pc.outW = dw;
+                pc.outH = dh;
+                pc.srcW = int32_t(w);
+                pc.srcH = int32_t(h);
+                pc.bandOn = bandOn ? 1u : 0u;
+                vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
+            }
+            else
+            {
+                // 2: the picture as wide as the frame (its columns the
+                // frame's, the viewport at a whole pixel): kScaleFs scales
+                // down each column only, the same picture from half the
+                // fetches (a Steam Deck's 1280x720 -> 1280x800).
+                const uint32_t mode = pass != upscale::Pass::Bicubic ? 0u : dw == int32_t(w) ? 2u : 1u;
+                struct
+                {
+                    float width, height, sharpen;
+                    uint32_t bicubic;
+                    float band[4];
+                    uint32_t bandOn;
+                } pc = { float(w), float(h), sharpen, mode,
+                    { float(band.x0), float(band.x1), float(band.y0), float(band.y1) }, bandOn ? 1u : 0u };
+                static_assert(sizeof(pc) == 36);
+                vkCmdPushConstants(cmd, layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
+            }
+            vkCmdDraw(cmd, 3, 1, 0, 0);
+        }
+
+        // The pass a frame takes (video/upscale.h), FSR 1 only where its
+        // pipelines are ready (made here the first time); a line in the log
+        // when the pass or the sizes change.
+        upscale::Pass ChoosePass(bool tone, uint32_t w, uint32_t h, int32_t dw, int32_t dh, VkPipeline& rcas)
+        {
+            rcas = VK_NULL_HANDLE;
+            upscale::Pass pass = upscale::Choose(settings::GetInt(settings::Id::Scaling), w, h, dw, dh);
+            if (pass == upscale::Pass::Fsr1 && EnsureFsr())
+                rcas = RcasPipeline(tone);
+            if (pass == upscale::Pass::Fsr1 && !rcas)
+                pass = upscale::Pass::Bicubic;
+            static upscale::Pass lastPass = upscale::Pass::Linear;
+            static uint32_t lastW = 0, lastH = 0;
+            static int32_t lastDw = 0, lastDh = 0;
+            static int lines = 0;
+            if ((pass != lastPass || w != lastW || h != lastH || dw != lastDw || dh != lastDh) && lines < 32)
+            {
+                lines++;
+                const bool fsrChosen = settings::GetInt(settings::Id::Scaling) == int32_t(settings::ScalingMode::Fsr1);
+                fprintf(stderr, "[video] upscaling: %s, %ux%u -> %dx%d%s\n", upscale::PassName(pass), w, h, dw, dh,
+                    pass == upscale::Pass::Fsr1 ? std::format(" (RCAS at {:.2f} of its strength)", upscale::RcasAmount(Sharpen())).c_str()
+                    : !fsrChosen ? ""
+                    : upscale::Enlarged(w, h, dw, dh) ? " (FSR 1 unavailable)" : " (FSR 1 only enlarges)");
+            }
+            lastPass = pass;
+            lastW = w;
+            lastH = h;
+            lastDw = dw;
+            lastDh = dh;
+            return pass;
+        }
+
+        // NFSMW_UPSCALE_COMPARE=<passes> (a diagnostic): with each
+        // NFSMW_CHECK_PRESENT_SEC capture, the same frame drawn again by each
+        // listed pass into an image of its own (the swapchain's size and
+        // format, without the UI), saved as
+        // build/present_check_<k>_<name>.ppm: side-by-sides of one frame.
+        // Passes: bicubic, linear, fsr1, each at Sharpening or with
+        // :<sharpening> (fsr1:0 is EASU alone). fsr1 where the frame isn't
+        // enlarged draws bicubic, as the setting does. "source": the frame
+        // the passes start from (after the anti-aliasing), at its own size
+        // (through the tone table when that is in use).
+        struct CompareEntry
+        {
+            std::string name;
+            int32_t mode;
+            float sharpen;  // < 0: Sharpening's
+            bool source = false;
+        };
+        const std::vector<CompareEntry>& CompareList()
+        {
+            static const std::vector<CompareEntry> list = [] {
+                std::vector<CompareEntry> entries;
+                const char* v = std::getenv("NFSMW_UPSCALE_COMPARE");
+                std::string text = v ? v : "";
+                for (size_t at = 0; at < text.size();)
+                {
+                    size_t end = text.find(',', at);
+                    std::string item = text.substr(at, end == std::string::npos ? std::string::npos : end - at);
+                    at = end == std::string::npos ? text.size() : end + 1;
+                    std::string kind = item.substr(0, item.find(':'));
+                    float sharpen = item.find(':') == std::string::npos ? -1.0f : std::strtof(item.c_str() + item.find(':') + 1, nullptr);
+                    int32_t mode = kind == "fsr1" ? int32_t(upscale::Mode::Fsr1) : kind == "linear" || kind == "source" ? int32_t(upscale::Mode::Linear)
+                        : kind == "bicubic" ? int32_t(upscale::Mode::Bicubic) : -1;
+                    if (mode < 0)
+                    {
+                        fprintf(stderr, "[video] NFSMW_UPSCALE_COMPARE: \"%s\" isn't bicubic, linear, fsr1[:<sharpening>] or source\n", item.c_str());
+                        continue;
+                    }
+                    std::string name = item;
+                    std::replace(name.begin(), name.end(), ':', '-');
+                    entries.push_back({ name, mode, sharpen, kind == "source" });
+                }
+                return entries;
+            }();
+            return list;
+        }
+
+        struct CompareShot
+        {
+            std::string name;
+            VkImage image = VK_NULL_HANDLE;
+            VkDeviceMemory memory = VK_NULL_HANDLE;
+            VkImageView view = VK_NULL_HANDLE;
+            VkBuffer buffer = VK_NULL_HANDLE;
+            VkDeviceMemory bufferMemory = VK_NULL_HANDLE;
+            uint32_t width = 0, height = 0;
+        };
+
+        // Records each listed pass's picture of this frame and its copy to
+        // the host. Outside a rendering pass.
+        std::vector<CompareShot> RecordCompare(VkCommandBuffer cmd, bool tone, VkImageView scaleInput, uint32_t w, uint32_t h,
+            const video::FrameBand& band, bool bandOn, int32_t dx, int32_t dy, int32_t dw, int32_t dh)
+        {
+            std::vector<CompareShot> shots;
+            for (const CompareEntry& entry : CompareList())
+            {
+                CompareShot shot;
+                shot.name = entry.name;
+                // The source: the frame image 1:1 (a bilinear fetch at each texel's centre).
+                shot.width = entry.source ? w : s_swapExtent.width;
+                shot.height = entry.source ? h : s_swapExtent.height;
+                const int32_t x = entry.source ? 0 : dx, y = entry.source ? 0 : dy;
+                const int32_t width = entry.source ? int32_t(w) : dw, height = entry.source ? int32_t(h) : dh;
+                VkImageCreateInfo ii{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+                ii.imageType = VK_IMAGE_TYPE_2D;
+                ii.format = s_swapFormat;
+                ii.extent = { shot.width, shot.height, 1 };
+                ii.mipLevels = 1;
+                ii.arrayLayers = 1;
+                ii.samples = VK_SAMPLE_COUNT_1_BIT;
+                ii.tiling = VK_IMAGE_TILING_OPTIMAL;
+                ii.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+                if (vkCreateImage(s_device, &ii, nullptr, &shot.image) != VK_SUCCESS)
+                    break;
+                VkMemoryRequirements req;
+                vkGetImageMemoryRequirements(s_device, shot.image, &req);
+                VkMemoryAllocateInfo ai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+                ai.allocationSize = req.size;
+                ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                vkAllocateMemory(s_device, &ai, nullptr, &shot.memory);
+                vkBindImageMemory(s_device, shot.image, shot.memory, 0);
+                VkImageViewCreateInfo vci{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+                vci.image = shot.image;
+                vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+                vci.format = s_swapFormat;
+                vci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+                vkCreateImageView(s_device, &vci, nullptr, &shot.view);
+                VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+                bci.size = VkDeviceSize(shot.width) * shot.height * 4;
+                bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+                vkCreateBuffer(s_device, &bci, nullptr, &shot.buffer);
+                vkGetBufferMemoryRequirements(s_device, shot.buffer, &req);
+                ai.allocationSize = req.size;
+                ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                vkAllocateMemory(s_device, &ai, nullptr, &shot.bufferMemory);
+                vkBindBufferMemory(s_device, shot.buffer, shot.bufferMemory, 0);
+
+                VkPipeline rcas = VK_NULL_HANDLE;
+                upscale::Pass pass = upscale::Choose(entry.mode, w, h, width, height);
+                if (pass == upscale::Pass::Fsr1 && EnsureFsr())
+                    rcas = RcasPipeline(tone);
+                if (pass == upscale::Pass::Fsr1 && !rcas)
+                    pass = upscale::Pass::Bicubic;
+                if (pass == upscale::Pass::Fsr1)
+                    RecordEasu(cmd, scaleInput, w, h, width, height, band, bandOn);
+                Barrier(cmd, shot.image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+                VkRenderingAttachmentInfoKHR color{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR };
+                color.imageView = shot.view;
+                color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+                color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+                VkRenderingInfoKHR ri{ VK_STRUCTURE_TYPE_RENDERING_INFO_KHR };
+                ri.renderArea = { { 0, 0 }, { shot.width, shot.height } };
+                ri.layerCount = 1;
+                ri.colorAttachmentCount = 1;
+                ri.pColorAttachments = &color;
+                s_context.cmdBeginRendering(cmd, &ri);
+                DrawPicture(cmd, pass, rcas, tone, scaleInput, w, h, band, bandOn, x, y, width, height,
+                    entry.sharpen >= 0.0f ? std::min(entry.sharpen, 1.0f) : Sharpen());
+                s_context.cmdEndRendering(cmd);
+                Barrier(cmd, shot.image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT);
+                VkBufferImageCopy region{};
+                region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+                region.imageExtent = { shot.width, shot.height, 1 };
+                vkCmdCopyImageToBuffer(cmd, shot.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, shot.buffer, 1, &region);
+                VkBufferMemoryBarrier hostRead{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
+                hostRead.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                hostRead.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+                hostRead.srcQueueFamilyIndex = hostRead.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                hostRead.buffer = shot.buffer;
+                hostRead.size = VK_WHOLE_SIZE;
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 0, nullptr, 1, &hostRead, 0, nullptr);
+                fprintf(stderr, "[video] NFSMW_UPSCALE_COMPARE: %s drawn by %s\n", entry.name.c_str(), upscale::PassName(pass));
+                shots.push_back(shot);
+            }
+            return shots;
+        }
+
+        // After the frame's fence: RecordCompare's pictures saved and freed.
+        void SaveCompare(std::vector<CompareShot>& shots, int captureIndex)
+        {
+            const bool bgr = s_swapFormat == VK_FORMAT_B8G8R8A8_UNORM || s_swapFormat == VK_FORMAT_B8G8R8A8_SRGB;
+            for (CompareShot& shot : shots)
+            {
+                void* mapped = nullptr;
+                const size_t pixels = size_t(shot.width) * shot.height;
+                if (vkMapMemory(s_device, shot.bufferMemory, 0, VkDeviceSize(pixels) * 4, 0, &mapped) == VK_SUCCESS)
+                {
+                    std::string path = std::format("build/present_check_{}_{}.ppm", captureIndex, shot.name);
+                    if (FILE* out = fopen(path.c_str(), "wb"))
+                    {
+                        fprintf(out, "P6\n%u %u\n255\n", shot.width, shot.height);
+                        const uint8_t* px = static_cast<const uint8_t*>(mapped);
+                        std::vector<uint8_t> rgb(pixels * 3);
+                        for (size_t i = 0; i < pixels; i++)
+                            for (int k = 0; k < 3; k++)
+                                rgb[i * 3 + k] = px[i * 4 + (bgr ? 2 - k : k)];
+                        fwrite(rgb.data(), 1, rgb.size(), out);
+                        fclose(out);
+                        fprintf(stderr, "[video] NFSMW_UPSCALE_COMPARE: saved %s\n", path.c_str());
+                    }
+                    vkUnmapMemory(s_device, shot.bufferMemory);
+                }
+                vkDestroyImageView(s_device, shot.view, nullptr);
+                vkDestroyImage(s_device, shot.image, nullptr);
+                vkFreeMemory(s_device, shot.memory, nullptr);
+                vkDestroyBuffer(s_device, shot.buffer, nullptr);
+                vkFreeMemory(s_device, shot.bufferMemory, nullptr);
+            }
+            shots.clear();
         }
 
         // Xenia's Tiled2D for 32x32-aligned pitches (texture_address.h).
@@ -2442,6 +2532,11 @@ void main()
             fprintf(stderr, "[video] SDL_CreateWindow: %s\n", SDL_GetError());
             return false;
         }
+#if defined(__APPLE__) && !TARGET_OS_IOS
+        // The title bar over the picture (platform/macos_window.h); a window
+        // made fullscreen gets it when it leaves fullscreen.
+        platform::macos::ConfigureWindow(s_window, !startFullscreen);
+#endif
 #if defined(__APPLE__) && TARGET_OS_IOS
         platform::ios::WatchKeyboards(s_window);
 #endif
@@ -3495,6 +3590,10 @@ void main()
         platform::ios::PollBattery();  // every 5 seconds
 #endif
         ScriptedWindowSizes();
+        // SIGTERM, SIGINT, SIGHUP (platform/quit_signals.h): the window's
+        // way out, from the game, the installer or the startup error page.
+        if (quitsignals::Requested())
+            return false;
         SDL_Event e;
         while (SDL_PollEvent(&e))
         {
@@ -3536,6 +3635,14 @@ void main()
                     fprintf(stderr, "[video] fullscreen %s by the system (the window's fullscreen button or menu, or the window "
                         "manager), for this session; the Fullscreen setting (%s) is unchanged and decides the next launch\n",
                         on ? "on" : "off", settings::GetBool(settings::Id::Fullscreen) ? "On" : "Off");
+#if defined(__APPLE__) && !TARGET_OS_IOS
+                // SDL took the title bar off the picture for the fullscreen
+                // Space: back on here, in the event loop, after SDL's own
+                // callbacks (platform/macos_window.h says why not sooner).
+                int windowW = 0, windowH = 0;
+                if (!on && platform::macos::RestoreAfterFullscreen(s_window) && SDL_GetWindowSize(s_window, &windowW, &windowH))
+                    fprintf(stderr, "[video] the title bar over the picture again (window %dx%d)\n", windowW, windowH);
+#endif
             }
         }
         // Without the queue lock: the command processor's submits take it,
@@ -3714,6 +3821,26 @@ void main()
                 s_postFrames++;
                 s_postAaNs += uint64_t(double(ts[1] - ts[0]) * s_timestampPeriod);
                 s_postNs += uint64_t(double(ts[2] - ts[0]) * s_timestampPeriod);
+                if (s_upscaleAb)
+                {
+                    const int k = int(f.pass);
+                    s_abFrames[k]++;
+                    s_abNs[k] += uint64_t(double(ts[2] - ts[0]) * s_timestampPeriod);
+                    s_abAaNs[k] += uint64_t(double(ts[1] - ts[0]) * s_timestampPeriod);
+                    if ((s_abFrames[0] + s_abFrames[1] + s_abFrames[2]) % 600 == 0)
+                    {
+                        std::string text;
+                        for (upscale::Pass pass : { upscale::Pass::Bicubic, upscale::Pass::Fsr1, upscale::Pass::Linear })
+                        {
+                            const int i = int(pass);
+                            if (s_abFrames[i])
+                                text += std::format(" | {}: {:.3f} ms (AA {:.3f} ms) over {} frames", upscale::PassName(pass),
+                                    double(s_abNs[i]) / 1e6 / double(s_abFrames[i]), double(s_abAaNs[i]) / 1e6 / double(s_abFrames[i]), s_abFrames[i]);
+                            s_abFrames[i] = s_abNs[i] = s_abAaNs[i] = 0;
+                        }
+                        fprintf(stderr, "[upscale-ab] post-processing GPU per frame%s\n", text.c_str());
+                    }
+                }
             }
             f.timed = false;
         }
@@ -3816,6 +3943,7 @@ void main()
         VkDeviceMemory captureMemory = VK_NULL_HANDLE;
         VkDeviceSize captureSize = 0;
         int captureIndex = -1;
+        std::vector<CompareShot> compareShots;  // NFSMW_UPSCALE_COMPARE
         // Letterbox to the source aspect ratio; or, on a screen of another
         // shape with Aspect Ratio on Auto, fill it (video/picture_fit): the
         // game draws that frame with its view widened (a wider screen, Hor+)
@@ -3872,15 +4000,6 @@ void main()
         }
         VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
         const bool post = haveSource && EnsurePostProcessing();
-        // Upscaling FSR 1: only where the picture is the frame scaled up (or
-        // 1:1) on both axes. EASU is an upscaler (1x to 4x in area): a frame
-        // larger than its picture (2x on a 1080p screen) is scaled bicubic,
-        // as on a device that can't make FSR's pipelines.
-        const bool fsrAsked = post && Fsr1();
-        const bool fsr = fsrAsked && dw >= int32_t(w) && dh >= int32_t(h) && EnsureFsr();
-        const bool rcas = fsr && Sharpen() > 0.0f;
-        if (post)
-            LogPostChain(fsrAsked, fsr, rcas, w, h, dw, dh);
         if (post || !haveSource)
         {
             // Draw into the swapchain image: the scaled game frame (if any),
@@ -3918,11 +4037,8 @@ void main()
                 if (AaEnabled())
                 {
                     EnsureAaImage(w, h);
-                    // (After the last frame's reads: the scale pass's, or with
-                    // FSR 1 its EASU pass's, a compute one.)
                     Barrier(cmd, s_post.aaImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT,
-                        VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | (s_post.easuEver ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : 0),
-                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                        VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
                     VkDescriptorImageInfo in{ s_post.sampler, f.sourceView, VK_IMAGE_LAYOUT_GENERAL };
                     VkDescriptorImageInfo out{ VK_NULL_HANDLE, s_post.aaView, VK_IMAGE_LAYOUT_GENERAL };
                     VkWriteDescriptorSet writes[2] = {
@@ -3942,53 +4058,27 @@ void main()
                     vkCmdPushConstants(cmd, s_post.aaLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
                     vkCmdDispatch(cmd, (w + 7) / 8, (h + 7) / 8, 1);
                     Barrier(cmd, s_post.aaImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT,
-                        VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | (fsr ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : 0));
+                        VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
                     scaleInput = s_post.aaView;
                 }
                 if (f.timed)
                     vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s_timestamps, s_frameIndex * 3 + 1);
-                if (fsr)
-                {
-                    // EASU: the frame (anti-aliased, or as rendered) to the
-                    // picture's size, kept to the 16:9 band's spans as the AA
-                    // pass is (the band in the frame's texels). Its image is
-                    // then the scale pass's input, drawn 1:1 by RCAS (or
-                    // copied: Sharpening 0).
-                    EnsureEasuImage(uint32_t(dw), uint32_t(dh));
-                    Barrier(cmd, s_post.easuImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT,
-                        VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-                    VkDescriptorImageInfo in{ s_post.sampler, scaleInput, VK_IMAGE_LAYOUT_GENERAL };
-                    VkDescriptorImageInfo out{ VK_NULL_HANDLE, s_post.easuView, VK_IMAGE_LAYOUT_GENERAL };
-                    VkWriteDescriptorSet writes[2] = {
-                        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 0, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &in, nullptr, nullptr },
-                        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &out, nullptr, nullptr },
-                    };
-                    const std::array<float, 4> con0 = EasuCon0(w, h, dw, dh);
-                    struct
-                    {
-                        float con0[4];
-                        int32_t inWidth, inHeight, outWidth, outHeight;
-                        int32_t band[4];
-                        uint32_t bandOn;
-                    } pc = { { con0[0], con0[1], con0[2], con0[3] }, int32_t(w), int32_t(h), dw, dh, { band.x0, band.x1, band.y0, band.y1 },
-                        bandOn ? 1u : 0u };
-                    static_assert(sizeof(pc) == 52);
-                    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_post.easu);
-                    s_post.pushDescriptorSet(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_post.easuLayout, 0, 2, writes);
-                    vkCmdPushConstants(cmd, s_post.easuLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-                    vkCmdDispatch(cmd, (uint32_t(dw) + 7) / 8, (uint32_t(dh) + 7) / 8, 1);
-                    Barrier(cmd, s_post.easuImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT,
-                        VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-                    scaleInput = s_post.easuView;
-                    s_post.easuEver = true;
-                }
             }
 
             // Brightness and the 360's display gamma: false at Brightness 0
             // with the gamma off, and then the scale pass below is exactly as
             // before.
             const bool tone = scaleInput && PrepareTone(cmd);
+            // The pass that draws the picture (video/upscale.h): FSR 1's
+            // EASU first, outside the swapchain image's pass.
+            VkPipeline rcas = VK_NULL_HANDLE;
+            upscale::Pass pass = scaleInput ? ChoosePass(tone, w, h, dw, dh, rcas) : upscale::Pass::Bicubic;
+            static uint64_t abCount = 0;
+            if (s_upscaleAb && pass == upscale::Pass::Fsr1 && (abCount++ & 1))
+                pass = upscale::Pass::Bicubic;
+            f.pass = pass;
+            if (scaleInput && pass == upscale::Pass::Fsr1)
+                RecordEasu(cmd, scaleInput, w, h, dw, dh, band, bandOn);
             Barrier(cmd, dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, 0,
                 VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
             VkRenderingAttachmentInfoKHR color{ VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR };
@@ -4006,62 +4096,7 @@ void main()
             s_context.cmdBeginRendering(cmd, &ri);
             if (scaleInput)
             {
-                VkViewport viewport{ float(dx), float(dy), float(dw), float(dh), 0.0f, 1.0f };
-                VkRect2D scissor{ { dx, dy }, { uint32_t(dw), uint32_t(dh) } };
-                vkCmdSetViewport(cmd, 0, 1, &viewport);
-                vkCmdSetScissor(cmd, 0, 1, &scissor);
-                // FSR 1: RCAS draws EASU's image 1:1 (with the tone, its
-                // variant; one that can't be made leaves RCAS out). Else the
-                // scale pass, which with FSR 1 copies EASU's image 1:1
-                // (Sharpening 0), and without scales the frame as before
-                // (bicubic where FSR 1 was asked for but isn't used).
-                const bool rcasPass = rcas && (!tone || EnsureToneRcas());
-                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                    rcasPass ? (tone ? s_tone.rcasPipeline : s_post.rcas) : tone ? s_tone.pipeline : s_post.scale);
-                VkDescriptorImageInfo in{ s_post.sampler, scaleInput, VK_IMAGE_LAYOUT_GENERAL };
-                VkWriteDescriptorSet write{ VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 0, 0, 1,
-                    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &in, nullptr, nullptr };
-                const VkPipelineLayout scaleLayout = rcasPass ? (tone ? s_tone.rcasLayout : s_post.rcasLayout) : tone ? s_tone.layout : s_post.scaleLayout;
-                if (tone)
-                {
-                    VkDescriptorImageInfo table{ s_post.sampler, s_tone.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
-                    VkWriteDescriptorSet writes[2] = { write, write };
-                    writes[1].dstBinding = 1;
-                    writes[1].pImageInfo = &table;
-                    s_post.pushDescriptorSet(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, scaleLayout, 0, 2, writes);
-                }
-                else
-                    s_post.pushDescriptorSet(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, scaleLayout, 0, 1, &write);
-                if (rcasPass)
-                {
-                    struct
-                    {
-                        int32_t outWidth, outHeight, inWidth, inHeight;
-                        int32_t band[4];
-                        float con;
-                        uint32_t bandOn;
-                    } pc = { dw, dh, int32_t(w), int32_t(h), { band.x0, band.x1, band.y0, band.y1 }, std::exp2(-RcasStops(Sharpen())),
-                        bandOn ? 1u : 0u };
-                    static_assert(sizeof(pc) == 40);
-                    vkCmdPushConstants(cmd, scaleLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
-                }
-                else
-                {
-                    bool bicubic = Bicubic() || fsrAsked;
-                    struct
-                    {
-                        float width, height, sharpen;
-                        uint32_t bicubic;
-                        float band[4];
-                        uint32_t bandOn;
-                    } pc = { float(w), float(h), Sharpen(), bicubic ? 1u : 0u, { float(band.x0), float(band.x1), float(band.y0), float(band.y1) },
-                        bandOn ? 1u : 0u };
-                    if (fsr)
-                        pc = { float(dw), float(dh), 0.0f, 0u, {}, 0u };  // EASU's image, 1:1: a plain copy
-                    static_assert(sizeof(pc) == 36);
-                    vkCmdPushConstants(cmd, scaleLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
-                }
-                vkCmdDraw(cmd, 3, 1, 0, 0);
+                DrawPicture(cmd, pass, rcas, tone, scaleInput, w, h, band, bandOn, dx, dy, dw, dh, Sharpen());
                 if ((!captures.empty() || !frameShots.empty()) && pictureRect.extent.width)
                 {
                     // The game's picture alone: pause the pass, copy it out,
@@ -4150,6 +4185,8 @@ void main()
             else
                 Barrier(cmd, dst, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                     VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, 0, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+            if (captureIndex >= 0 && scaleInput)
+                compareShots = RecordCompare(cmd, tone, scaleInput, w, h, band, bandOn, dx, dy, dw, dh);
             if (post && !gpuImage)
                 Barrier(cmd, s_source, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_SHADER_READ_BIT,
                     VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
@@ -4312,7 +4349,7 @@ void main()
         if (s_presentTiming && shown.image)
         {
             std::lock_guard lock(s_timingMutex);
-            s_timings.push_back({ id, s_swapchain, presented, frameVblank });
+            s_timings.push_back({ id, s_swapchainGeneration, presented, frameVblank });
             s_timingCv.notify_one();
         }
         s_lastPresent = std::chrono::steady_clock::now();
@@ -4372,6 +4409,12 @@ void main()
             vkUnmapMemory(s_device, captureMemory);
             vkDestroyBuffer(s_device, captureBuffer, nullptr);
             vkFreeMemory(s_device, captureMemory, nullptr);
+        }
+        if (!compareShots.empty())
+        {
+            if (vkWaitForFences(s_device, 1, &f.inFlight, VK_TRUE, UINT64_MAX) == VK_ERROR_DEVICE_LOST)
+                DeviceLost("vkWaitForFences (a frame saved for a comparison)");
+            SaveCompare(compareShots, captureIndex);
         }
         // The next frame's CheckSwapchain builds again (before its acquire),
         // or its start makes a new surface first.
@@ -4625,10 +4668,12 @@ void main()
             s_uiReady = false;
         }
         hid::Shutdown();  // a rumble under way would otherwise carry on
-        {
-            std::lock_guard wait(s_waitSwapchainMutex);  // the present waiter is off the swapchain
-            s_waitSwapchain = VK_NULL_HANDLE;
-        }
+        s_swapchainUse.Retire();  // the present waiter is off the swapchain, and stays off
+        // Then the title bar's styling lets go of the window (Retire first:
+        // nothing presents to it while it is taken apart), then SDL frees it.
+#if defined(__APPLE__) && !TARGET_OS_IOS
+        platform::macos::ForgetWindow(s_window);
+#endif
         if (s_window)
             SDL_DestroyWindow(s_window);
         // No SDL_Quit: the process exits next, and the game's audio thread

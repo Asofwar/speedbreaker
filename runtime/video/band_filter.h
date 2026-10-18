@@ -56,4 +56,29 @@ namespace video::band
     {
         return std::clamp(i, s.a, s.b - 1);
     }
+
+    // FSR 1 (video/fsr1.cpp's GLSL). Its passes work on output pixels: the
+    // picture's pixel i of outSize along an axis has its centre at this
+    // coordinate of the srcSize-texel frame image, and its span is the one
+    // holding it (SpanOf). EASU keeps each of its taps (texels floor(t -
+    // 0.5) - 1 to + 2) in that span with ClampTexel.
+    inline float SourceOf(int32_t i, int32_t outSize, int32_t srcSize)
+    {
+        return (float(i) + 0.5f) * float(srcSize) / float(outSize);
+    }
+
+    // Which span holds t: 0 [0, lo), 1 [lo, hi), 2 [hi, size).
+    inline int SpanIndex(float t, int32_t lo, int32_t hi)
+    {
+        return t < float(lo) ? 0 : t < float(hi) ? 1 : 2;
+    }
+
+    // RCAS's neighbour j (i +- 1) of output pixel i: j, or i itself where
+    // j's centre lies in another span (its span's edge pixel, as ClampTexel
+    // keeps a tap), so the sharpening never reads across the band's edge.
+    inline int32_t RcasNeighbour(int32_t i, int32_t j, int32_t lo, int32_t hi, int32_t outSize, int32_t srcSize)
+    {
+        j = std::clamp(j, 0, outSize - 1);
+        return SpanIndex(SourceOf(j, outSize, srcSize), lo, hi) == SpanIndex(SourceOf(i, outSize, srcSize), lo, hi) ? j : i;
+    }
 }

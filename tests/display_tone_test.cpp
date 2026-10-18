@@ -315,8 +315,7 @@ namespace
         ss << in.rdbuf();
         std::string src = ss.str();
         CHECK(!src.empty(), "can't read %s", path);
-        // (And Upscaling FSR 1's RCAS pass, which ToneVariant wraps the same way.)
-        for (const char* name : { "kScaleFs", "kScaleFastFs", "kRcasFs" })
+        for (const char* name : { "kScaleFs", "kScaleFastFs" })
         {
             std::string open = std::string("const char* ") + name + " = R\"(";
             size_t a = src.find(open);
@@ -334,7 +333,6 @@ namespace
         // tone pipeline only from ToneVariant.
         CHECK(src.find("s_post.fs = PostModule(s_fastScale ? kScaleFastFs : kScaleFs, 1);") != std::string::npos, "the plain scale shader");
         CHECK(src.find("ToneVariant(s_fastScale ? kScaleFastFs : kScaleFs)") != std::string::npos, "the tone variant's source");
-        CHECK(src.find("ToneVariant(kRcasFs)") != std::string::npos, "RCAS's tone variant's source");
         CHECK(src.find("tone ? s_tone.pipeline : s_post.scale") != std::string::npos, "the scale pass picks the plain pipeline when neutral");
     }
 

@@ -4,6 +4,81 @@ What changed in each SpeedBreaker release, newest first. Each release's notes on
 its entry here, and the game shows the entry once, the first time a new version starts (offline:
 it's built into the game).
 
+## v0.1.6
+
+### What's new
+
+- No more lost sound followed by a freeze. If your audio output stopped taking sound for a while,
+  the game's sound stopped for good, and the game later froze, for example on the save screen
+  after an event. Every version so far had this. Now the game keeps running, unheard, and the
+  sound comes back as soon as the output takes audio again. Thanks to Omega3komma3 for the report
+  and the two bug reports (GitHub issue #20).
+- No more rectangular borders in the Showcase (where you rotate and zoom around a car, in the car
+  lot, the customize shop and on a Blacklist rival's car) or around a Blacklist rival's bio. The
+  Showcase darkens the edges of the garage, and that darkening stopped short of the edges of the
+  screen; the bio's black panel did the same. On a 16:9 screen that left a thin border, as on an
+  Xbox 360, whose TV hid it past the edge of its screen; on a taller screen such as a MacBook or a
+  Steam Deck the Showcase's border was wide at the top and bottom. Both now reach the edges of the
+  screen, on every screen shape. Thanks to DoubleDips, who reported it, and m9cy884mv6-a11y, who
+  confirmed it on the Steam Deck (GitHub issue #19).
+- Mac: in a window, the picture now runs up under a transparent title bar, and the window's
+  buttons show only while you move the mouse over it. Thanks to aleszczynskig, who wrote it
+  (GitHub pull request #23).
+- Mac: on a MacBook Pro's 120 Hz ProMotion screen, switching fullscreen on or off, or resizing the
+  window, could close the game now and then (since v0.1.4; its crash report named "mutex lock
+  failed"). It no longer does.
+- A quit asked for from outside the game is now a normal quit: the stop signal a launcher sends,
+  Ctrl+C, or closing the terminal the game was started from. Your settings are saved, as with
+  Quit Game. Closing its terminal used to end it on the spot, and every session, even one ended
+  with Quit Game, left a crash marker in its logs folder until the next start.
+
+### More about it
+
+- The sound: the log now says when the audio output stopped taking audio and when it came back,
+  and a hang report includes the audio's state.
+- The borders: the few black frames between two shots of the career's opening scene are now
+  black to the edges of the screen too.
+- The title bar: the window's saved size now takes in the title bar, so a window from an earlier
+  version opens a title bar shorter, with the same picture.
+- Quitting: a crash still saves a crash report, and the next start still offers it. A session
+  that ended without quitting (stopped by force, or the power going) now leaves its marker, and
+  the next start's log says so.
+- Updating keeps your saves, settings and the installed game, and needs no disc image: on a Mac,
+  drag the new app into Applications and choose Replace, then Open Anyway once more; on SteamOS,
+  unpack the new download over the old folder.
+
+## v0.1.5
+
+### What's new
+
+- Settings > Controls: every keyboard control can be reassigned, and each control has two keys.
+  Choose a row, Left or Right for its first or second key, press A or Enter, then the new key; Y
+  clears a key, X puts a row's defaults back, Reset page the whole table. The default keys are
+  unchanged (the arrows steer as well as A and D), and the left stick click gets a key of its own,
+  Z. Thanks to love-gamer, who wrote it (GitHub pull request #12).
+- Settings > Graphics > Upscaling has a third choice, FSR 1 (AMD FidelityFX Super Resolution 1),
+  for a window much larger than the Internal Resolution (1x on a 1440p, MacBook or 4K screen):
+  curves, wires and diagonals stay smooth where bicubic shows steps, such as lamp posts against
+  the sky or the speedometer's needle. It is used only when the picture is enlarged. Bicubic stays
+  the default. Not on iPhone and iPad.
+- The race results screen no longer shows a thin strip of the race above and below it. An Xbox 360
+  draws that strip too, and a TV of the time hid it past the edge of its screen; today's screens
+  show the whole picture, so it is now black, on every screen shape (Steam Deck, 16:9 and others).
+
+### More about it
+
+- The Controls page: the keys are saved by name in settings.toml's `[keys]` table (`w`,
+  `left_shift`, `none`). F1, Esc (it cancels a wait) and the Cmd and Windows keys can't be
+  assigned. If you go back to v0.1.4 and change a setting there, it forgets the Controls page's
+  keys.
+- FSR 1: Sharpening sets its sharpening pass too (0.3 of its full strength by default). Bicubic
+  stays the default because FSR 1 makes foliage look a little painted, costs more GPU time (about
+  1 ms a frame on an M1 Pro at 1080p, 0.1 ms on a Steam Machine), and with Internal Resolution on
+  Auto most screens aren't enlarged at all.
+- Updating keeps your saves, settings and the installed game, and needs no disc image: on a Mac,
+  drag the new app into Applications and choose Replace, then Open Anyway once more; on SteamOS,
+  unpack the new download over the old folder.
+
 ## v0.1.4
 
 ### What's new

@@ -21,6 +21,7 @@
 #include "report.h"
 #include "internal.h"
 
+#include <apu/audio.h>
 #include <cpu/guest_thread.h>
 #include <cpu/guest_time.h>
 #include <gpu/command_processor.h>
@@ -234,6 +235,9 @@ namespace report
                 text += std::format("Suspended (the app inactive): {} times, {:.1f} s in all before the last resume{}.\n", suspensions,
                     double(guesttime::PausedNs()) / 1e9, guesttime::Suspended() ? "; suspended now" : "");
             text += "\nCommand processor:\n" + gpu::DescribeState();
+            // The game's sound runs on the render callback, and some of its
+            // waits on its sound commands (GitHub issue #20).
+            text += "\nAudio:\n" + apu::DescribeState();
             text += "\nThreads, where each one is (host stacks, innermost first; recompiled guest functions are "
                     "sub_<guest address>):\n";
             for (const ThreadSample& s : samples)

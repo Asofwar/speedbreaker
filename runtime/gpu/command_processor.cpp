@@ -126,6 +126,7 @@ namespace gpu
         void GuestStore(uint32_t address, const void* data, size_t size)
         {
             writewatch::GpuThreadStore(Physical(address), data, size);
+            g_gpuProgress.Ring();  // a fence or a report a D3D wait may poll (gpu/cp_doorbell.h)
         }
 
         void StoreSwapped(uint32_t address, uint32_t value)
@@ -550,8 +551,9 @@ namespace gpu
                         if (cpuMask & (1u << n))
                             DispatchInterrupt(*guest, 1, n);
                     // From the completion thread, the handler's stores may end
-                    // a WAIT_REG_MEM this thread sleeps in.
+                    // a WAIT_REG_MEM this thread sleeps in, or a D3D wait.
                     g_cpDoorbell.Ring();
+                    g_gpuProgress.Ring();
                 });
                 return true;
             }
@@ -1337,7 +1339,10 @@ namespace gpu
                 // copied, so its ring space is free now. D3D tracks resource
                 // lifetimes with fences, which stay deferred to GPU completion.
                 if (uint32_t wb = s_readWriteback)
+                {
                     *reinterpret_cast<be<uint32_t>*>(Physical(wb)) = writeIndex;
+                    g_gpuProgress.Ring();  // D3D's wait for ring space polls it
+                }
                 lastWork = std::chrono::steady_clock::now();
             }
         }
@@ -1423,8 +1428,10 @@ namespace gpu
                 DispatchInterrupt(thread.ppcContext, 0, 2);
                 // The game's handler clears D3D's presentation flag when the
                 // swap's vblank has come, which ends the command processor's
-                // WAIT_REG_MEM on it: wake it (gpu/cp_doorbell.h).
+                // WAIT_REG_MEM on it: wake it (gpu/cp_doorbell.h), and any
+                // D3D wait on what the handler stored.
                 g_cpDoorbell.Ring();
+                g_gpuProgress.Ring();
                 timing.Add(fired - next, now() - fired);
                 auto status = clock.GetStatus();
                 if (status.locked != locked || status.slips != slips || ++count % 3600 == 0)

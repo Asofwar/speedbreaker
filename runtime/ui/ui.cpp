@@ -17,6 +17,9 @@
 #include <imgui_internal.h>  // DragToScroll: the window under a touch, its scroll and the active item
 #include <platform/ios_ui.h>
 #endif
+#if defined(__APPLE__) && !TARGET_OS_IOS
+#include <platform/macos_window.h>
+#endif
 
 #include <SDL3/SDL.h>
 
@@ -505,6 +508,33 @@ namespace ui
         }
 #endif
 
+#if defined(__APPLE__) && !TARGET_OS_IOS
+        bool s_buttonsShown = true;  // as AppKit makes the window
+        int s_buttonChanges = 0;     // logged, the first few
+
+        // The window's close, minimise and zoom buttons, over the picture in
+        // a window (platform/macos_window.h), come and go with the pointer:
+        // shown while it shows over the window, hidden when it hides (the
+        // mouse still for 2 s), leaves the window, or the app isn't in front
+        // (SDL then gives no window the mouse). In fullscreen they stay:
+        // macOS shows them there only with the menu bar.
+        void UpdateWindowButtons(bool pointerShown)
+        {
+            if (!s_window)
+                return;
+            const bool fullscreen = SDL_GetWindowFlags(s_window) & SDL_WINDOW_FULLSCREEN;
+            const bool shown = fullscreen || (pointerShown && SDL_GetMouseFocus() == s_window);
+            if (shown == s_buttonsShown)
+                return;
+            s_buttonsShown = shown;
+            platform::macos::ShowWindowButtons(s_window, shown);
+            if (++s_buttonChanges <= 6)
+                fprintf(stderr, "[ui] window buttons %s\n",
+                    shown ? (fullscreen ? "shown (fullscreen)" : "shown (the pointer is over the window)")
+                          : "hidden (the pointer hid or left the window)");
+        }
+#endif
+
         // Shows or hides the cursor for now (each frame, and as the menu
         // opens or closes). While a menu or modal page has the mouse, ImGui's
         // backend shows it and picks its shape; otherwise it must keep its
@@ -523,6 +553,9 @@ namespace ui
                     io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
             }
             const bool show = s_cursorIdle.Shows(SDL_GetTicksNS(), menu);
+#if defined(__APPLE__)
+            UpdateWindowButtons(show);  // every time: the pointer can leave without hiding
+#endif
             if (show == s_cursorShown)
                 return;
             s_cursorShown = show;
@@ -645,8 +678,14 @@ namespace ui
                 s_settingsOpen ? CloseSettings() : OpenSettings();
                 return;
             }
+            if (s_settingsOpen && SettingsMenuTakesKey(e.key))
+                return;  // a Controls row took it: ImGui doesn't act on it too
             break;
         }
+        case SDL_EVENT_KEY_UP:
+            if (s_settingsOpen && SettingsMenuTakesKey(e.key))
+                return;  // the release of a key a Controls row took
+            break;
         case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
         case SDL_EVENT_GAMEPAD_BUTTON_UP:
         {
@@ -730,6 +769,10 @@ namespace ui
 
         // NFSMW_UI_KEYS="3:F1,4:Down,4.5:Right": key presses (SDL key names)
         // at seconds since launch, for testing the menus without a person.
+        // A key is pressed and released at once; "Hold Return" only presses
+        // it, "Repeat Return" is the OS's auto-repeat of a held key (a
+        // key-down marked repeat) and "Release Return" lets it go, for a key
+        // held across other keys.
         // FocusLost and FocusGained send the window those events instead (as
         // switching to another window would: Mute in Background). Shot saves
         // the next presented frame as build/ui_shot_<n>.ppm: on the keys'
@@ -742,7 +785,8 @@ namespace ui
         // motion a mouse moving there makes is posted.
         constexpr SDL_Keycode kFocusLost = SDLK_EXTENDED_MASK | 0x7F01, kFocusGained = SDLK_EXTENDED_MASK | 0x7F02,
                               kShot = SDLK_EXTENDED_MASK | 0x7F03, kMouseMove = SDLK_EXTENDED_MASK | 0x7F04;
-        struct Key { double time; SDL_Keycode key; };
+        enum class Press : uint8_t { Tap, Hold, Repeat, Release };
+        struct Key { double time; SDL_Keycode key; Press press = Press::Tap; };
         static const auto start = std::chrono::steady_clock::now();
         static std::vector<Key> keys = [] {
             std::vector<Key> parsed;
@@ -756,12 +800,20 @@ namespace ui
                     if (colon == std::string::npos)
                         continue;
                     std::string name = item.substr(colon + 1);
+                    Press press = Press::Tap;
+                    for (auto [prefix, kind] : { std::pair{ "Hold ", Press::Hold }, std::pair{ "Repeat ", Press::Repeat },
+                             std::pair{ "Release ", Press::Release } })
+                        if (name.starts_with(prefix))
+                        {
+                            press = kind;
+                            name = name.substr(strlen(prefix));
+                        }
                     SDL_Keycode key = name == "FocusLost" ? kFocusLost : name == "FocusGained" ? kFocusGained
                         : name == "Shot"                                                         ? kShot
                         : name == "MouseMove"                                                    ? kMouseMove
                                                                                                  : SDL_GetKeyFromName(name.c_str());
                     if (key != SDLK_UNKNOWN)
-                        parsed.push_back({ std::atof(item.c_str()), key });
+                        parsed.push_back({ std::atof(item.c_str()), key, press });
                     else
                         fprintf(stderr, "[ui] NFSMW_UI_KEYS: unknown key %s\n", item.c_str() + colon + 1);
                 }
@@ -828,8 +880,11 @@ namespace ui
                 fprintf(stderr, "[ui] NFSMW_UI_KEYS: window focus %s\n", keys[next].key == kFocusLost ? "lost" : "gained");
                 continue;
             }
+            const Press press = keys[next].press;
             for (bool down : { true, false })
             {
+                if ((down && press == Press::Release) || (!down && (press == Press::Hold || press == Press::Repeat)))
+                    continue;
                 SDL_Event e{};
                 e.type = down ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
                 e.key.timestamp = SDL_GetTicksNS();
@@ -837,6 +892,7 @@ namespace ui
                 e.key.key = keys[next].key;
                 e.key.scancode = SDL_GetScancodeFromKey(keys[next].key, nullptr);
                 e.key.down = down;
+                e.key.repeat = press == Press::Repeat;
                 SDL_PushEvent(&e);
             }
         }
@@ -955,14 +1011,20 @@ namespace ui
         UpdateScale();
         ImGui::NewFrame();
         // Panels and toasts lay out in the work area: the window's safe area,
-        // clear of an iPhone's Dynamic Island and home indicator (elsewhere
-        // the whole window, as before).
+        // clear of an iPhone's Dynamic Island and home indicator, and below a
+        // Mac window's title bar where that lies over the picture (the
+        // window's buttons are there: platform/macos_window.h); elsewhere the
+        // whole window, as before.
         // (The window's, in its points: kept inside the display, which is
         // the swapchain's shape while FitUiDisplay overrules the window.)
         if (SDL_Rect safe; s_window && SDL_GetWindowSafeArea(s_window, &safe) && safe.w > 0 && safe.h > 0)
         {
             ImGuiViewport* viewport = ImGui::GetMainViewport();
-            const float x0 = std::clamp(float(safe.x), 0.0f, io.DisplaySize.x), y0 = std::clamp(float(safe.y), 0.0f, io.DisplaySize.y);
+            float top = float(safe.y);
+#if defined(__APPLE__) && !TARGET_OS_IOS
+            top = std::max(top, platform::macos::TitleStripHeight(s_window));
+#endif
+            const float x0 = std::clamp(float(safe.x), 0.0f, io.DisplaySize.x), y0 = std::clamp(top, 0.0f, io.DisplaySize.y);
             const float x1 = std::clamp(float(safe.x + safe.w), x0, io.DisplaySize.x), y1 = std::clamp(float(safe.y + safe.h), y0, io.DisplaySize.y);
             if (x1 - x0 >= 1.0f && y1 - y0 >= 1.0f)
             {

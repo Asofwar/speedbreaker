@@ -80,17 +80,23 @@ namespace gpu::renderer
         // by default where passes cost most, the tile GPUs: under MoltenVK
         // (iPad race frame: 46 -> 20 passes; heavy scenes ~4 ms less GPU
         // time) and Turnip on arm64 Linux (Steam Frame: 37 -> 21 passes,
-        // -0.3 ms GPU a busy frame); off elsewhere until measured there.
-        // Lighter passes (NFSMW_UNTILED_AREA, NFSMW_PASS_BARRIER): Apple only.
-        // On the Frame the smaller area cost +0.3 ms (Turnip chooses tiled
-        // or direct rendering by the area) and the barrier changed nothing.
-        // Each variable overrides.
-#if defined(__APPLE__) || (defined(__linux__) && defined(__aarch64__))
+        // -0.3 ms GPU a busy frame); and on x86-64 Linux, measured on the
+        // Steam Deck (below). Lighter passes (NFSMW_UNTILED_AREA,
+        // NFSMW_PASS_BARRIER): Apple and x86-64 Linux. On the Frame the
+        // smaller area cost +0.3 ms (Turnip chooses tiled or direct
+        // rendering by the area) and the barrier changed nothing.
+        // Steam Deck at a 5 W TDP limit, where its GPU (~300 MHz) bounds the
+        // race (alternated runs, 1x): both with NFSMW_RESOLVE_DEFER 33-36 ->
+        // 36-38 fps, GPU busy -1.4 to -2.4 ms a frame (fewer passes and the
+        // deferral alone: about half of it); the pictures as before
+        // (compare_shots.py --strict: 2 of 7 identical, the rest 3 levels
+        // off at most, PSNR 80 dB and up). Each variable overrides.
+#if defined(__APPLE__) || defined(__linux__)
         constexpr bool kFewerPasses = true;
 #else
         constexpr bool kFewerPasses = false;
 #endif
-#ifdef __APPLE__
+#if defined(__APPLE__) || (defined(__linux__) && defined(__x86_64__))
         constexpr bool kLighterPasses = true;
 #else
         constexpr bool kLighterPasses = false;
@@ -211,6 +217,10 @@ namespace gpu::renderer
         constexpr uint32_t kSharedPartBinding = 13;
         bool s_splitMemory = false;
         VkDescriptorBufferInfo s_sharedInfo[4]{};  // the binding(s): [0] alone, or the four parts
+        // The translated shaders' multiplication in the form Mesa folds into
+        // fmulz (shader_translator.cpp, SB_FMULZ): NFSMW_FMULZ=0|1, by default
+        // on with RADV. Set before the first shader is compiled.
+        bool s_fmulz = false;
 
         void SetSharedInfo()
         {
@@ -1237,6 +1247,102 @@ namespace gpu::renderer
 
         void WriteDeferredIn(uint32_t base, uint32_t size);
 
+        // NFSMW_RESOLVE_USE=<swap> (diagnostic, shadow mode): from that swap on,
+        // per resolve destination (its guest range), how often anything read its
+        // guest bytes before the next resolve there wrote them again: GPU work
+        // (EnsureShadow), or the CPU (a page of it no longer GPU-owned: read
+        // back) - or nothing (dead: written over unread). [resolve-use] lines
+        // every 600 swaps and at exit.
+        const uint64_t s_resolveUseFrom = [] { const char* v = std::getenv("NFSMW_RESOLVE_USE"); return v ? uint64_t(std::max(std::atoll(v), 0ll)) : 0ull; }();
+        bool s_resolveUse = false;  // counting (from s_resolveUseFrom)
+        struct ResolveUse
+        {
+            uint32_t width = 0, height = 0, format = 0;
+            bool depth = false, fused = false, partial = false, deferred = false;
+            bool pending = false, gpuRead = false;  // written by a resolve since; read by GPU work since
+            uint64_t resolves = 0, bytes = 0, dead = 0, deadBytes = 0, gpuReads = 0, cpuReads = 0;
+        };
+        std::map<uint64_t, ResolveUse> s_resolveUses;  // (range base << 32) | range bytes
+        bool s_resolveUseQuiet = false;  // (a resolve's own EnsureShadow isn't a read)
+        std::mutex s_resolveUseMutex;    // (the exit report reads the map on another thread)
+        uint64_t s_resolveUseFrames = 0;
+
+        // A resolve into [base, base + size) of `bytes` pixel bytes: the last
+        // one there was read, or not. Returns its entry (for what the resolve
+        // turns out to be).
+        ResolveUse* NoteResolveUse(uint32_t base, uint32_t size, uint32_t w, uint32_t h, uint32_t format, bool depth, uint64_t bytes)
+        {
+            std::lock_guard lock(s_resolveUseMutex);
+            ResolveUse& u = s_resolveUses[uint64_t(base) << 32 | size];
+            if (u.pending)
+            {
+                bool cpu = false;
+                for (uint32_t page = base >> 12; page <= (base + size - 1) >> 12 && !cpu; page++)
+                    cpu = !writewatch::AnyGpuOwned(page << 12, 4096);
+                if (u.gpuRead)
+                    u.gpuReads++;
+                else if (cpu)
+                    u.cpuReads++;
+                else
+                {
+                    u.dead++;
+                    u.deadBytes += bytes;
+                }
+            }
+            u.pending = true;
+            u.gpuRead = false;
+            u.width = w;
+            u.height = h;
+            u.format = format;
+            u.depth = depth;
+            u.resolves++;
+            u.bytes += bytes;
+            return &u;
+        }
+
+        void NoteResolveRead(uint32_t base, uint32_t size)
+        {
+            if (s_resolveUseQuiet)
+                return;
+            std::lock_guard lock(s_resolveUseMutex);
+            for (auto& [key, u] : s_resolveUses)
+            {
+                uint32_t b = uint32_t(key >> 32), n = uint32_t(key);
+                if (u.pending && uint64_t(b) < uint64_t(base) + size && uint64_t(base) < uint64_t(b) + n)
+                    u.gpuRead = true;
+            }
+        }
+
+        void ReportResolveUse(const char* when)
+        {
+            if (!s_resolveUseFrames)
+                return;
+            std::lock_guard lock(s_resolveUseMutex);
+            uint64_t bytes = 0, dead = 0, resolves = 0, deadResolves = 0;
+            std::vector<std::pair<uint64_t, const ResolveUse*>> order;
+            for (auto& [key, u] : s_resolveUses)
+            {
+                bytes += u.bytes;
+                dead += u.deadBytes;
+                resolves += u.resolves;
+                deadResolves += u.dead;
+                order.push_back({ key, &u });
+            }
+            std::sort(order.begin(), order.end(), [](auto& a, auto& b) { return a.second->bytes > b.second->bytes; });
+            const double f = double(s_resolveUseFrames);
+            fprintf(stderr, "[resolve-use] %s, %llu frames: a frame %.1f resolves, %.2f MB; dead (written over unread) %.1f resolves, %.2f MB (%.0f%%)\n",
+                when, (unsigned long long)s_resolveUseFrames, double(resolves) / f, double(bytes) / f / 1048576.0, double(deadResolves) / f,
+                double(dead) / f / 1048576.0, bytes ? 100.0 * double(dead) / double(bytes) : 0.0);
+            for (size_t i = 0; i < order.size() && i < 24; i++)
+            {
+                const ResolveUse& u = *order[i].second;
+                fprintf(stderr, "[resolve-use]   %08X+%u %ux%u fmt %u %s%s%s: %.2f a frame, %.3f MB; dead %llu, read by GPU work %llu, by the CPU %llu\n",
+                    uint32_t(order[i].first >> 32), uint32_t(order[i].first), u.width, u.height, u.format, u.depth ? "depth" : "colour",
+                    u.fused ? (u.partial ? " fused (part)" : " fused") : "", u.deferred ? " deferred" : "", double(u.resolves) / f,
+                    double(u.bytes) / f / 1048576.0, (unsigned long long)u.dead, (unsigned long long)u.gpuReads, (unsigned long long)u.cpuReads);
+            }
+        }
+
         // Shadow mode: bring the GPU's copy of [base, base + size) up to date
         // before recording work that reads it (deferred resolves' bytes there
         // too: NFSMW_RESOLVE_DEFER).
@@ -1246,6 +1352,8 @@ namespace gpu::renderer
                 return;
             base &= 0x1FFFFFFF;
             size = std::min<uint32_t>(size, uint32_t(kSharedSize) - base);
+            if (s_resolveUse)
+                NoteResolveRead(base, size);
             WriteDeferredIn(base, size);
             uint64_t key = uint64_t(base) << 32 | size;
             auto it = s_shadowSynced.find(key);
@@ -1587,7 +1695,8 @@ namespace gpu::renderer
         std::vector<uint32_t> CompileGlsl(const std::string& source, glslang_stage_t stage, std::string& log,
             const std::string& shaderPreamble = {})
         {
-            const std::string preamble = s_splitMemory ? "#define SPLIT_MEMORY\n" + shaderPreamble : shaderPreamble;
+            const std::string preamble = std::string(s_splitMemory ? "#define SPLIT_MEMORY\n" : "") +
+                (s_fmulz ? "#define SB_FMULZ\n" : "") + shaderPreamble;
             if (!s_shaderCacheEnabled)
                 return CompileGlslUncached(source, stage, log, preamble);
             std::filesystem::path file = ShaderCacheFile(source, stage, preamble);
@@ -3553,6 +3662,8 @@ namespace gpu::renderer
         // Found in the same pass, the highest as the highest index + 1,
         // which wraps a restart (0xFFFF in 16 bits, ~0 in 32; never an index
         // there, see above) to 0: no branch keeps the loops from vectorizing.
+        // 16 bits out without restart (not on Apple: see Draw), 0xFFFF is an
+        // index: the highest + 1 is counted in 32 bits there.
         vsnap::IndexRange ConvertIndices(uint8_t* dst, const IndexSource& src, uint32_t count, bool out16, bool restart, uint32_t resetIndex)
         {
             auto range = [](uint32_t lo, uint32_t hiPlus1) {
@@ -3562,6 +3673,26 @@ namespace gpu::renderer
             {
                 const uint8_t* p = s_sharedHost + (src.base & 0x1FFFFFFE);
                 bool swap = src.endian == 1 || src.endian == 2;
+                if (out16 && !restart)
+                {
+                    uint32_t lo = 0xFFFFFFFFu, hiPlus1 = 0;
+                    auto copy = [&](auto order) {
+                        for (uint32_t i = 0; i < count; i++)
+                        {
+                            uint16_t v;
+                            memcpy(&v, p + size_t(i) * 2, 2);
+                            v = order(v);
+                            memcpy(dst + size_t(i) * 2, &v, 2);
+                            lo = std::min(lo, uint32_t(v));
+                            hiPlus1 = std::max(hiPlus1, uint32_t(v) + 1);
+                        }
+                    };
+                    if (swap)
+                        copy([](uint16_t v) { return __builtin_bswap16(v); });
+                    else
+                        copy([](uint16_t v) { return v; });
+                    return range(lo, hiPlus1);
+                }
                 if (out16)
                 {
                     uint16_t lo = 0xFFFF, hiPlus1 = 0;
@@ -5421,8 +5552,10 @@ void main()
         // two above. (Coalesced only up to a den y of 2: a group is two rows.)
         VkPipeline s_resolveDenPipelines[2][4][4] = {};
         VkPipeline s_resolveTexturePipeline = VK_NULL_HANDLE;  // TEXTURE_ONLY (NFSMW_RESOLVE_DEFER; made at its first use)
+        VkPipeline s_resolveWritebackPipeline = VK_NULL_HANDLE;  // TEXTURE_WRITEBACK (NFSMW_RESOLVE_DEFER_COLOR; the same)
+        VkPipeline s_resolveWritebackCheckPipeline = VK_NULL_HANDLE;  // and WRITEBACK_CHECK (NFSMW_RESOLVE_DEFER_COLOR=2)
         VkPipeline ResolvePipeline(bool coalesced, const gpu::RenderScale& scale);
-        void MakeResolvePipeline(bool coalesced, uint32_t denX, uint32_t denY, VkPipeline* out, bool textureOnly = false);
+        void MakeResolvePipeline(bool coalesced, uint32_t denX, uint32_t denY, VkPipeline* out, bool textureOnly = false, uint32_t writeback = 0);
 
         // Coalesced scaled resolves: 2.8 -> 1.1 ms of scaled resolves a frame
         // on the Steam Machine (RADV), but 2.6-3.4 -> 4.1-4.4 ms on an M1 Pro
@@ -5497,7 +5630,11 @@ layout(std430, set = 0, binding = 0) buffer SharedMemory { uint g_mem[]; };)" GL
 layout(set = 0, binding = 1) uniform texture2D src;
 layout(std430, set = 0, binding = 2) buffer ScaledPool { uint s_pool[]; };
 layout(std430, set = 0, binding = 3) readonly buffer ScaledTable { uint s_table[]; };
+#ifdef TEXTURE_WRITEBACK
+layout(set = 0, binding = 4, r32ui) readonly uniform uimage2D t_image;
+#else
 layout(set = 0, binding = 4, r32ui) writeonly uniform uimage2D t_image;
+#endif
 layout(push_constant) uniform P
 {
     ivec2 origin;
@@ -5692,6 +5829,34 @@ void main()
         imageStore(t_image, ivec2(int(x), int(y)), uvec4(o, 0u, 0u, 0u));
 #endif
     }
+}
+#elif defined(TEXTURE_WRITEBACK)
+// NFSMW_RESOLVE_DEFER_COLOR: a deferred colour resolve's guest bytes, from
+// the cached texture that holds its texels: raw 32-bit ones (no conversion),
+// each the guest word in the texture's endianness (main() below stores
+// swapWord(m, texEndian)), so swapped back it is the word again. The
+// rectangle lies in the texture whole (see Resolve).
+void main()
+{
+    uvec2 id = gl_GlobalInvocationID.xy;
+    if (id.x >= p.size.x || id.y >= p.size.y)
+        return;
+    uint x = uint(p.origin.x) + id.x, y = uint(p.origin.y) + id.y;
+    uint word = ((p.destBase + tiled2D(x, y, p.destPitch, 2u)) & 0x1FFFFFFFu) >> 2;
+#ifdef TEX_OFFSET
+    uint v = imageLoad(t_image, ivec2(int(x + p.texX), int(y + p.texY))).x;
+#else
+    uint v = imageLoad(t_image, ivec2(int(x), int(y))).x;
+#endif
+#ifdef WRITEBACK_CHECK
+    // NFSMW_RESOLVE_DEFER_COLOR=2: the word main() stored, compared (the
+    // pool binding counts: [0] words that differ, [1] words compared).
+    if (g_mem[word] != swapWord(v, p.texEndian))
+        atomicAdd(s_pool[0], 1u);
+    atomicAdd(s_pool[1], 1u);
+#else
+    memStore(word, swapWord(v, p.texEndian));
+#endif
 }
 #else
 void main()
@@ -6178,7 +6343,9 @@ void main()
                 p.srcBase, p.rect, p.frame, p.seconds }).detach();
         }
 
-        // NFSMW_RESOLVE_DEFER=1 (shadow mode; off by default): a depth resolve
+        // NFSMW_RESOLVE_DEFER=1 (shadow mode; on by default on x86-64 Linux,
+        // where the Steam Deck measured it with the fewer and lighter passes,
+        // see kFewerPasses; NFSMW_RESOLVE_DEFER=0 turns it off): a depth resolve
         // into a cached texture of exactly its surface (Resolve's exact
         // fusion), at 1x, whose target the same resolve then clears whole,
         // stores its texels into that texture only (TEXTURE_ONLY). Its guest
@@ -6199,8 +6366,51 @@ void main()
         // would (a fault: the write watch asks for them and waits) and logs
         // what it found ([defer-check]: words whose stencil byte isn't 0 were
         // never a depth resolve's).
-        const int s_resolveDeferMode = [] { const char* v = std::getenv("NFSMW_RESOLVE_DEFER"); return v ? std::clamp(std::atoi(v), 0, 2) : 0; }();
+#if defined(__linux__) && defined(__x86_64__)
+        constexpr int kResolveDeferDefault = 1;
+#else
+        constexpr int kResolveDeferDefault = 0;
+#endif
+        const int s_resolveDeferMode = [] {
+            const char* v = std::getenv("NFSMW_RESOLVE_DEFER");
+            return v ? std::clamp(std::atoi(v), 0, 2) : kResolveDeferDefault;
+        }();
         const bool s_resolveDefer = s_resolveDeferMode != 0;
+        // NFSMW_RESOLVE_DEFER_COLOR=1 (shadow mode; on by default on x86-64
+        // Linux as NFSMW_RESOLVE_DEFER: a Steam Deck at 5 W, 5 alternated
+        // rounds, +1.7% fps, GPU busy -0.43 ms a frame, the pictures within
+        // compare_shots.py --strict; =0 turns it off): a colour
+        // resolve into a cached texture (the exact fusion or a part of one,
+        // NFSMW_FUSE_PARTIAL, NFSMW_DIRECT_CUBE), at 1x, of raw 32-bit texels
+        // (no conversion), whose rectangle lies in the texture whole, stores
+        // into the texture only too. Its guest bytes are written back from the
+        // texture when something reads them (TEXTURE_WRITEBACK: a texel is the
+        // guest word in the texture's endianness), so the target needs no
+        // keeping. A later colour resolve into the same texture leaves the
+        // owed ones owed (the texture holds the latest texels of all of
+        // them), and those its rectangle covers no longer owe anything. The
+        // texture stays cached while it holds owed texels. In the race 90% of
+        // the resolved bytes were written over unread (NFSMW_RESOLVE_USE),
+        // ~9.3 MB a frame of them such colour resolves: the scene into its
+        // texture (whole, in strips or halves), the six environment cube
+        // faces, the bloom chain.
+        // NFSMW_RESOLVE_DEFER_COLOR=2 (a check): such resolves aren't deferred,
+        // but after each (guest bytes and texels stored as usual) a
+        // WRITEBACK_CHECK pass compares every word with the one written back
+        // from the texture would be, and the write-back runs too (the same
+        // words again): [defer-check] colour lines count the words that differ.
+        const int s_resolveDeferColorMode = [] {
+            const char* v = std::getenv("NFSMW_RESOLVE_DEFER_COLOR");
+            return v ? std::clamp(std::atoi(v), 0, 2) : kResolveDeferDefault;
+        }();
+        const bool s_resolveDeferColor = s_resolveDeferColorMode == 1;
+        struct ColourCheck
+        {
+            VkBuffer buffer = VK_NULL_HANDLE;
+            VkDeviceMemory memory = VK_NULL_HANDLE;
+            volatile uint32_t* counts = nullptr;  // [0] words that differ, [1] words compared (coherent)
+        };
+        ColourCheck s_colourCheck;
         struct DeferCheckRange { uint32_t base, bytes, endian; };
         std::mutex s_deferCheckMutex;
         std::vector<DeferCheckRange> s_deferCheckRanges;  // the destinations deferred so far (8 at most)
@@ -6243,9 +6453,14 @@ void main()
             VkImageView sampleView;           // its depth aspect
             VkFormat format;                  // the target's format and size
             uint32_t width, height;
+            // A colour resolve's (NFSMW_RESOLVE_DEFER_COLOR; none of the
+            // above): the cached texture, and the face, holding its texels.
+            Texture* texture = nullptr;
+            uint32_t layer = 0;
         };
         std::vector<DeferredResolve> s_deferredResolves;
-        constexpr size_t kMaxDeferred = 4;  // more: the oldest is written
+        constexpr size_t kMaxDeferred = 32;  // more: the oldest is written
+        constexpr size_t kMaxDeferredDepth = 4;  // of them depth ones (each keeps a target's image)
         // Images of depth targets that went into records and came back, for the
         // next target of their format and size that needs one.
         struct SpareTarget
@@ -6259,21 +6474,23 @@ void main()
         // Resolves deferred; replaced unwritten; written for GPU work, for the
         // CPU, for want of room (any thread reads them at exit).
         std::atomic<uint64_t> s_deferredCount{ 0 }, s_deferReplaced{ 0 }, s_deferForGpu{ 0 }, s_deferForCpu{ 0 }, s_deferForRoom{ 0 };
+        std::atomic<uint64_t> s_deferredColour{ 0 }, s_deferForResolve{ 0 };  // (colour ones; written for a resolve not deferred)
 
-        // Records deferred resolve `i`'s guest bytes (the main resolve shader
-        // from its depth, guest memory only) and takes it off the list; its
-        // image becomes a spare.
-        void WriteDeferred(size_t i)
+        // Whether deferred colour resolve `b`'s rectangle in its texture holds
+        // all of `a`'s (the same texture and face).
+        bool CoversTexels(const ResolveConstants& b, const ResolveConstants& a)
         {
-            DeferredResolve d = s_deferredResolves[i];
-            s_deferredResolves.erase(s_deferredResolves.begin() + ptrdiff_t(i));
-            EndPass();
-            Begin();
-            ResolveConstants rc = d.rc;
-            rc.texWrite = 0;
-            VkDescriptorImageInfo ii{ VK_NULL_HANDLE, d.sampleView, VK_IMAGE_LAYOUT_GENERAL };
-            VkDescriptorImageInfo ti{ VK_NULL_HANDLE, s_dummyStorage.view, VK_IMAGE_LAYOUT_GENERAL };
-            VkDescriptorBufferInfo pool = DummyStorage(s_scaled.pool);
+            const int64_t bx = int64_t(b.originX) + b.texX, by = int64_t(b.originY) + b.texY;
+            const int64_t ax = int64_t(a.originX) + a.texX, ay = int64_t(a.originY) + a.texY;
+            return bx <= ax && by <= ay && bx + b.width >= ax + a.width && by + b.height >= ay + a.height;
+        }
+
+        // A resolve shader pass over `rc`'s rectangle (8x8 groups): `src` its
+        // source, `store` its texture binding, `pool` its pool binding.
+        void DispatchResolvePass(VkPipeline pipeline, const ResolveConstants& rc, VkImageView src, VkImageView store, VkDescriptorBufferInfo pool)
+        {
+            VkDescriptorImageInfo ii{ VK_NULL_HANDLE, src, VK_IMAGE_LAYOUT_GENERAL };
+            VkDescriptorImageInfo ti{ VK_NULL_HANDLE, store, VK_IMAGE_LAYOUT_GENERAL };
             VkDescriptorBufferInfo table = DummyStorage(s_scaled.table);
             VkWriteDescriptorSet w[8]{};
             w[0] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 0, 0, 1,
@@ -6287,12 +6504,33 @@ void main()
             w[4] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 4, 0, 1,
                 VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &ti, nullptr, nullptr };
             ComputeWorkRecorded();
-            if (s_profiling)
-                ProfileCompute(std::format("deferred resolve {}x{} to {:08X}: its guest bytes", rc.width, rc.height, rc.destBase).c_str());
-            vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_resolvePipeline);  // (1x only are deferred)
+            vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
             s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_resolveLayout, 0, AddSharedParts(w, 5), w);
             vkCmdPushConstants(s_cmd, s_resolveLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, s_resolvePush, &rc);
             vkCmdDispatch(s_cmd, (rc.width + 7) / 8, (rc.height + 7) / 8, 1);
+        }
+
+        // Records deferred resolve `i`'s guest bytes and takes it off the
+        // list: a depth one's from its depth (the main resolve shader, guest
+        // memory only; its image becomes a spare), a colour one's from its
+        // texture (TEXTURE_WRITEBACK).
+        void WriteDeferred(size_t i)
+        {
+            DeferredResolve d = s_deferredResolves[i];
+            s_deferredResolves.erase(s_deferredResolves.begin() + ptrdiff_t(i));
+            EndPass();
+            Begin();
+            const bool colour = d.texture != nullptr;
+            ResolveConstants rc = d.rc;
+            rc.texWrite = 0;
+            if (colour && !s_resolveWritebackPipeline)
+                MakeResolvePipeline(false, 1, 1, &s_resolveWritebackPipeline, false, 1);
+            if (s_profiling)
+                ProfileCompute(std::format("deferred resolve {}x{} to {:08X}: its guest bytes{}", rc.width, rc.height, rc.destBase,
+                    colour ? ", from its texture" : "").c_str());
+            DispatchResolvePass(colour ? s_resolveWritebackPipeline : s_resolvePipeline,  // (1x only are deferred)
+                rc, colour ? s_dummy[0].view : d.sampleView, colour ? d.texture->storeViews[d.layer] : s_dummyStorage.view,
+                DummyStorage(s_scaled.pool));
             ResolveBarrier(d.rangeBase, d.rangeBytes, 0);
             ProfileComputeEnd();
             // Guarded as the resolve's own write would have been (its pages
@@ -6301,8 +6539,54 @@ void main()
             GuardGpu(d.rangeBase, d.rangeBytes, true, "resolve");
             writewatch::MarkGpuOwned(d.rangeBase, d.rangeBytes);
             writewatch::DeferredWritten(d.rangeBase, d.rangeBytes);
-            s_spareTargets.push_back({ d.image, d.sampleView, d.format, d.width, d.height });
+            if (!colour)
+                s_spareTargets.push_back({ d.image, d.sampleView, d.format, d.width, d.height });
             LogOnce(0x3300, "deferred resolve to %08X (%ux%u) written: something reads its guest bytes", rc.destBase, rc.width, rc.height);
+        }
+
+        // NFSMW_RESOLVE_DEFER_COLOR=2: after a colour resolve that could have
+        // been deferred, its words compared with the write-back's
+        // (WRITEBACK_CHECK, into s_colourCheck), and the write-back itself.
+        void CheckColourWriteback(const ResolveConstants& resolved, Texture* t, uint32_t layer, uint32_t rangeBase, uint32_t rangeBytes)
+        {
+            if (!s_colourCheck.buffer)
+            {
+                VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+                bci.size = 256;
+                bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+                Check(vkCreateBuffer(s_dev, &bci, nullptr, &s_colourCheck.buffer), "colour check buffer");
+                VkMemoryRequirements req;
+                vkGetBufferMemoryRequirements(s_dev, s_colourCheck.buffer, &req);
+                VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+                mai.allocationSize = req.size;
+                mai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                Check(vkAllocateMemory(s_dev, &mai, nullptr, &s_colourCheck.memory), "colour check memory");
+                Check(vkBindBufferMemory(s_dev, s_colourCheck.buffer, s_colourCheck.memory, 0), "colour check bind");
+                void* mapped = nullptr;
+                Check(vkMapMemory(s_dev, s_colourCheck.memory, 0, VK_WHOLE_SIZE, 0, &mapped), "colour check map");
+                s_colourCheck.counts = static_cast<volatile uint32_t*>(mapped);
+                s_colourCheck.counts[0] = 0;
+                s_colourCheck.counts[1] = 0;
+                MakeResolvePipeline(false, 1, 1, &s_resolveWritebackCheckPipeline, false, 2);
+                if (!s_resolveWritebackPipeline)
+                    MakeResolvePipeline(false, 1, 1, &s_resolveWritebackPipeline, false, 1);
+                LogOnce(0x3500, "NFSMW_RESOLVE_DEFER_COLOR=2: colour resolves into cached textures compared with their write-back");
+            }
+            EndPass();
+            Begin();
+            ResolveConstants rc = resolved;
+            rc.texWrite = 0;
+            DispatchResolvePass(s_resolveWritebackCheckPipeline, rc, s_dummy[0].view, t->storeViews[layer], { s_colourCheck.buffer, 0, 256 });
+            FullBarrier();
+            DispatchResolvePass(s_resolveWritebackPipeline, rc, s_dummy[0].view, t->storeViews[layer], DummyStorage(s_scaled.pool));
+            ResolveBarrier(rangeBase, rangeBytes, t->guestStart);
+        }
+
+        void ReportColourCheck(const char* when)
+        {
+            if (s_colourCheck.counts)
+                fprintf(stderr, "[defer-check] colour %s: %u words compared with their write-back from the texture, %u differ%s\n", when,
+                    s_colourCheck.counts[1], s_colourCheck.counts[0], s_colourCheck.counts[0] ? " (NOT exact)" : "");
         }
 
         // Before work that reads guest bytes [base, base + size): the deferred
@@ -6495,9 +6779,35 @@ void main()
                             break;
                         }
                     }
+                // NFSMW_RESOLVE_DEFER_COLOR: deferred colour resolves this one
+                // overlaps, whose texture holds this one's range too (the same
+                // pitch): kept from EnsureShadow below. Should this one be
+                // deferred into the same texture and face, they stay owed
+                // (those it covers no longer owe anything once it does);
+                // otherwise they are written before it writes guest memory.
+                std::vector<DeferredResolve> held;
+                if (s_resolveDeferColor && ResolveFormatSupported(format) && ResolveBppLog2(format) == 2)
+                    for (size_t i = s_deferredResolves.size(); i-- > 0;)
+                    {
+                        const DeferredResolve& d = s_deferredResolves[i];
+                        const Texture* t = d.texture;
+                        if (t && uint64_t(d.rangeBase) < uint64_t(rangeBase) + rangeBytes && uint64_t(rangeBase) < uint64_t(d.rangeBase) + d.rangeBytes &&
+                            rangeBase >= t->guestStart && uint64_t(rangeBase) + rangeBytes <= uint64_t(t->guestStart) + t->guestSize &&
+                            d.rc.destPitch == ((destPitch.copy_dest_pitch + 31) & ~31u))
+                        {
+                            held.push_back(d);
+                            s_deferredResolves.erase(s_deferredResolves.begin() + ptrdiff_t(i));
+                        }
+                    }
+                ResolveUse* use = s_resolveUse && s_shadowMode && ResolveFormatSupported(format)
+                    ? NoteResolveUse(rangeBase, rangeBytes, uint32_t(r.x1 - r.x0), uint32_t(r.y1 - r.y0), format, depthSource,
+                        (uint64_t(r.x1 - r.x0) * uint32_t(r.y1 - r.y0)) << ResolveBppLog2(format))
+                    : nullptr;
                 // Shadow mode: pages the resolve covers only in part keep
                 // the CPU's latest data around it.
+                s_resolveUseQuiet = true;
                 EnsureShadow(rangeBase, rangeBytes);
+                s_resolveUseQuiet = false;
                 if (destInfo.copy_dest_array)
                     LogOnce(0x200, "resolve to a 3D/array destination is not implemented (copying slice 0)");
                 if (!ResolveFormatSupported(format))
@@ -6619,6 +6929,18 @@ void main()
                                 "not read at host resolution %u times in a row (the 1x copy only, until a reader wants one)", rc.width,
                                 rc.height, rc.destBase, rc.destPitch, format, kUnreadSkip);
                         }
+                    }
+                    // (Scaled: no fusion, so held colour records, see above,
+                    // are written now, before the fill below reads the 1x data.)
+                    if (scaledWrite)
+                    {
+                        for (const DeferredResolve& h : held)
+                        {
+                            s_deferredResolves.push_back(h);
+                            s_deferForResolve++;
+                            WriteDeferred(s_deferredResolves.size() - 1);
+                        }
+                        held.clear();
                     }
                     if (scaledWrite)
                     {
@@ -6810,7 +7132,37 @@ void main()
                     const bool defer = s_resolveDefer && s_shadowMode && depthSource && fused && !partial && !scaledWrite && bl == 2 &&
                         source->scale.IsOne() && copyControl.depth_clear_enable && !s_logShadowMap && r.x0 + shiftX <= 0 &&
                         r.y0 + shiftY <= 0 && r.x1 + shiftX >= int32_t(source->guestWidth) && r.y1 + shiftY >= int32_t(source->guestHeight);
-                    if (defer && !s_resolveTexturePipeline)
+                    // NFSMW_RESOLVE_DEFER_COLOR (see s_resolveDeferColor).
+                    const bool colourFits = s_shadowMode && !depthSource && fused && fused->convert == 0 && !scaledWrite && bl == 2 &&
+                        source->scale.IsOne() && r.x0 >= 0 && r.y0 >= 0 && uint64_t(r.x1) + rc.texX <= fused->width &&
+                        uint64_t(r.y1) + rc.texY <= fused->height;
+                    const bool deferColour = s_resolveDeferColor && colourFits;
+                    const bool checkColour = s_resolveDeferColorMode == 2 && colourFits && !s_splitMemory;
+                    std::vector<DeferredResolve> covered;  // held ones this one's texels cover whole
+                    for (const DeferredResolve& h : held)
+                    {
+                        const bool same = deferColour && h.texture == fused && h.layer == layer;
+                        if (same && CoversTexels(rc, h.rc))
+                            covered.push_back(h);
+                        else
+                        {
+                            s_deferredResolves.push_back(h);
+                            if (!same)
+                            {
+                                s_deferForResolve++;
+                                WriteDeferred(s_deferredResolves.size() - 1);
+                            }
+                        }
+                    }
+                    const bool textureOnly = defer || deferColour;
+                    if (use)
+                    {
+                        std::lock_guard lock(s_resolveUseMutex);
+                        use->fused = fused != nullptr;
+                        use->partial = partial;
+                        use->deferred = textureOnly;
+                    }
+                    if (textureOnly && !s_resolveTexturePipeline)
                         MakeResolvePipeline(false, 1, 1, &s_resolveTexturePipeline, true);
                     if (s_profiling)
                     {
@@ -6819,14 +7171,14 @@ void main()
                             rc.originY, pitch, format, rc.destBase, depthSource ? "depth " : "",
                             scaledWrite ? std::format("scaled {}", gpu::ScaleName(source->scale)).c_str()
                             : !source->scale.IsOne() ? "1x (from a scaled target)" : "1x", fused ? " fused" : "",
-                            defer ? ", texture only (deferred)" : "");
+                            textureOnly ? ", texture only (deferred)" : "");
                         ProfileCompute(desc);
                     }
-                    vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, defer ? s_resolveTexturePipeline : ResolvePipeline(coalesced, source->scale));
+                    vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, textureOnly ? s_resolveTexturePipeline : ResolvePipeline(coalesced, source->scale));
                     s_pushDescriptorSet(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_resolveLayout, 0, AddSharedParts(w, 5), w);
                     vkCmdPushConstants(s_cmd, s_resolveLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, s_resolvePush, &rc);
                     uint32_t perWord = bl >= 2 ? 1 : (4 >> bl);
-                    if (!(s_exp & 2) && defer)  // a group a 32x32 tile of the destination
+                    if (!(s_exp & 2) && textureOnly)  // a group a 32x32 tile of the destination
                         vkCmdDispatch(s_cmd, ((r.x1 - 1) >> 5) - (r.x0 >> 5) + 1, ((r.y1 - 1) >> 5) - (r.y0 >> 5) + 1, 1);
                     else if (!(s_exp & 2))
                         vkCmdDispatch(s_cmd, coalesced ? (rc.width + 31) / 32 : (rc.width / perWord + 7) / 8,
@@ -6842,6 +7194,8 @@ void main()
                     else
                         ResolveBarrier(rangeBase, rangeBytes, fused ? fused->guestStart : 0);
                     ProfileComputeEnd();
+                    if (checkColour)
+                        CheckColourWriteback(rc, fused, layer, rangeBase, rangeBytes);
                     if (s_logShadowMap && depthSource && pitch == 1600 && bl == 2)
                         ShadowMapProbeRecord(rangeBase, rangeBytes, rc, r, source->base);
                     SubmitIfStarving();
@@ -6902,7 +7256,7 @@ void main()
                     }
                     // Deferred: its bytes owed first, so that no CPU access
                     // finds the pages guarded and not owed.
-                    if (defer)
+                    if (textureOnly)
                         writewatch::DeferWrite(rangeBase, rangeBytes);
                     GuardGpu(rangeBase, rangeBytes, true, "resolve");
                     writewatch::MarkGpuOwned(rangeBase, rangeBytes);
@@ -6910,14 +7264,37 @@ void main()
                     {
                         s_deferReplaced++;
                         writewatch::DeferredWritten(replaced->rangeBase, replaced->rangeBytes);
-                        s_spareTargets.push_back({ replaced->image, replaced->sampleView, replaced->format, replaced->width, replaced->height });
+                        if (!replaced->texture)
+                            s_spareTargets.push_back({ replaced->image, replaced->sampleView, replaced->format, replaced->width, replaced->height });
                     }
-                    if (defer)
+                    for (const DeferredResolve& c : covered)
+                    {
+                        s_deferReplaced++;
+                        writewatch::DeferredWritten(c.rangeBase, c.rangeBytes);
+                    }
+                    if (deferColour)
                     {
                         if (s_deferredResolves.size() >= kMaxDeferred)
                         {
                             s_deferForRoom++;
                             WriteDeferred(0);
+                        }
+                        s_deferredResolves.push_back({ rangeBase, rangeBytes, rc, Image{}, VK_NULL_HANDLE, VK_FORMAT_UNDEFINED, 0, 0, fused, layer });
+                        s_deferredCount++;
+                        s_deferredColour++;
+                        LogOnce(0x3400, "colour resolves into cached textures defer their guest bytes (NFSMW_RESOLVE_DEFER_COLOR; the first: "
+                            "%ux%u at %08X)", rc.width, rc.height, rc.destBase);
+                    }
+                    if (defer)
+                    {
+                        auto depthRecord = [](const DeferredResolve& d) { return d.texture == nullptr; };
+                        if (s_deferredResolves.size() >= kMaxDeferred ||
+                            size_t(std::count_if(s_deferredResolves.begin(), s_deferredResolves.end(), depthRecord)) >= kMaxDeferredDepth)
+                        {
+                            s_deferForRoom++;
+                            auto oldest = std::find_if(s_deferredResolves.begin(), s_deferredResolves.end(), depthRecord);
+                            WriteDeferred(s_deferredResolves.size() >= kMaxDeferred || oldest == s_deferredResolves.end()
+                                ? 0 : size_t(oldest - s_deferredResolves.begin()));
                         }
                         auto [image, view] = SwapTargetImage(*source);
                         s_deferredResolves.push_back({ rangeBase, rangeBytes, rc, image, view, source->vkFormat, source->width, source->height });
@@ -7540,11 +7917,13 @@ void main()
 
         // The resolve shader for sources whose scale has these denominators
         // (1, 2, 4 or 8 each; the shader's SB_DEN_X, SB_DEN_Y), into `out`;
-        // `textureOnly`: its TEXTURE_ONLY variant (whole scales).
-        void MakeResolvePipeline(bool coalesced, uint32_t denX, uint32_t denY, VkPipeline* out, bool textureOnly)
+        // `textureOnly`: its TEXTURE_ONLY variant, `writeback` 1 its
+        // TEXTURE_WRITEBACK one, 2 that with WRITEBACK_CHECK (whole scales).
+        void MakeResolvePipeline(bool coalesced, uint32_t denX, uint32_t denY, VkPipeline* out, bool textureOnly, uint32_t writeback)
         {
             std::string log;
-            std::string preamble = coalesced ? "#define COALESCED\n" : textureOnly ? "#define TEXTURE_ONLY\n" : "";
+            std::string preamble = coalesced ? "#define COALESCED\n" : textureOnly ? "#define TEXTURE_ONLY\n"
+                : writeback == 2 ? "#define TEXTURE_WRITEBACK\n#define WRITEBACK_CHECK\n" : writeback ? "#define TEXTURE_WRITEBACK\n" : "";
             if (s_resolvePush != offsetof(ResolveConstants, texX))
                 preamble += "#define TEX_OFFSET\n";
             if (denX != 1)
@@ -8101,6 +8480,18 @@ void main()
         template <typename Which>
         size_t DropTextures(Which which)
         {
+            // Deferred colour resolves' bytes from those textures first, and
+            // their reads done before the textures go.
+            bool owed = false;
+            for (size_t i = s_deferredResolves.size(); i-- > 0;)
+                if (s_deferredResolves[i].texture && which(*s_deferredResolves[i].texture))
+                {
+                    s_deferForGpu++;
+                    WriteDeferred(i);
+                    owed = true;
+                }
+            if (owed)
+                Flush();
             s_textureCache->generation++;
             size_t dropped = 0;
             for (auto it = s_textures.begin(); it != s_textures.end();)
@@ -8222,7 +8613,11 @@ void main()
             for (const auto& [key, t] : s_textures)
             {
                 keys.push_back(key);
-                candidates.push_back({ t->image.bytes, t->lastUsed });
+                // (One a deferred colour resolve's bytes are to come from
+                // counts as used now: never evicted.)
+                const bool owed = std::any_of(s_deferredResolves.begin(), s_deferredResolves.end(),
+                    [&](const DeferredResolve& d) { return d.texture == t.get(); });
+                candidates.push_back({ t->image.bytes, owed ? s_frame : t->lastUsed });
                 usage.bytes += t->image.bytes;
             }
             usage.count = uint32_t(s_textures.size());
@@ -8558,6 +8953,10 @@ void main()
             VkPhysicalDeviceProperties props;
             vkGetPhysicalDeviceProperties(s_vk->physical, &props);
             ReadRenderScale(props);
+            const char* fmulz = std::getenv("NFSMW_FMULZ");
+            s_fmulz = fmulz ? fmulz[0] == '1' : DriverId(props) == VK_DRIVER_ID_MESA_RADV;
+            if (s_fmulz)
+                fprintf(stderr, "[renderer] shader multiplications in the fmulz form (NFSMW_FMULZ=0: the select form)\n");
             const char* split = std::getenv("NFSMW_SPLIT_MEMORY");
             s_splitMemory = split ? split[0] == '1' : props.limits.maxStorageBufferRange < kSharedSize;
             if (s_splitMemory)
@@ -9078,8 +9477,11 @@ void main()
         if (useIndices)
             vertexCount = directIndices ? count : uint32_t(indices.size());
         // 16-bit indices when 0xFFFF means what the pipeline says: restart
-        // with the guest's reset index 0xFFFF, or no restart and no 0xFFFF
-        // index (Metal can't turn primitive restart off).
+        // with the guest's reset index 0xFFFF, or no restart (an index
+        // 0xFFFF is then a vertex like any other). Metal can't turn primitive
+        // restart off: there, without restart, only when no index is 0xFFFF
+        // (a scan of them; elsewhere it was ~8% of the command processor's
+        // time on a Steam Deck at 5 W, its hottest loop with the conversion).
         bool indices16 = false;
         if (directIndices && !src.is32)
         {
@@ -9087,8 +9489,12 @@ void main()
                 indices16 = resetIndex == 0xFFFF;
             else
             {
+#ifdef __APPLE__
                 const uint16_t* p = reinterpret_cast<const uint16_t*>(s_sharedHost + (src.base & 0x1FFFFFFE));
                 indices16 = std::find(p, p + count, uint16_t(0xFFFF)) == p + count;  // byte order doesn't matter
+#else
+                indices16 = true;
+#endif
             }
         }
         const VkDeviceSize indexBytes = directIndices ? VkDeviceSize(count) * (indices16 ? 2 : 4) : indices.size() * 4;
@@ -9693,8 +10099,131 @@ void main()
         // stretched in y alone it would be distorted by up to 1/sv. The rest
         // of the front end is clipped to the band (below).
         // Edge bars (gpu/edge_bars.h): the copies of a police vid-cam side
-        // bar, the intro's black frame or a menu's inset overlay that fill
-        // the screen past the 16:9 band, drawn right after it.
+        // bar that fill the screen past the 16:9 band, and of a black frame
+        // (the intro's cuts, the Blacklist bio's panel) that fill everything
+        // outside it, at 16:9 too, drawn right after it; the black around a
+        // full-band backdrop (the results screen), cleared right after it,
+        // at 16:9 too; and the Showcase's vignette, stretched to the screen's
+        // edges. NFSMW_BAR_FILL=0 turns all the edge fills off (an A/B
+        // switch).
+        // planEdgeFills: the plan for a front-end draw (its registers, what
+        // the rules below did, a reader for its ePolys): PlanFill's bars and
+        // black frames first, then PlanBackdrop's full-band picture, then
+        // PlanVignette's overlay (every screen shape; a bar fills nothing at
+        // 16:9).
+        // logEdgeFill: what a plan does, once per kind, screen shape and
+        // outcome, in every log (a tester's too).
+        static const bool barFill = [] { const char* v = std::getenv("NFSMW_BAR_FILL"); return !(v && v[0] == '0'); }();
+        auto planEdgeFills = [&](const float* c, float feY, float aspectX, float aspectY, bool feShader, bool leftAlone) {
+            xenos::xe_gpu_texture_fetch_t t0;
+            memcpy(&t0, &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], sizeof(t0));
+            const gpu::bars::Draw draw{ .prim = uint32_t(initiator.prim_type),
+                .count = count,
+                .c = c,
+                .frontEndY = feY,
+                .scaleX = aspectX,
+                .scaleY = aspectY,
+                .frontEndShader = feShader,
+                .leftAlone = leftAlone,
+                .occlusion = zpdCount,
+                .vte = vte.value,
+                .blend0 = s_regs[XE_GPU_REG_RB_BLENDCONTROL0] & 0x1FFF1FFF,
+                .t0Sampled = (s_ps->info.texture2DMask & 1) != 0,
+                .t0Width = uint32_t(t0.size_2d.width) + 1,
+                .t0Height = uint32_t(t0.size_2d.height) + 1,
+                .t0Format = uint32_t(t0.format),
+                .posScale = { pc.posScale[0], pc.posScale[1], pc.posScale[2], pc.posScale[3] },
+                .hostW = w * float(scaleX),
+                .hostH = h * float(scaleY),
+                .scissor = { scissor.offset.x, scissor.offset.y, scissor.offset.x + int32_t(scissor.extent.width),
+                    scissor.offset.y + int32_t(scissor.extent.height) } };
+            const uint32_t* vf = &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 95 * 2];
+            const uint32_t base = vf[0] & 0x1FFFFFFC, endian = vf[1] & 3;
+            const uint32_t words = (vf[1] >> 2) & 0xFFFFFF, first = s_regs[XE_GPU_REG_VGT_INDX_OFFSET];
+            auto read = [&](uint32_t k, uint32_t j, uint32_t& word) {
+                const uint32_t v = src.Get(k) + first;  // an ePoly: 8 words
+                if ((v + 1) * 8 > words)
+                    return false;
+                word = GpuSwap(LoadPhysical(base + (v * 8 + j) * 4), endian);
+                return true;
+            };
+            gpu::bars::Plan plan = gpu::bars::PlanFill(draw, read);
+            // The results screen's backdrop (and any opaque picture of that
+            // shape: the title's key art): what lies outside the picture,
+            // past the band and in the band's overscan rows above and below
+            // it, is cleared to black after it, where the world drawn behind
+            // it showed (gpu/edge_bars.h).
+            if (plan.fill == gpu::bars::Fill::None)
+                plan = gpu::bars::PlanBackdrop(draw, read);
+            // The Showcase's vignette (and any front-end overlay of its
+            // shape, clear in the middle): stretched to the screen's edges,
+            // where the garage showed undimmed round it (GitHub #19). Its
+            // texels as the GPU reads them: 32-bit, tiled or linear rows.
+            if (plan.fill == gpu::bars::Fill::None)
+            {
+                const uint32_t t0Base = (uint32_t(t0.base_address) << 12) & 0x1FFFFFFFu;
+                const uint32_t t0Pitch = uint32_t(t0.pitch) << 5;
+                auto texel = [&](uint32_t x, uint32_t y, uint32_t& word) {
+                    if (!t0Pitch || x >= draw.t0Width || y >= draw.t0Height || x >= t0Pitch)
+                        return false;
+                    word = GpuSwap(LoadPhysical(t0Base + gpu::bars::TexelOffset32(x, y, t0Pitch, t0.tiled != 0)), uint32_t(t0.endianness));
+                    return true;
+                };
+                plan = gpu::bars::PlanVignette(draw, read, texel);
+            }
+            return plan;
+        };
+        auto logEdgeFill = [&](const gpu::bars::Plan& barPlan, float aspectX, float aspectY) {
+            if (barPlan.fill == gpu::bars::Fill::None)
+                return;
+            static const bool logFrontEnd = std::getenv("NFSMW_LOG_FRONTEND") != nullptr;
+            // A match each frame skips building the line once its key is
+            // logged.
+            const uint32_t kind = uint32_t(barPlan.fill);
+            const bool blackout = barPlan.fill == gpu::bars::Fill::Blackout;
+            const bool backdrop = barPlan.fill == gpu::bars::Fill::Backdrop;
+            const bool vignette = barPlan.fill == gpu::bars::Fill::Vignette;
+            const gpu::bars::Box& box = barPlan.box;
+            const uint64_t key = (0x36ull << 56) | (uint64_t(kind) << 40) | (uint64_t(barPlan.rectCount) << 36) |
+                (uint64_t(std::lround(aspectX * 4096.0f)) << 18) | uint64_t(std::lround(aspectY * 4096.0f));
+            static uint64_t loggedKey[6] = { ~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull };
+            if (loggedKey[kind] != key)
+            {
+                loggedKey[kind] = key;
+                char fills[192];
+                if (barPlan.rectCount)
+                    snprintf(fills, sizeof(fills), "fills %u rectangle(s) %s, first [%d,%d)x[%d,%d) (host px)", barPlan.rectCount,
+                        backdrop ? "outside it (past the 16:9 band, and the band's overscan rows)"
+                            : blackout ? "outside it (past the 16:9 band, and the band's border round it)" : "past the 16:9 band", barPlan.rects[0].x0,
+                        barPlan.rects[0].x1, barPlan.rects[0].y0, barPlan.rects[0].y1);
+                else
+                    snprintf(fills, sizeof(fills), "%s", vignette ? "stretched to the screen's edges"
+                        : blackout || backdrop ? "fills nothing" : "reaches the screen edge: nothing to fill");
+                LogOnce(key,
+                    "edge bars: frame %llu vs_%016llx ps_%016llx: %s (clip x %.3f..%.3f y %.3f..%.3f, colour %08X; view scale x %.4f y %.4f) %s",
+                    (unsigned long long)s_frame, (unsigned long long)s_vs->hash, (unsigned long long)s_ps->hash,
+                    vignette ? "the Showcase's vignette (clear in the middle)" : backdrop ? "a full-band backdrop (black outside it)"
+                        : blackout ? "a black frame" : kind == uint32_t(gpu::bars::Fill::RightBar) ? "the right vid-cam bar" : "the left vid-cam bar",
+                    box.x0, box.x1, box.y0, box.y1, barPlan.argb, aspectX, aspectY, fills);
+            }
+            // NFSMW_LOG_FRONTEND=1: the first frame of each run of frames
+            // with a match, bars and black frames apart (one run per vid-cam
+            // scene and per cut; any other is a draw this should not take).
+            static uint64_t lastBarFrame[4] = { ~0ull - 1, ~0ull - 1, ~0ull - 1, ~0ull - 1 };
+            uint64_t& last = lastBarFrame[vignette ? 3 : backdrop ? 2 : blackout ? 1 : 0];
+            if (logFrontEnd && s_frame != last && s_frame != last + 1)
+            {
+                xenos::xe_gpu_texture_fetch_t t0;
+                memcpy(&t0, &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], sizeof(t0));
+                fprintf(stderr, "[frontend] edge bars: matching from frame %llu: %s x %.3f..%.3f y %.3f..%.3f colour %08X blend %08X t0 %08X %ux%u, %u rect(s)\n",
+                    (unsigned long long)s_frame, vignette ? "vignette" : backdrop ? "backdrop" : blackout ? "black frame"
+                        : kind == uint32_t(gpu::bars::Fill::RightBar) ? "right bar" : "left bar",
+                    box.x0, box.x1, box.y0, box.y1, barPlan.argb, s_regs[XE_GPU_REG_RB_BLENDCONTROL0] & 0x1FFF1FFF,
+                    (uint32_t(t0.base_address) << 12) & 0x1FFFFFFFu, uint32_t(t0.size_2d.width) + 1, uint32_t(t0.size_2d.height) + 1,
+                    barPlan.rectCount);
+            }
+            last = s_frame;
+        };
         gpu::bars::Plan barPlan;
         if (const float s = game::AspectScaleX(), sv = game::AspectScaleY(); s < 1.0f || sv < 1.0f)
         {
@@ -9988,115 +10517,27 @@ void main()
                     // past a 2.50:1 screen beside them. The intro's cut
                     // between two shots (~95 s) is a few frames of one black
                     // quad 0.970 x 0.939 of the 16:9 frame: the world shows
-                    // all round it. Such a quad (gpu::bars::PlanFill: one
-                    // black rectangle of the front-end shader the rules
-                    // above left alone; a bar a little past both band edges
-                    // in y, from inside the band to well past one side; a
-                    // black frame centred, short of the band's edges) is
-                    // drawn again after itself, stretched over the frame and
-                    // scissored to (its half of) what lies outside the band:
-                    // nothing inside the band changes. So is a menu's
-                    // translucent backdrop or vignette of the black frame's
-                    // shape (gpu::bars::PlanOverlay: any colour, alpha and
-                    // texture, alpha-blended; GitHub issue #19, the world
-                    // undimmed above and below the blacklist's and the
-                    // showcase car's screens on 16:10).
-                    // NFSMW_BAR_FILL=0 turns it off (an A/B switch).
-                    static const bool barFill = [] { const char* v = std::getenv("NFSMW_BAR_FILL"); return !(v && v[0] == '0'); }();
+                    // all round it (and the Blacklist bio's panel, 0.976 x
+                    // 0.985, for as long as it is up). Such a quad
+                    // (gpu::bars::PlanFill: one black rectangle of the
+                    // front-end shader the rules above left alone; a bar a
+                    // little past both band edges in y, from inside the band
+                    // to well past one side; a black frame centred, short of
+                    // the band's edges) is drawn again after itself,
+                    // stretched over the frame and scissored to (its half of)
+                    // what lies outside the band (a bar: nothing inside the
+                    // band changes) or to everything outside itself (a black
+                    // frame). The Showcase's vignette
+                    // (gpu::bars::PlanVignette) is drawn stretched to the
+                    // screen's edges instead (its own posScale).
+                    // NFSMW_BAR_FILL=0 turns it off (an A/B switch: barFill).
                     const uint32_t blend0 = s_regs[XE_GPU_REG_RB_BLENDCONTROL0] & 0x1FFF1FFF;
                     if (barFill)
                     {
-                        xenos::xe_gpu_texture_fetch_t t0;
-                        memcpy(&t0, &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], sizeof(t0));
-                        const gpu::bars::Draw draw{ .prim = prim,
-                            .count = count,
-                            .c = c,
-                            .frontEndY = feY,
-                            .scaleX = s,
-                            .scaleY = sv,
-                            .frontEndShader = feShader,
-                            .leftAlone = kX == 1.0f && kY == 1.0f && kCover == 1.0f && !clipped,
-                            .occlusion = zpdCount,
-                            .vte = vte.value,
-                            .blend0 = blend0,
-                            .t0Sampled = (s_ps->info.texture2DMask & 1) != 0,
-                            .t0Width = uint32_t(t0.size_2d.width) + 1,
-                            .t0Height = uint32_t(t0.size_2d.height) + 1,
-                            .posScale = { pc.posScale[0], pc.posScale[1], pc.posScale[2], pc.posScale[3] },
-                            .hostW = w * float(scaleX),
-                            .hostH = h * float(scaleY),
-                            .scissor = { scissor.offset.x, scissor.offset.y, scissor.offset.x + int32_t(scissor.extent.width),
-                                scissor.offset.y + int32_t(scissor.extent.height) } };
-                        const uint32_t base = vf[0] & 0x1FFFFFFC, endian = vf[1] & 3;
-                        const uint32_t words = (vf[1] >> 2) & 0xFFFFFF, first = s_regs[XE_GPU_REG_VGT_INDX_OFFSET];
-                        auto read = [&](uint32_t k, uint32_t j, uint32_t& word) {
-                            const uint32_t v = src.Get(k) + first;  // an ePoly: 8 words
-                            if ((v + 1) * 8 > words)
-                                return false;
-                            word = GpuSwap(LoadPhysical(base + (v * 8 + j) * 4), endian);
-                            return true;
-                        };
-                        barPlan = gpu::bars::PlanFill(draw, read);
-                        // The results screen's backdrop (and any opaque
-                        // picture of that shape: the title's key art): what
-                        // lies past the band and outside the picture is
-                        // cleared to black after it, where the world drawn
-                        // behind it showed (gpu/edge_bars.h).
-                        if (barPlan.fill == gpu::bars::Fill::None)
-                            barPlan = gpu::bars::PlanBackdrop(draw, read);
-                        // A menu's inset overlay (any colour, so last: an
-                        // opaque black one is a black frame above).
-                        if (barPlan.fill == gpu::bars::Fill::None)
-                            barPlan = gpu::bars::PlanOverlay(draw, read);
-                    }
-                    if (barPlan.fill != gpu::bars::Fill::None)
-                    {
-                        // Once per kind, screen shape and outcome, in every
-                        // log (a tester's too); a match each frame skips
-                        // building the line once its key is logged.
-                        const uint32_t kind = uint32_t(barPlan.fill);
-                        const bool blackout = barPlan.fill == gpu::bars::Fill::Blackout;
-                        const bool backdrop = barPlan.fill == gpu::bars::Fill::Backdrop;
-                        const bool overlay = barPlan.fill == gpu::bars::Fill::Overlay;
-                        const gpu::bars::Box& box = barPlan.box;
-                        const uint64_t key = (0x36ull << 56) | (uint64_t(kind) << 40) | (uint64_t(barPlan.rectCount) << 36) |
-                            (uint64_t(std::lround(s * 4096.0f)) << 18) | uint64_t(std::lround(sv * 4096.0f));
-                        static uint64_t loggedKey[6] = { ~0ull, ~0ull, ~0ull, ~0ull, ~0ull, ~0ull };
-                        if (loggedKey[kind] != key)
-                        {
-                            loggedKey[kind] = key;
-                            char fills[96];
-                            if (barPlan.rectCount)
-                                snprintf(fills, sizeof(fills), "fills %u rectangle(s) past the 16:9 band, first [%d,%d)x[%d,%d) (host px)",
-                                    barPlan.rectCount, barPlan.rects[0].x0, barPlan.rects[0].x1, barPlan.rects[0].y0, barPlan.rects[0].y1);
-                            else
-                                snprintf(fills, sizeof(fills), "%s", blackout || backdrop || overlay ? "fills nothing" : "reaches the screen edge: nothing to fill");
-                            LogOnce(key,
-                                "edge bars: frame %llu vs_%016llx ps_%016llx: %s (clip x %.3f..%.3f y %.3f..%.3f, colour %08X; view scale x %.4f y %.4f) %s",
-                                (unsigned long long)s_frame, (unsigned long long)s_vs->hash, (unsigned long long)s_ps->hash,
-                                backdrop ? "a full-band backdrop (black past the band)" : blackout ? "a black frame"
-                                    : overlay ? "an inset overlay (a menu's backdrop or vignette)"
-                                    : kind == uint32_t(gpu::bars::Fill::RightBar) ? "the right vid-cam bar" : "the left vid-cam bar",
-                                box.x0, box.x1, box.y0, box.y1, barPlan.argb, s, sv, fills);
-                        }
-                        // NFSMW_LOG_FRONTEND=1: the first frame of each
-                        // run of frames with a match, bars, black frames,
-                        // backdrops and overlays apart (one run per vid-cam
-                        // scene, per cut and per menu screen; any other is a
-                        // draw this should not take).
-                        static uint64_t lastBarFrame[4] = { ~0ull - 1, ~0ull - 1, ~0ull - 1, ~0ull - 1 };
-                        uint64_t& last = lastBarFrame[overlay ? 3 : backdrop ? 2 : blackout ? 1 : 0];
-                        if (logFrontEnd && s_frame != last && s_frame != last + 1)
-                        {
-                            xenos::xe_gpu_texture_fetch_t t0;
-                            memcpy(&t0, &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0], sizeof(t0));
-                            fprintf(stderr, "[frontend] edge bars: matching from frame %llu: %s x %.3f..%.3f y %.3f..%.3f colour %08X blend %08X t0 %08X %ux%u, %u rect(s)\n",
-                                (unsigned long long)s_frame, backdrop ? "backdrop" : blackout ? "black frame" : overlay ? "inset overlay"
-                                    : kind == uint32_t(gpu::bars::Fill::RightBar) ? "right bar" : "left bar",
-                                box.x0, box.x1, box.y0, box.y1, barPlan.argb, blend0, (uint32_t(t0.base_address) << 12) & 0x1FFFFFFFu,
-                                uint32_t(t0.size_2d.width) + 1, uint32_t(t0.size_2d.height) + 1, barPlan.rectCount);
-                        }
-                        last = s_frame;
+                        barPlan = planEdgeFills(c, feY, s, sv, feShader, kX == 1.0f && kY == 1.0f && kCover == 1.0f && !clipped);
+                        logEdgeFill(barPlan, s, sv);
+                        if (barPlan.fill == gpu::bars::Fill::Vignette)
+                            memcpy(pc.posScale, barPlan.posScale, sizeof(pc.posScale));
                     }
                     // The edge candidates (above) that still stop short of
                     // the screen's edge after the rules, each distinct line
@@ -10147,10 +10588,10 @@ void main()
                         uint32_t& perT0Edge = perKey[(uint64_t(t0) << 32) | (kind << 3) | edgeCode];
                         if (perT0Edge >= 4)
                             continue;
-                        const std::string action = barPlan.rectCount
+                        const std::string action = barPlan.fill == gpu::bars::Fill::Vignette ? std::string("vignette stretched to the screen's edges")
+                            : barPlan.rectCount
                             ? std::string(barPlan.fill == gpu::bars::Fill::Backdrop ? "backdrop fill"
-                                    : barPlan.fill == gpu::bars::Fill::Blackout ? "black frame fill"
-                                    : barPlan.fill == gpu::bars::Fill::Overlay ? "overlay fill" : "bar fill")
+                                    : barPlan.fill == gpu::bars::Fill::Blackout ? "black frame fill" : "bar fill")
                             : clipped ? std::format("clipped to rows {}..{}", scissor.offset.y, scissor.offset.y + int32_t(scissor.extent.height))
                             : kCover != 1.0f ? std::format("cover x{:.3f}", kCover)
                             : (kX != 1.0f || kY != 1.0f) ? std::format("widened x{:.3f} y{:.3f}", kX, kY)
@@ -10236,6 +10677,42 @@ void main()
                 }
             }
         }
+        else if (barFill)
+        {
+            // 16:9 (or a 16:9 picture letterboxed on another shape): none of
+            // the rules above has anything to do, and no bar needs a fill,
+            // but a black frame leaves a thin border of what is behind it all
+            // round it: filled with its copies (gpu::bars::BlackoutRects); a
+            // full-band backdrop (the results screen) leaves the race showing
+            // in the band's overscan rows above and below it: those are
+            // cleared to black (gpu::bars::OverscanRows); and the Showcase's
+            // vignette leaves a thin border of the garage undimmed all round
+            // it: it is stretched to the screen's edges
+            // (gpu::bars::PlanVignette).
+            // A front-end draw as above (the front-end matrix in c0..c3,
+            // ePolys at fetch constant 95, read by the vertex shader); nothing
+            // is measured, and only one quad gets as far as reading its
+            // vertices: over a small t0 its first colour only (a black frame
+            // needs black, gpu::bars::Candidate), over a large t0
+            // (gpu::bars::BackdropCandidate, VignetteCandidate) all four.
+            if (const float feX = game::FrontEndScaleX(); feX > 0.0f)
+            {
+                float c[16];
+                memcpy(c, &s_regs[XE_GPU_REG_SHADER_CONSTANT_000_X], sizeof(c));
+                const uint32_t* vf = &s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 95 * 2];
+                if (std::fabs(c[0] - feX) <= feX * 1e-5f && c[1] == 0.0f && c[2] == 0.0f &&
+                    c[12] == 0.0f && c[13] == 0.0f && c[14] == 0.0f && c[15] == 1.0f && ((vf[0] & 3) == 3))
+                {
+                    const auto& vi = s_vs->info;
+                    const bool feShader = ((vi.vertexFetchConstants[95 / 32] >> (95 % 32)) & 1) &&
+                        (vi.constRelative || (vi.constUsed[0] & 0xFull) == 0xFull);
+                    barPlan = planEdgeFills(c, game::FrontEndScaleY(), s, sv, feShader, true);
+                    logEdgeFill(barPlan, s, sv);
+                    if (barPlan.fill == gpu::bars::Fill::Vignette)
+                        memcpy(pc.posScale, barPlan.posScale, sizeof(pc.posScale));
+                }
+            }
+        }
         // NFSMW_LOG_DRAWS=<seconds>: every draw of one frame (target, viewport,
         // scissor, textures, shaders), consecutive duplicates folded.
         if (s_logDrawsNow)
@@ -10247,8 +10724,9 @@ void main()
                     line += std::format(" {}:{:08X}", n, (s_regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + n * 6 + 1] & 0x1FFFF000u));
             if (barPlan.rectCount)
                 line += std::format(" +edge {} fill x{}", barPlan.fill == gpu::bars::Fill::Backdrop ? "backdrop"
-                    : barPlan.fill == gpu::bars::Fill::Blackout ? "black frame" : barPlan.fill == gpu::bars::Fill::Overlay ? "overlay" : "bar",
-                    barPlan.rectCount);
+                    : barPlan.fill == gpu::bars::Fill::Blackout ? "black frame" : "bar", barPlan.rectCount);
+            else if (barPlan.fill == gpu::bars::Fill::Vignette)
+                line += " +vignette stretched";
             static std::string last;
             static uint32_t repeats = 0;
             if (line == last)
@@ -10609,7 +11087,7 @@ void main()
                     ca[attachments].clearValue.color = { { 0.0f, 0.0f, 0.0f, 1.0f } };
                     attachments++;
                 }
-            VkClearRect cr[6]{};
+            VkClearRect cr[std::extent_v<decltype(gpu::bars::Plan::rects)>]{};
             for (uint32_t i = 0; i < barPlan.rectCount; i++)
             {
                 const gpu::bars::Rect& r = barPlan.rects[i];
@@ -11127,6 +11605,14 @@ void main()
     {
         if (s_vk)
             ApplyLiveSettings();
+        if (frame % 600 == 0)
+            ReportColourCheck("so far");
+        if (s_resolveUseFrom && frame >= s_resolveUseFrom)
+        {
+            s_resolveUse = true;
+            if (++s_resolveUseFrames % 600 == 0)
+                ReportResolveUse("so far");
+        }
         if (s_uploadLog)
         {
             UploadLog& log = *s_uploadLog;
@@ -11341,14 +11827,16 @@ void main()
         s_compileCv.notify_all();
         SavePipelineCache();
         SavePipelineKeys();
-        if (s_resolveDefer)
+        ReportResolveUse("at exit");
+        ReportColourCheck("at exit");
+        if (s_resolveDefer || s_resolveDeferColor)
         {
             auto ds = writewatch::GetDeferStats();
-            fprintf(stderr, "[renderer] deferred resolves (NFSMW_RESOLVE_DEFER): %llu, replaced unwritten %llu, written for GPU work %llu, "
-                "for the CPU %llu, for room %llu; CPU accesses that waited %llu, stale read-backs %llu\n",
-                (unsigned long long)s_deferredCount.load(), (unsigned long long)s_deferReplaced.load(), (unsigned long long)s_deferForGpu.load(),
-                (unsigned long long)s_deferForCpu.load(), (unsigned long long)s_deferForRoom.load(), (unsigned long long)ds.waits,
-                (unsigned long long)ds.staleReadbacks);
+            fprintf(stderr, "[renderer] deferred resolves (NFSMW_RESOLVE_DEFER): %llu (%llu colour), replaced unwritten %llu, written for GPU "
+                "work %llu, for the CPU %llu, for a resolve %llu, for room %llu; CPU accesses that waited %llu, stale read-backs %llu\n",
+                (unsigned long long)s_deferredCount.load(), (unsigned long long)s_deferredColour.load(), (unsigned long long)s_deferReplaced.load(),
+                (unsigned long long)s_deferForGpu.load(), (unsigned long long)s_deferForCpu.load(), (unsigned long long)s_deferForResolve.load(),
+                (unsigned long long)s_deferForRoom.load(), (unsigned long long)ds.waits, (unsigned long long)ds.staleReadbacks);
         }
         // A shot's copy still being read and written out (ReadBackFrontImage):
         // a moment for it, so its file is whole and its buffer freed.

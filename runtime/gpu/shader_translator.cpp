@@ -111,6 +111,21 @@ bool boolConst(uint i) { return ((u.bools[i >> 7][(i >> 5) & 3u] >> (i & 31u)) &
 // No `precise` anywhere: MoltenVK (SPIRV-Cross) implements it with
 // optnone helper calls per operation, making shaders ~20x slower. Positions
 // stay identical across passes through `invariant gl_Position` instead.
+// SB_FMULZ (the renderer's NFSMW_FMULZ; default with RADV): each operand
+// zeroed where the other is zero, then multiplied (DXVK's Strict form),
+// which Mesa folds into one fmulz: v_mul_legacy_f32 (v_fma_legacy_f32 with
+// the add), where the product's select costs 4-5 instructions a component.
+// The same values but a zero's sign (+-0 kept where a driver doesn't fold it).
+#ifdef SB_FMULZ
+vec4 xmul(vec4 a, vec4 b)
+{
+    return mix(a, vec4(0.0), equal(b, vec4(0.0))) * mix(b, vec4(0.0), equal(a, vec4(0.0)));
+}
+float xmul(float a, float b)
+{
+    return (b == 0.0 ? 0.0 : a) * (a == 0.0 ? 0.0 : b);
+}
+#else
 vec4 xmul(vec4 a, vec4 b)
 {
     vec4 r = a * b;
@@ -122,6 +137,7 @@ float xmul(float a, float b)
     float r = a * b;
     return (abs(a) == 0.0 || abs(b) == 0.0) ? 0.0 : r;
 }
+#endif
 )";
     }
 

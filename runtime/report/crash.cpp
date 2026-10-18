@@ -4,7 +4,8 @@
 // watch declined the fault) runs on the crashing thread in a signal handler,
 // so everything here that it calls is async-signal-safe: the report file is
 // opened at startup (logs/.crash-pending-<session>, empty unless the session
-// crashes) and renamed to crash-<session>.txt when written; its header, the
+// crashes: crash_marker.h, removed when the session ends cleanly) and renamed
+// to crash-<session>.txt when written; its header, the
 // system summary and the symbol table are ready beforehand; text goes out
 // with write(2). The one call outside POSIX's list is dladdr (and the
 // backtrace() it follows), which glibc and macOS implement without
@@ -28,6 +29,7 @@
 #include <stdafx.h>
 #include "report.h"
 #include "internal.h"
+#include "crash_marker.h"
 
 #include <gpu/command_processor.h>
 #include <ui/ui.h>
@@ -259,7 +261,7 @@ namespace report
         thread_local CrashStack t_crashStack;
 #endif
 
-        int s_reportFd = -1;
+        std::atomic<int> s_reportFd{ -1 };  // -1 once the session has ended cleanly (ClearCrashMarker)
         char s_pendingPath[1024];
         char s_finalPath[1024];
         char s_header[2048];
@@ -512,7 +514,7 @@ namespace report
         {
             memcpy(s_pendingPath, pending.c_str(), pending.size() + 1);
             memcpy(s_finalPath, finalPath.c_str(), finalPath.size() + 1);
-            s_reportFd = open(s_pendingPath, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+            s_reportFd = marker::Arm(s_pendingPath);
         }
         if (s_reportFd < 0)
             fprintf(stderr, "[crash] can't prepare a crash report file in %s: %s\n", dir.c_str(), strerror(errno));
@@ -638,18 +640,18 @@ namespace report
                 frame(frames[i]);
         detail::WriteDirect(text, b.size);
 
-        if (s_reportFd >= 0)
+        if (const int fd = s_reportFd.load(); fd >= 0)
         {
-            detail::WriteAll(s_reportFd, s_header, s_headerSize);
-            detail::WriteAll(s_reportFd, text + 1, b.size - 1);  // (without the leading blank line)
+            detail::WriteAll(fd, s_header, s_headerSize);
+            detail::WriteAll(fd, text + 1, b.size - 1);  // (without the leading blank line)
             static const char recent[] = "\nThe log's last lines:\n";
-            detail::WriteAll(s_reportFd, recent, sizeof(recent) - 1);
-            detail::WriteRecentOutput(s_reportFd, 300);
+            detail::WriteAll(fd, recent, sizeof(recent) - 1);
+            detail::WriteRecentOutput(fd, 300);
             static const char system[] = "\nSystem (at startup):\n";
-            detail::WriteAll(s_reportFd, system, sizeof(system) - 1);
+            detail::WriteAll(fd, system, sizeof(system) - 1);
             const char* summary = detail::LoggedSystemSummary();
-            detail::WriteAll(s_reportFd, summary, strlen(summary));
-            fsync(s_reportFd);
+            detail::WriteAll(fd, summary, strlen(summary));
+            fsync(fd);
             bool renamed = rename(s_pendingPath, s_finalPath) == 0;
             b.size = 0;
             b.Str("[crash] crash report: ").Str(renamed ? s_finalPath : s_pendingPath).Char('\n');
@@ -657,23 +659,34 @@ namespace report
         }
     }
 
-    void NoticePreviousCrash()
+    void ClearCrashMarker()
+    {
+        // A crash being reported is how the session ends: its report stays.
+        if (s_crashing.load())
+            return;
+        if (const int fd = s_reportFd.exchange(-1); fd >= 0)
+            marker::Clear(fd, s_pendingPath);
+    }
+
+    void NoticePreviousCrash(bool lastClearsMarker)
     {
         std::filesystem::path dir = LogDirectory();
-        std::string current = std::string(".crash-pending-") + SessionName();
         std::error_code ec;
-        // Pending files of earlier sessions: empty (no crash: removed), or a
+        // Markers of earlier sessions (crash_marker.h): empty (removed), or a
         // report the handler couldn't rename.
-        for (std::filesystem::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec))
+        for (const marker::Leftover& left : marker::Find(dir, SessionName()))
         {
-            std::string name = it->path().filename().string();
-            if (!name.starts_with(".crash-pending-") || name == current)
+            std::error_code fileError;
+            if (left.ended == marker::Ended::Crashed)
+            {
+                std::filesystem::rename(left.path, dir / ("crash-" + left.session + ".txt"), fileError);
                 continue;
-            std::error_code sizeError;
-            if (std::filesystem::file_size(it->path(), sizeError) == 0 || sizeError)
-                std::filesystem::remove(it->path(), sizeError);
-            else
-                std::filesystem::rename(it->path(), dir / ("crash-" + name.substr(15) + ".txt"), sizeError);
+            }
+            std::filesystem::remove(left.path, fileError);
+            // A version before v0.1.6 left one after every session.
+            if (lastClearsMarker)
+                fprintf(stderr, "[crash] an earlier session (%s) ended without quitting: it was stopped from outside (SIGKILL: a forced "
+                    "quit, the power going) or crashed too hard to write a report; there is no report to send\n", left.session.c_str());
         }
         detail::KeepNewest(dir.string(), "crash-", ".txt", 5);
 

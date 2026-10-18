@@ -1107,6 +1107,7 @@ namespace bench
                 fprintf(stderr, "[bench] no event loop to quit through (%s): exiting here, code %d\n", SDL_GetError(), code);
                 vfs::WaitForStagedFiles(std::chrono::seconds(2));
                 renderer::Shutdown();
+                report::ClearCrashMarker();  // a clean end, as main's quit paths
                 report::FlushLog();
                 std::_Exit(code);
             }
