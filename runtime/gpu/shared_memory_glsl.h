@@ -41,7 +41,16 @@ void memStore(uint w, uint v)
     else if (part == 2u) g_mem2[i] = v;
     else g_mem3[i] = v;
 }
+uint memLoad(uint w)
+{
+    uint i = w & 0x1FFFFFFu, part = w >> 25;
+    if (part == 0u) return g_mem[i];
+    if (part == 1u) return g_mem1[i];
+    if (part == 2u) return g_mem2[i];
+    return g_mem3[i];
+}
 #else
 #define memStore(w, v) g_mem[w] = (v)
+#define memLoad(w) g_mem[w]
 #endif
 )"
