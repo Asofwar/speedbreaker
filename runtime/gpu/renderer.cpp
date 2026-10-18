@@ -713,7 +713,11 @@ namespace gpu::renderer
         // Per profiled pass, also what was recorded in the gap before it:
         // resolves, texture uploads, submissions, guest memory synced to the
         // GPU copy (KB).
-        struct PassInfo { std::string desc; uint32_t draws = 0; uint32_t slot, query; uint32_t resolves = 0, uploads = 0, submits = 0; uint64_t shadowKB = 0; };
+        // And why it began (study/hle-renderer): what ended the pass before
+        // it (PassBreak), whether that pass had the same targets (a break
+        // that only the reason forced), and for a submit its site (s_submitWhy).
+        struct PassInfo { std::string desc; uint32_t draws = 0; uint32_t slot, query; uint32_t resolves = 0, uploads = 0, submits = 0; uint64_t shadowKB = 0;
+            uint8_t why = 0, same = 0, submitWhy = 0; };
         struct GapCounters { uint64_t resolves = 0, uploads = 0, submits = 0, shadowBytes = 0; } s_gapLast;
         std::vector<PassInfo> s_passInfos;
         bool s_profiling = false;
@@ -793,7 +797,15 @@ namespace gpu::renderer
             s_zpdQuery = -1;
         }
 
-        void EndPass();
+        // What ended a render pass (study/hle-renderer; NFSMW_PASS_PROFILE
+        // prints it with the pass after it, as why that one had to begin).
+        enum PassBreak : uint8_t { kBreakStart, kBreakTargets, kBreakResolve, kBreakSubmit, kBreakClear, kBreakUpload, kBreakBarrier,
+            kBreakPresent, kBreakOther };
+        constexpr const char* kPassBreakNames[] = { "start", "targets", "resolve", "submit", "clear", "upload", "barrier", "present", "other" };
+        PassBreak s_passBreak = kBreakStart;      // what ended the last pass
+        uint8_t s_passBreakSubmit = 0;            // and, a submit, its site
+        const void* s_lastPassTargets[5] = {};    // that pass's colour targets and depth
+        void EndPass(PassBreak why = kBreakOther);
         // Bumped when the command buffer's graphics state is unknown (a new
         // command buffer; without CP_OPT_KEEP_BINDINGS also compute work,
         // which shares the push constants).
@@ -947,7 +959,8 @@ namespace gpu::renderer
                 return;
             s_submitWhy[why]++;
             timeline::Mark(timeline::SubmitBegin, why);
-            EndPass();
+            s_passBreakSubmit = uint8_t(why);
+            EndPass(kBreakSubmit);
             if (s_timestamps)
                 vkCmdWriteTimestamp(s_cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, s_timestamps, s_slot * 2 + 1);
             Check(vkEndCommandBuffer(s_cmd), "vkEndCommandBuffer");
@@ -2384,7 +2397,7 @@ namespace gpu::renderer
         // ~0.15-0.25: the glow and flare draws still run).
         const uint32_t s_passMerge = [] { const char* v = std::getenv("NFSMW_PASS_MERGE"); return v ? uint32_t(std::atoi(v)) : kFewerPasses ? 3u : 0u; }();
 
-        void EndPass()
+        void EndPass(PassBreak why)
         {
             if (!s_passActive)
                 return;
@@ -2430,6 +2443,9 @@ namespace gpu::renderer
         // Guest rectangle [x0, x1) x [y0, y1) in host pixels at `scale`: its
         // edges' (gpu/render_scale.h; a negative edge is 0), so rectangles
         // that share a guest edge share the host one.
+            s_passBreak = why;
+            std::copy(s_passColor, s_passColor + 4, s_lastPassTargets);
+            s_lastPassTargets[4] = s_passDepth;
         VkRect2D HostRect(const gpu::RenderScale& scale, int32_t x0, int32_t y0, int32_t x1, int32_t y1)
         {
             const int32_t hx0 = scale.x.EdgeAt(x0), hy0 = scale.y.EdgeAt(y0), hx1 = scale.x.EdgeAt(x1), hy1 = scale.y.EdgeAt(y1);
@@ -2528,7 +2544,7 @@ namespace gpu::renderer
             for (const PendingClear& pc : s_pendingClears)
                 if (attached(pc.rt))
                     area = Union(area, pc.rect);
-            EndPass();
+            EndPass(kBreakTargets);
             Begin();
             uint32_t w = UINT32_MAX, h = UINT32_MAX;
             VkRenderingAttachmentInfoKHR colors[4]{};
@@ -2692,6 +2708,10 @@ namespace gpu::renderer
             {
                 // Newest first, so `run` (the read, then each clear that runs
                 // now) holds every newer clear an older one must land under.
+                PassInfo& pi = s_passInfos.back();
+                pi.why = s_passBreak;
+                pi.same = std::equal(color, color + 4, s_lastPassTargets) && s_lastPassTargets[4] == depth;
+                pi.submitWhy = s_passBreakSubmit;
                 std::vector<VkRect2D> run{ *read };
                 for (size_t i = s_pendingClears.size(); i-- > 0;)
                 {
@@ -2767,7 +2787,7 @@ namespace gpu::renderer
                 (unsigned long long)s_vs->hash, kWhy[why], s_passActive ? " (its pass is split)" : "");
             s_barrierCounts.vertex[why]++;
             s_barrierCounts.splits += s_passActive;
-            EndPass();
+            EndPass(kBreakBarrier);
             Begin();
             FullBarrier();
         }
@@ -4018,7 +4038,7 @@ namespace gpu::renderer
                 return;
             std::sort(dirty.begin(), dirty.end());
             dirty.erase(std::unique(dirty.begin(), dirty.end()), dirty.end());
-            EndPass();
+            EndPass(kBreakUpload);
             Begin();
             for (size_t i = 0; i < dirty.size();)
             {
@@ -5033,7 +5053,7 @@ void main()
                     {
                         if (t.storeView)  // stored directly (one 2D slice, or a cube's face: see s_untileStorePipeline)
                         {
-                            EndPass();
+                            EndPass(kBreakUpload);
                             Begin();
                             UntileConstants uc{ base + slice * sliceStride, f.tiled ? 1u : 0u, f.tiled ? pitchAligned : rowBytes, fi.bpbLog2,
                                 offX, offY, bw, bh, uint32_t(f.endianness), fi.convert, 0, 0, 0, 0 };
@@ -5063,7 +5083,7 @@ void main()
                             LogOnce(0x2200, "texture %ux%u format %u is too large for a staging slot", width, height, format);
                             return dummy;
                         }
-                        EndPass();
+                        EndPass(kBreakUpload);
                         Begin();
                         uint32_t layer = volume ? 0 : slice, zSlice = volume ? slice : 0;
                         uint32_t sliceBase = base + (volume ? (f.tiled ? 0 : zSlice * sliceStride) : layer * sliceStride);
@@ -5127,7 +5147,7 @@ void main()
                             VkDeviceSize staging = RingAllocate(VkDeviceSize(levelRowWords) * 4 * lbh);
                             if (staging == ~VkDeviceSize(0))
                                 break;
-                            EndPass();
+                            EndPass(kBreakUpload);
                             Begin();
                             UntileConstants uc{ levelBase + layer * mips.SliceStride(storage), f.tiled ? 1u : 0u,
                                 f.tiled ? mips.PitchBlocks(storage) : mips.RowBytes(storage), fi.bpbLog2,
@@ -6106,7 +6126,7 @@ void main()
             // Deferred (see s_pendingClears); a pass open on the target now
             // must end so the clear lands before its next use.
             if (s_passActive && (s_passDepth == rt || std::find(s_passColor, s_passColor + 4, rt) != s_passColor + 4))
-                EndPass();
+                EndPass(kBreakClear);
             VkRect2D rect{ { x0, y0 }, { uint32_t(x1 - x0), uint32_t(y1 - y0) } };
             // NFSMW_CLEAR_FLUSH_RECT: tile bands left pending by the resolves
             // between them become one clear (a load-op clear when it covers the
@@ -6518,7 +6538,7 @@ void main()
         {
             DeferredResolve d = s_deferredResolves[i];
             s_deferredResolves.erase(s_deferredResolves.begin() + ptrdiff_t(i));
-            EndPass();
+            EndPass(kBreakResolve);
             Begin();
             const bool colour = d.texture != nullptr;
             ResolveConstants rc = d.rc;
@@ -6572,7 +6592,7 @@ void main()
                     MakeResolvePipeline(false, 1, 1, &s_resolveWritebackPipeline, false, 1);
                 LogOnce(0x3500, "NFSMW_RESOLVE_DEFER_COLOR=2: colour resolves into cached textures compared with their write-back");
             }
-            EndPass();
+            EndPass(kBreakResolve);
             Begin();
             ResolveConstants rc = resolved;
             rc.texWrite = 0;
@@ -6643,7 +6663,7 @@ void main()
             vci.format = rt.vkFormat;
             vci.subresourceRange = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
             Check(vkCreateImageView(s_dev, &vci, nullptr, &rt.sampleView), "vkCreateImageView(depth)");
-            EndPass();
+            EndPass(kBreakResolve);
             Begin();  // (the resolve may have submitted: SubmitIfStarving)
             ToGeneral(rt.image.image, aspect, 1);
             return old;
@@ -6816,7 +6836,7 @@ void main()
                 }
                 else
                 {
-                    EndPass();
+                    EndPass(kBreakResolve);
                     Begin();
                     // NFSMW_UNTILED_AREA: a resolve reading, inside what the
                     // untiled draws cut to their viewports could reach (their
@@ -6870,7 +6890,7 @@ void main()
                     {
                         FlushPendingClears(source);
                     }
-                    EndPass();
+                    EndPass(kBreakResolve);
                     Begin();
                     ResolveConstants rc{};
                     rc.originX = r.x0;
@@ -7660,7 +7680,7 @@ void main()
             else if (!s_scaledUntilePipeline)
                 CreateComputePipeline(kScaledUntileGlsl, b, 3, 10 * sizeof(uint32_t), s_scaledUntileSetLayout, s_scaledUntileLayout,
                     s_scaledUntilePipeline, "#define TO_BUFFER\n");
-            EndPass();
+            EndPass(kBreakUpload);
             Begin();
             vkCmdFillBuffer(s_cmd, s_scaled.table, 0, VK_WHOLE_SIZE, 0);
             FullBarrier();
@@ -7695,7 +7715,7 @@ void main()
                 LogOnce(0x2300, "scaled texture %ux%u is larger than the scratch buffer", t.width, t.height);
                 return;
             }
-            EndPass();
+            EndPass(kBreakUpload);
             Begin();
             s_scaled.loads++;
             s_scaled.untiledBytes += bytes;
@@ -7763,7 +7783,7 @@ void main()
                     out[i * 2 + 1] = fresh[first + i].second;
                     EnsureShadow(fresh[first + i].first << 12, 4096);
                 }
-                EndPass();
+                EndPass(kBreakUpload);
                 Begin();
                 VkDescriptorBufferInfo bi[3] = { s_sharedInfo[0], { s_scaled.pool, 0, VK_WHOLE_SIZE }, { s_ring, 0, kRingSize } };
                 VkWriteDescriptorSet w[6];
@@ -11388,7 +11408,7 @@ void main()
         }
         else
             EnsureShadow(pc.base, frontBytes);
-        EndPass();
+        EndPass(kBreakPresent);
         Begin();
         FullBarrier();  // after earlier work, including the presenter's last read
         // The image this swap writes: not the one the presenter took last,
@@ -11561,7 +11581,7 @@ void main()
         // later write of the image (the next swaps' conversions begin with a
         // full barrier too), so the copy is this swap's picture whatever the
         // GPU's pace. The guest sees nothing of it.
-        EndPass();
+        EndPass(kBreakPresent);
         Begin();
         FullBarrier();
         VkBufferImageCopy region{};
@@ -11795,8 +11815,14 @@ void main()
             between += gap;
             if (ts[1] > ts[0])
                 lastEnd = ts[1];
-            fprintf(stderr, "[profile] %8.1f us  %4u draws  (+%7.1f us before: %u resolves, %u uploads, %u submits, %llu KB synced)  %s\n",
-                us, pi.draws, gap, pi.resolves, pi.uploads, pi.submits, (unsigned long long)pi.shadowKB, pi.desc.c_str());
+            // A pass also says why it began: "| after <what ended the one
+            // before>[ (submit site)], same targets|new targets".
+            std::string why;
+            if (pi.desc.starts_with("area"))
+                why = std::format("  | after {}{}, {} targets", kPassBreakNames[std::min<size_t>(pi.why, std::size(kPassBreakNames) - 1)],
+                    pi.why == kBreakSubmit ? std::format(" ({})", pi.submitWhy) : std::string(), pi.same ? "same" : "new");
+            fprintf(stderr, "[profile] %8.1f us  %4u draws  (+%7.1f us before: %u resolves, %u uploads, %u submits, %llu KB synced)  %s%s\n",
+                us, pi.draws, gap, pi.resolves, pi.uploads, pi.submits, (unsigned long long)pi.shadowKB, pi.desc.c_str(), why.c_str());
         }
         fprintf(stderr, "[profile] total %.1f us in passes, %.1f us between them\n", total, between);
         if (frame < uint64_t(s_profileFrame) + uint64_t(s_profileFrames))
