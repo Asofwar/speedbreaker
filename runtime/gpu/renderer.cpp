@@ -40,6 +40,9 @@
 
 #include <glslang/Include/glslang_c_interface.h>
 #include <glslang/Public/resource_limits_c.h>
+#if __has_include(<glslang/build_info.h>)
+#include <glslang/build_info.h>
+#endif
 
 #include <array>
 #include <cmath>
@@ -1822,8 +1825,15 @@ namespace gpu::renderer
             {
                 if (s_spirvOpt)
                 {
+                    // (Since glslang 16.6 its optimizer runs for an
+                    // optimize_performance or optimize_size request only.)
                     glslang_spv_options_t options{};
                     options.disable_optimizer = false;
+#ifdef GLSLANG_VERSION_GREATER_OR_EQUAL_TO
+#if GLSLANG_VERSION_GREATER_OR_EQUAL_TO(16, 6, 0)
+                    options.optimize_performance = true;
+#endif
+#endif
                     glslang_program_SPIRV_generate_with_options(program, stage, &options);
                 }
                 else
