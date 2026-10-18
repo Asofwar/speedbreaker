@@ -161,27 +161,36 @@ namespace hle
         packet = Physical(packet);
         destBase = Physical(destBase);
         std::lock_guard lock(s_mutex);
-        auto holds = [&](const Intent& in) {
+        // Its destination in the intent's texture (none named: any).
+        auto into = [&](const Intent& in) {
+            return !in.texBase || (destBase >= in.texBase && uint64_t(destBase) < uint64_t(in.texBase) + in.texBytes);
+        };
+        // Its packet in the intent's: first a call whose packets are one run
+        // [start, end), then (pass 1) one that began a new segment of the
+        // ring (end below start: it holds nearly every address) or is still
+        // running (end 0).
+        auto holds = [&](const Intent& in, int pass) {
+            if (pass == 0)
+                return in.ringEnd != 0 && in.ringEnd >= in.ringStart && packet >= in.ringStart && packet < in.ringEnd;
             if (in.ringEnd == 0)
                 return packet >= in.ringStart;
-            if (in.ringEnd >= in.ringStart)
-                return packet >= in.ringStart && packet < in.ringEnd;
-            return packet >= in.ringStart || packet < in.ringEnd;  // a new segment began inside the call
+            return in.ringEnd < in.ringStart && (packet >= in.ringStart || packet < in.ringEnd);
         };
         size_t found = s_pending.size();
         bool byPacket = false;
-        for (size_t i = 0; i < s_pending.size(); i++)
-            if (holds(s_pending[i]))
-            {
-                found = i;
-                byPacket = true;
-                break;
-            }
+        for (int pass = 0; pass < 2 && found == s_pending.size(); pass++)
+            for (size_t i = 0; i < s_pending.size(); i++)
+                if (holds(s_pending[i], pass) && into(s_pending[i]))
+                {
+                    found = i;
+                    byPacket = true;
+                    break;
+                }
         if (found == s_pending.size())
             for (size_t i = 0; i < s_pending.size() && i < 8; i++)
             {
                 const Intent& in = s_pending[i];
-                if (in.texBase && destBase >= in.texBase && uint64_t(destBase) < uint64_t(in.texBase) + in.texBytes)
+                if (in.texBase && into(in))
                 {
                     found = i;
                     break;
