@@ -3,6 +3,7 @@
 // vulkan/vulkan_pipeline_cache.cc.
 #include <stdafx.h>
 #include "renderer.h"
+#include "cpu_locks.h"
 #include <cpu/guest_thread.h>
 #include <cpu/host_cpu.h>
 #include <cpu/guest_time.h>
@@ -5888,15 +5889,40 @@ void main()
         return;
     uint x = uint(p.origin.x) + id.x, y = uint(p.origin.y) + id.y;
     uint word = ((p.destBase + tiled2D(x, y, p.destPitch, 2u)) & 0x1FFFFFFFu) >> 2;
+    // NFSMW_RESOLVE_LAZY: a rectangle past the texture by
+    // its 8-pixel alignment only (D3D resolved the surface whole): those
+    // words stay as they were.
 #ifdef TEX_OFFSET
+    if (x + p.texX >= p.texWidth || y + p.texY >= p.texHeight)
+        return;
     uint v = imageLoad(t_image, ivec2(int(x + p.texX), int(y + p.texY))).x;
 #else
+    if (x >= p.texWidth || y >= p.texHeight)
+        return;
     uint v = imageLoad(t_image, ivec2(int(x), int(y))).x;
 #endif
+    if (p.texConvert == 4u)
+    {
+        // NFSMW_RESOLVE_LAZY: a depth resolve's texel, float(d24) / 16777215 as
+        // TEXTURE_ONLY stored it, back to the word main() writes (d24 << 8,
+        // the stencil byte 0): the 24-bit value whose quotient is this float.
+        float f = uintBitsToFloat(v);
+        uint d0 = packDepth24(f), d = d0;
+        for (int k = -3; k <= 3; k++)
+        {
+            uint c = uint(int(d0) + k);
+            if (c <= 0xFFFFFFu && float(c) / 16777215.0 == f)
+            {
+                d = c;
+                break;
+            }
+        }
+        v = d << 8;
+    }
 #ifdef WRITEBACK_CHECK
     // NFSMW_RESOLVE_DEFER_COLOR=2: the word main() stored, compared (the
     // pool binding counts: [0] words that differ, [1] words compared).
-    if (g_mem[word] != swapWord(v, p.texEndian))
+    if (memLoad(word) != swapWord(v, p.texEndian))
         atomicAdd(s_pool[0], 1u);
     atomicAdd(s_pool[1], 1u);
 #else
@@ -6449,6 +6475,27 @@ void main()
             return v ? std::clamp(std::atoi(v), 0, 2) : kResolveDeferDefault;
         }();
         const bool s_resolveDeferColor = s_resolveDeferColorMode == 1;
+        // NFSMW_RESOLVE_LAZY=1 (off by default): more resolves into cached
+        // textures store the texture only, their guest bytes written back
+        // from it when something reads them, as NFSMW_RESOLVE_DEFER_COLOR's,
+        // where the CPU hasn't locked that texture lately (gpu/cpu_locks.h:
+        // a read every frame, the exposure's 64x64, would only wait):
+        // - depth ones without a clear (shadow map 1, which map 2 is drawn
+        //   over; the scene's depth strips): the texture holds float(d24) /
+        //   16777215, the word main() writes is d24 << 8 (its stencil byte
+        //   0), so the write-back recovers it (in the same endianness only);
+        // - colour ones whose rectangle runs past the texture by its 8-pixel
+        //   alignment only (the bloom chain's 320x180 and 160x90 at 184 and
+        //   96 rows: D3D resolves those surfaces whole, the hardware's
+        //   rectangle is 8-pixel aligned): the words past it, outside the
+        //   texture, stay as they were.
+        // NFSMW_RESOLVE_LAZY=2 checks it as NFSMW_RESOLVE_DEFER_COLOR=2 does:
+        // stored as before, then compared with what the write-back writes.
+        const int s_hleLazyMode = [] {
+            const char* v = std::getenv("NFSMW_RESOLVE_LAZY");
+            return v ? std::clamp(std::atoi(v), 0, 2) : 0;
+        }();
+        const bool s_hleLazy = s_hleLazyMode == 1;
         struct ColourCheck
         {
             VkBuffer buffer = VK_NULL_HANDLE;
@@ -6520,6 +6567,7 @@ void main()
         // CPU, for want of room (any thread reads them at exit).
         std::atomic<uint64_t> s_deferredCount{ 0 }, s_deferReplaced{ 0 }, s_deferForGpu{ 0 }, s_deferForCpu{ 0 }, s_deferForRoom{ 0 };
         std::atomic<uint64_t> s_deferredColour{ 0 }, s_deferForResolve{ 0 };  // (colour ones; written for a resolve not deferred)
+        std::atomic<uint64_t> s_deferredHle{ 0 };  // (NFSMW_RESOLVE_LAZY ones)
 
         // Whether deferred colour resolve `b`'s rectangle in its texture holds
         // all of `a`'s (the same texture and face).
@@ -6834,7 +6882,7 @@ void main()
                 // (those it covers no longer owe anything once it does);
                 // otherwise they are written before it writes guest memory.
                 std::vector<DeferredResolve> held;
-                if (s_resolveDeferColor && ResolveFormatSupported(format) && ResolveBppLog2(format) == 2)
+                if ((s_resolveDeferColor || s_hleLazy) && ResolveFormatSupported(format) && ResolveBppLog2(format) == 2)
                     for (size_t i = s_deferredResolves.size(); i-- > 0;)
                     {
                         const DeferredResolve& d = s_deferredResolves[i];
@@ -7184,12 +7232,24 @@ void main()
                     const bool colourFits = s_shadowMode && !depthSource && fused && fused->convert == 0 && !scaledWrite && bl == 2 &&
                         source->scale.IsOne() && r.x0 >= 0 && r.y0 >= 0 && uint64_t(r.x1) + rc.texX <= fused->width &&
                         uint64_t(r.y1) + rc.texY <= fused->height;
+                    // NFSMW_RESOLVE_LAZY (see s_hleLazy): a texture the CPU
+                    // hasn't locked lately (gpu/cpu_locks.h).
+                    const bool hleFits = s_hleLazyMode && !cpulocks::LockedLately(fused ? fused->guestStart : rc.destBase) && s_shadowMode && fused &&
+                        !scaledWrite &&
+                        bl == 2 && source->scale.IsOne() && r.x0 >= 0 && r.y0 >= 0 && !defer;
+                    const bool hleDepthFits = hleFits && depthSource && fused->convert == 4 && !copyControl.depth_clear_enable &&
+                        rc.endian == fused->endian && uint64_t(r.x1) + rc.texX <= fused->width && uint64_t(r.y1) + rc.texY <= fused->height;
+                    const bool hleColourFits = hleFits && !depthSource && !colourFits && fused->convert == 0 &&
+                        uint64_t(r.x1) + rc.texX < uint64_t(fused->width) + 8 && uint64_t(r.y1) + rc.texY < uint64_t(fused->height) + 8;
+                    const bool deferHle = s_hleLazy && (hleDepthFits || hleColourFits);
                     const bool deferColour = s_resolveDeferColor && colourFits;
-                    const bool checkColour = s_resolveDeferColorMode == 2 && colourFits && !s_splitMemory;
+                    const bool deferTexture = deferColour || deferHle;  // a record with its texture (written back from it)
+                    // (Split memory too: WRITEBACK_CHECK reads through memLoad.)
+                    const bool checkColour = (s_resolveDeferColorMode == 2 && colourFits) || (s_hleLazyMode == 2 && (hleDepthFits || hleColourFits));
                     std::vector<DeferredResolve> covered;  // held ones this one's texels cover whole
                     for (const DeferredResolve& h : held)
                     {
-                        const bool same = deferColour && h.texture == fused && h.layer == layer;
+                        const bool same = deferTexture && h.texture == fused && h.layer == layer;
                         if (same && CoversTexels(rc, h.rc))
                             covered.push_back(h);
                         else
@@ -7202,7 +7262,7 @@ void main()
                             }
                         }
                     }
-                    const bool textureOnly = defer || deferColour;
+                    const bool textureOnly = defer || deferTexture;
                     if (s_hleCounting)
                     {
                         const uint64_t px = (uint64_t(rc.width) * rc.height) << bl;
@@ -7327,7 +7387,7 @@ void main()
                         s_deferReplaced++;
                         writewatch::DeferredWritten(c.rangeBase, c.rangeBytes);
                     }
-                    if (deferColour)
+                    if (deferTexture)
                     {
                         if (s_deferredResolves.size() >= kMaxDeferred)
                         {
@@ -7336,9 +7396,14 @@ void main()
                         }
                         s_deferredResolves.push_back({ rangeBase, rangeBytes, rc, Image{}, VK_NULL_HANDLE, VK_FORMAT_UNDEFINED, 0, 0, fused, layer });
                         s_deferredCount++;
-                        s_deferredColour++;
-                        LogOnce(0x3400, "colour resolves into cached textures defer their guest bytes (NFSMW_RESOLVE_DEFER_COLOR; the first: "
-                            "%ux%u at %08X)", rc.width, rc.height, rc.destBase);
+                        s_deferredColour += deferColour;
+                        s_deferredHle += deferHle;
+                        if (deferColour)
+                            LogOnce(0x3400, "colour resolves into cached textures defer their guest bytes (NFSMW_RESOLVE_DEFER_COLOR; the first: "
+                                "%ux%u at %08X)", rc.width, rc.height, rc.destBase);
+                        else
+                            LogOnce(0x3410 + depthSource, "%s resolves into cached textures the CPU never locked defer their guest bytes "
+                                "(NFSMW_RESOLVE_LAZY; the first: %ux%u at %08X)", depthSource ? "depth" : "padded colour", rc.width, rc.height, rc.destBase);
                     }
                     if (defer)
                     {
@@ -11905,12 +11970,12 @@ void main()
                 double(s_hle.presented) / n);
         }
         ReportColourCheck("at exit");
-        if (s_resolveDefer || s_resolveDeferColor)
+        if (s_resolveDefer || s_resolveDeferColor || s_hleLazy)
         {
             auto ds = writewatch::GetDeferStats();
-            fprintf(stderr, "[renderer] deferred resolves (NFSMW_RESOLVE_DEFER): %llu (%llu colour), replaced unwritten %llu, written for GPU "
+            fprintf(stderr, "[renderer] deferred resolves (NFSMW_RESOLVE_DEFER): %llu (%llu colour, %llu NFSMW_RESOLVE_LAZY), replaced unwritten %llu, written for GPU "
                 "work %llu, for the CPU %llu, for a resolve %llu, for room %llu; CPU accesses that waited %llu, stale read-backs %llu\n",
-                (unsigned long long)s_deferredCount.load(), (unsigned long long)s_deferredColour.load(), (unsigned long long)s_deferReplaced.load(),
+                (unsigned long long)s_deferredCount.load(), (unsigned long long)s_deferredColour.load(), (unsigned long long)s_deferredHle.load(), (unsigned long long)s_deferReplaced.load(),
                 (unsigned long long)s_deferForGpu.load(), (unsigned long long)s_deferForCpu.load(), (unsigned long long)s_deferForResolve.load(),
                 (unsigned long long)s_deferForRoom.load(), (unsigned long long)ds.waits, (unsigned long long)ds.staleReadbacks);
         }

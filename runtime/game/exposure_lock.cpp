@@ -57,6 +57,7 @@
 #include <kernel/heap.h>
 #include <kernel/memory.h>
 #include <kernel/write_watch.h>
+#include <gpu/cpu_locks.h>
 
 extern "C" PPC_FUNC(__imp__sub_82589398);  // D3D: LockRect of a texture's level
 extern "C" PPC_FUNC(__imp__sub_82597410);  // D3D: the fence a lock of a resource waits for
@@ -102,6 +103,7 @@ namespace
 
 PPC_FUNC(sub_82589398)
 {
+    cpulocks::Note(base, ctx.r3.u32);  // the textures the CPU reads (gpu/cpu_locks.h)
     if (uint32_t(ctx.lr) != kExposureLock)
     {
         __imp__sub_82589398(ctx, base);
