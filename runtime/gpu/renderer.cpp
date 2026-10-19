@@ -687,6 +687,10 @@ namespace gpu::renderer
             // here, harvested at completion, then the END reports, in order.
             std::vector<ZpdSegment> zpdSegments;
             std::vector<ZpdEnd> zpdEnds;
+            // NFSMW_PREPASS: secondary command buffers its passes recorded
+            // into (the first `secondaryUsed`; reused once it completes).
+            std::vector<VkCommandBuffer> secondaries;
+            size_t secondaryUsed = 0;
         };
         // NFSMW_FENCE_EVENTS=0 disables mid-buffer fence publication.
         const bool s_fenceEvents = [] { const char* v = std::getenv("NFSMW_FENCE_EVENTS"); return !v || v[0] != '0'; }();
@@ -792,6 +796,34 @@ namespace gpu::renderer
         const void* s_lastConstLayoutVs = nullptr;  // the layout of that upload (see Draw)
         const void* s_lastConstLayoutPs = nullptr;
         VkCommandBuffer s_cmd = VK_NULL_HANDLE;
+        // NFSMW_PREPASS=1 (off by default): a depth pre-pass in each pass with
+        // colour and depth targets. The pass records into two secondary
+        // command buffers, run in its rendering in turn at its end: the
+        // pre-pass, where each draw that writes depth (LESS_OR_EQUAL, no
+        // stencil test, no blending, alpha test, kill or depth export) writes
+        // it with no pixel shader (its pipeline's vertex stage keeps only the
+        // position: `invariant gl_Position`, the same depth), and the pass,
+        // where those draws test EQUAL without writing it. Every pixel then
+        // runs the pixel shaders of the draws that end up on it (and of those
+        // not in the pre-pass: alpha-tested, blended), not of all the opaque
+        // ones drawn over each other on the way: a race frame's scene keeps
+        // 2.4 samples a pixel, its mirror 2.6, the cube faces about 2
+        // (NFSMW_PASS_STATS=2). The picture: a fragment the pre-pass hides was
+        // drawn over by an opaque one later (or failed its test then); ties
+        // keep the last of LESS_OR_EQUAL draws, as before.
+        // s_cmd is the pass's buffer while one records (s_preCmd the
+        // pre-pass's, s_primaryCmd the submission's).
+        const bool s_prepassOn = [] { const char* v = std::getenv("NFSMW_PREPASS"); return v && v[0] == '1'; }();
+        bool s_passSecondary = false;
+        VkCommandBuffer s_primaryCmd = VK_NULL_HANDLE, s_preCmd = VK_NULL_HANDLE;
+        uint64_t s_preEpoch = 1;  // the pre-pass buffer's bound state (Draw)
+        struct DeferredRendering
+        {
+            VkRenderingInfoKHR ri;
+            VkRenderingAttachmentInfoKHR colors[4];
+            VkRenderingAttachmentInfoKHR ds;
+        } s_deferredRendering;
+        struct PrepassCounts { uint64_t passes = 0, draws = 0, prepassed = 0, waiting = 0, depthOnly = 0; } s_prepassCounts;
         bool s_recording = false;
         std::chrono::steady_clock::time_point s_recordStart;
         std::mutex s_submitMutex;
@@ -970,6 +1002,7 @@ namespace gpu::renderer
             }
             vkResetFences(s_dev, 1, &sub.fence);
             vkResetCommandBuffer(sub.cmd, 0);
+            sub.secondaryUsed = 0;
             s_cmd = sub.cmd;
             VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
             bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -2757,7 +2790,24 @@ shaderPreamble;
             if (!s_passActive)
                 return;
             ZpdEndSegment();  // a segment never outlives its pass
-            s_vk->cmdEndRendering(s_cmd);
+            if (s_passSecondary)
+            {
+                // NFSMW_PREPASS: the pre-pass, then the pass, in its rendering.
+                Check(vkEndCommandBuffer(s_preCmd), "vkEndCommandBuffer (pre-pass)");
+                Check(vkEndCommandBuffer(s_cmd), "vkEndCommandBuffer (pass)");
+                const VkCommandBuffer secondaries[2] = { s_preCmd, s_cmd };
+                s_cmd = s_primaryCmd;
+                s_deferredRendering.ri.flags |= VK_RENDERING_CONTENTS_SECONDARY_COMMAND_BUFFERS_BIT_KHR;
+                s_vk->cmdBeginRendering(s_cmd, &s_deferredRendering.ri);
+                vkCmdExecuteCommands(s_cmd, 2, secondaries);
+                s_vk->cmdEndRendering(s_cmd);
+                s_passSecondary = false;
+                // (The submission's state is undefined after them.)
+                s_stateEpoch++;
+                s_pushEpoch++;
+            }
+            else
+                s_vk->cmdEndRendering(s_cmd);
             if (s_profiling && s_passEndPending && s_passStats && s_passInfos.back().stats)
             {
                 vkCmdEndQuery(s_cmd, s_passStats, s_passInfos.back().query / 2);
@@ -3028,6 +3078,7 @@ shaderPreamble;
             ri.pColorAttachments = colors;
             ri.pDepthAttachment = depth ? &ds : nullptr;
             ri.pStencilAttachment = depth ? &ds : nullptr;
+            const bool secondary = s_prepassOn && s_dynamicState && depth && std::any_of(color, color + 4, [](RenderTarget* t) { return t != nullptr; });
             if (s_profiling && s_passQueryNext + 2 <= 512)
             {
                 char desc[256];
@@ -3044,7 +3095,7 @@ shaderPreamble;
                 s_passInfos.push_back({ desc, 0, s_slot, s_passQueryNext, uint32_t(now.resolves - s_gapLast.resolves),
                     uint32_t(now.uploads - s_gapLast.uploads), uint32_t(now.submits - s_gapLast.submits), (now.shadowBytes - s_gapLast.shadowBytes) / 1024 });
                 PassInfo& pi = s_passInfos.back();
-                if (s_passStats)
+                if (s_passStats && !secondary)
                 {
                     vkCmdResetQueryPool(s_cmd, s_passStats, pi.query / 2, 1);
                     vkCmdBeginQuery(s_cmd, s_passStats, pi.query / 2, 0);
@@ -3063,7 +3114,54 @@ shaderPreamble;
                 s_passQueryNext += 2;
                 s_passEndPending = true;
             }
-            s_vk->cmdBeginRendering(s_cmd, &ri);
+            if (secondary)
+            {
+                s_deferredRendering.ri = ri;
+                std::copy(colors, colors + 4, s_deferredRendering.colors);
+                s_deferredRendering.ds = ds;
+                s_deferredRendering.ri.pColorAttachments = s_deferredRendering.colors;
+                s_deferredRendering.ri.pDepthAttachment = &s_deferredRendering.ds;
+                s_deferredRendering.ri.pStencilAttachment = &s_deferredRendering.ds;
+                VkFormat formats[4];
+                for (int i = 0; i < 4; i++)
+                    formats[i] = color[i] ? color[i]->vkFormat : VK_FORMAT_UNDEFINED;
+                VkCommandBufferInheritanceRenderingInfoKHR inherit{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_RENDERING_INFO_KHR };
+                inherit.colorAttachmentCount = 4;
+                inherit.pColorAttachmentFormats = formats;
+                inherit.depthAttachmentFormat = depth->vkFormat;
+                inherit.stencilAttachmentFormat = depth->vkFormat;
+                inherit.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+                VkCommandBufferInheritanceInfo ii{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO, &inherit };
+                VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+                bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT | VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT;
+                bi.pInheritanceInfo = &ii;
+                auto take = [] {
+                    Submission& sub = s_submissions[s_slot];
+                    if (sub.secondaryUsed == sub.secondaries.size())
+                    {
+                        VkCommandBufferAllocateInfo cbai{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+                        cbai.commandPool = s_commandPool;
+                        cbai.level = VK_COMMAND_BUFFER_LEVEL_SECONDARY;
+                        cbai.commandBufferCount = 1;
+                        VkCommandBuffer cb;
+                        Check(vkAllocateCommandBuffers(s_dev, &cbai, &cb), "vkAllocateCommandBuffers (secondary)");
+                        sub.secondaries.push_back(cb);
+                    }
+                    return sub.secondaries[sub.secondaryUsed++];
+                };
+                s_preCmd = take();
+                const VkCommandBuffer pass = take();
+                Check(vkBeginCommandBuffer(s_preCmd, &bi), "vkBeginCommandBuffer (pre-pass)");
+                Check(vkBeginCommandBuffer(pass, &bi), "vkBeginCommandBuffer (pass)");
+                s_primaryCmd = s_cmd;
+                s_cmd = pass;
+                s_passSecondary = true;
+                s_stateEpoch++;
+                s_preEpoch++;
+                s_prepassCounts.passes++;
+            }
+            else
+                s_vk->cmdBeginRendering(s_cmd, &ri);
             s_passActive = true;
             s_stats.passes++;
             s_hle.passes += s_hleCounting;
@@ -3081,7 +3179,7 @@ shaderPreamble;
                             ca.colorAttachment = i;
                 }
                 VkClearRect cr{ pc.rect, 0, 1 };
-                vkCmdClearAttachments(s_cmd, 1, &ca, 1, &cr);
+                vkCmdClearAttachments(secondary ? s_preCmd : s_cmd, 1, &ca, 1, &cr);  // (before a pre-pass)
             }
         }
 
@@ -3277,13 +3375,19 @@ shaderPreamble;
             for (int i = 0; i < 4; i++)
                 if (key.colorFormats[i] != 0)
                     outputs |= 1u << i;
-            uint32_t psRegs = std::min(16u, ps.info.registerCount);
-            uint32_t inputs = vs.info.interpolatorMask & ((1u << psRegs) - 1);
-            VkShaderModule psModule = PixelVariant(ps, outputs, inputs, (key.raster >> 5) & 1);
-            if (!psModule)
-                return VK_NULL_HANDLE;
-            stages[1] = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT,
-                psModule, "main", nullptr };
+            // Raster bit 7: an NFSMW_PREPASS pipeline, depth only (no fragment
+            // stage, no colour writes).
+            const bool prepass = (key.raster >> 7) & 1;
+            if (!prepass)
+            {
+                uint32_t psRegs = std::min(16u, ps.info.registerCount);
+                uint32_t inputs = vs.info.interpolatorMask & ((1u << psRegs) - 1);
+                VkShaderModule psModule = PixelVariant(ps, outputs, inputs, (key.raster >> 5) & 1);
+                if (!psModule)
+                    return VK_NULL_HANDLE;
+                stages[1] = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT,
+                    psModule, "main", nullptr };
+            }
 
             VkPipelineVertexInputStateCreateInfo vi{ VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
             VkPipelineInputAssemblyStateCreateInfo ia{ VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
@@ -3379,7 +3483,7 @@ shaderPreamble;
 
             VkGraphicsPipelineCreateInfo gpci{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
             gpci.pNext = &rci;
-            gpci.stageCount = 2;
+            gpci.stageCount = prepass ? 1 : 2;
             gpci.pStages = stages;
             gpci.pVertexInputState = &vi;
             gpci.pInputAssemblyState = &ia;
@@ -3629,6 +3733,31 @@ shaderPreamble;
 
         // The pipeline for `key`; VK_NULL_HANDLE with `pending` set while a
         // worker still compiles it (the caller skips the draw).
+        Shader* DepthOnlyPixelShader();
+        // NFSMW_PREPASS: a pre-pass pipeline (`key` with raster bit 7), or
+        // none while it compiles (the draw then isn't in the pre-pass).
+        // Never waits; not kept in the key list.
+        VkPipeline PrepassPipeline(const PipelineKey& key, VkPipelineLayout layout)
+        {
+            if (auto it = s_pipelines.find(key); it != s_pipelines.end())
+                return it->second.pipeline;
+            auto p = s_pendingPipelines.find(key);
+            if (p == s_pendingPipelines.end())
+            {
+                QueuePipeline(key, layout, s_shaders[key.vs].get(), DepthOnlyPixelShader(), false);
+                return VK_NULL_HANDLE;
+            }
+            std::shared_ptr<PendingPipeline> job = p->second;
+            {
+                std::lock_guard lock(job->mutex);
+                if (!job->done)
+                    return VK_NULL_HANDLE;
+            }
+            s_pipelines[key] = { job->pipeline, false };
+            s_pendingPipelines.erase(key);
+            return job->pipeline;
+        }
+
         VkPipeline GetPipeline(const PipelineKey& key, VkPipelineLayout layout, bool& pending)
         {
             pending = false;
@@ -11922,6 +12051,31 @@ void main()
             memcpy(bound.bias, bias, sizeof(bias));
             bound.unormBias = unormBias;
         }
+        // NFSMW_PREPASS (see s_prepassOn): this draw in the pre-pass too?
+        VkPipeline prePipeline = VK_NULL_HANDLE;
+        if (s_passSecondary && !(s_exp & 1))
+        {
+            s_prepassCounts.draws++;
+            const gpu::draw_state::DepthStencil t = gpu::draw_state::FromDepthControl(depthState);
+            bool blends = false;
+            for (int i = 0; i < 4; i++)
+                blends = blends || (color[i] && ((writeMask >> (4 * i)) & 0xF) && key.blend[i] != ~0u);
+            if (depth && !adoptedDepth && t.depthTest && t.depthWrite && t.depthCompareOp == VK_COMPARE_OP_LESS_OR_EQUAL && !t.stencilTest &&
+                !blends && !(rasterState & 32u) && s_ps && !s_ps->info.usesKill && !s_ps->info.writesDepth && !barPlan.rectCount && !zpdCount)
+            {
+                PipelineKey pk = key;
+                pk.ps = DepthOnlyPixelShader()->hash;
+                for (uint32_t& b : pk.blend)
+                    b = ~0u;
+                pk.colorMask = 0;
+                pk.raster = (key.raster & ~32u) | 128u;
+                prePipeline = PrepassPipeline(pk, layout.pipeline);
+                if (prePipeline)
+                    s_prepassCounts.prepassed++;
+                else
+                    s_prepassCounts.waiting++;
+            }
+        }
 #ifdef VK_EXT_extended_dynamic_state
         // CP_OPT_DYNAMIC_STATE: what the pipeline key left out (above), as
         // BuildPipeline would bake it (gpu/draw_state.h; no depth target, or
@@ -11931,7 +12085,13 @@ void main()
         if (s_dynamicState)
         {
             const uint32_t cullMode = rasterState & 3u, frontFace = (rasterState >> 2) & 1u;
-            const gpu::draw_state::DepthStencil tests = gpu::draw_state::FromDepthControl(depthState);
+            gpu::draw_state::DepthStencil tests = gpu::draw_state::FromDepthControl(depthState);
+            if (prePipeline)
+            {
+                // (The pre-pass wrote its depth: what passes is what ends up there.)
+                tests.depthCompareOp = VK_COMPARE_OP_EQUAL;
+                tests.depthWrite = 0;
+            }
             if (fresh || bound.cullMode != cullMode)
                 s_vk->cmdSetCullMode(s_cmd, VkCullModeFlags(cullMode));
             if (fresh || bound.frontFace != frontFace)
@@ -12047,6 +12207,141 @@ void main()
 
         if (s_exp & 1)
             return;
+        bool skipPassDraw = false;  // NFSMW_PREPASS: a depth-only draw the pre-pass took whole
+        if (prePipeline)
+        {
+            // NFSMW_PREPASS: the same draw into the pre-pass buffer, its own
+            // bound state (the pass buffer's above), depth LESS_OR_EQUAL with
+            // writes, no stencil test.
+            struct PreBound
+            {
+                uint64_t epoch = 0;
+                VkPipeline pipeline = VK_NULL_HANDLE;
+                VkViewport viewport{};
+                VkRect2D scissor{};
+                float bias[3] = {};
+                bool unormBias = false;
+                uint32_t cullMode = ~0u, frontFace = ~0u;
+                uint32_t setOffset = ~0u;
+                int32_t indexType = -1;
+                VkPipelineLayout textureLayout = VK_NULL_HANDLE;
+                uint64_t textureSerial = 0;
+                DrawConstants pc{};
+            };
+            static PreBound pre;
+            const VkCommandBuffer cmd = s_preCmd;
+            const bool first = pre.epoch != s_preEpoch;
+            if (first)
+            {
+                pre = PreBound{};
+                pre.epoch = s_preEpoch;
+                s_vk->cmdSetDepthTestEnable(cmd, VK_TRUE);
+                s_vk->cmdSetDepthWriteEnable(cmd, VK_TRUE);
+                s_vk->cmdSetDepthCompareOp(cmd, VK_COMPARE_OP_LESS_OR_EQUAL);
+                s_vk->cmdSetStencilTestEnable(cmd, VK_FALSE);
+                const float none[4] = {};
+                vkCmdSetBlendConstants(cmd, none);  // (dynamic in every pipeline: set before a draw)
+                vkCmdSetStencilCompareMask(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, 0);
+                vkCmdSetStencilWriteMask(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, 0);
+                vkCmdSetStencilReference(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, 0);
+                s_vk->cmdSetStencilOp(cmd, VK_STENCIL_FACE_FRONT_AND_BACK, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP,
+                    VK_COMPARE_OP_ALWAYS);
+            }
+            if (first || pre.pipeline != prePipeline)
+            {
+                vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, prePipeline);
+                pre.pipeline = prePipeline;
+            }
+            if (first || memcmp(&pre.viewport, &viewport, sizeof(viewport)) != 0)
+            {
+                vkCmdSetViewport(cmd, 0, 1, &viewport);
+                pre.viewport = viewport;
+            }
+            if (first || memcmp(&pre.scissor, &scissor, sizeof(scissor)) != 0)
+            {
+                vkCmdSetScissor(cmd, 0, 1, &scissor);
+                pre.scissor = scissor;
+            }
+            if (first || memcmp(pre.bias, bias, sizeof(bias)) != 0 || pre.unormBias != unormBias)
+            {
+#ifdef VK_EXT_depth_bias_control
+                if (unormBias)
+                {
+                    VkDepthBiasRepresentationInfoEXT representation{ VK_STRUCTURE_TYPE_DEPTH_BIAS_REPRESENTATION_INFO_EXT };
+                    representation.depthBiasRepresentation = VK_DEPTH_BIAS_REPRESENTATION_LEAST_REPRESENTABLE_VALUE_FORCE_UNORM_EXT;
+                    representation.depthBiasExact = s_vk->depthBiasExact ? VK_TRUE : VK_FALSE;
+                    VkDepthBiasInfoEXT info{ VK_STRUCTURE_TYPE_DEPTH_BIAS_INFO_EXT, &representation };
+                    info.depthBiasConstantFactor = bias[0];
+                    info.depthBiasClamp = bias[1];
+                    info.depthBiasSlopeFactor = bias[2];
+                    s_vk->cmdSetDepthBias2(cmd, &info);
+                }
+                else
+#endif
+                    vkCmdSetDepthBias(cmd, bias[0], bias[1], bias[2]);
+                memcpy(pre.bias, bias, sizeof(bias));
+                pre.unormBias = unormBias;
+            }
+            const uint32_t cullMode = rasterState & 3u, frontFace = (rasterState >> 2) & 1u;
+            if (first || pre.cullMode != cullMode)
+                s_vk->cmdSetCullMode(cmd, VkCullModeFlags(cullMode));
+            if (first || pre.frontFace != frontFace)
+                s_vk->cmdSetFrontFace(cmd, frontFace ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE);
+            pre.cullMode = cullMode;
+            pre.frontFace = frontFace;
+            if (first || pre.setOffset != dynamicOffset)
+            {
+                vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout.pipeline, 0, 1, &s_set0, 1, &dynamicOffset);
+                pre.setOffset = dynamicOffset;
+            }
+            // The textures only where the vertex shader fetches some.
+            if (textureCount && s_vs && (s_vs->info.texture2DMask | s_vs->info.texture3DMask | s_vs->info.textureCubeMask) &&
+                (first || pre.textureLayout != layout.pipeline || pre.textureSerial != textureCache.infosSerial))
+            {
+                VkWriteDescriptorSet writes[96];
+                for (uint32_t i = 0; i < textureCount; i++)
+                {
+                    writes[i] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
+                    writes[i].dstBinding = layout.bindings[i];
+                    writes[i].descriptorCount = 1;
+                    writes[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                    writes[i].pImageInfo = &textureInfos[i];
+                }
+                s_pushDescriptorSet(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layout.pipeline, 1, textureCount, writes);
+                pre.textureLayout = layout.pipeline;
+                pre.textureSerial = textureCache.infosSerial;
+            }
+            {
+                uint32_t lo = 0, hi = sizeof(pc);
+                if (first || gpu::draw_state::ChangedRows(&pre.pc, &pc, sizeof(pc), lo, hi))
+                {
+                    if (first)
+                        lo = 0, hi = sizeof(pc);
+                    vkCmdPushConstants(cmd, layout.pipeline, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, lo, hi - lo,
+                        reinterpret_cast<const uint8_t*>(&pc) + lo);
+                    pre.pc = pc;
+                }
+            }
+            if (useIndices)
+            {
+                const VkIndexType indexType = indices16 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
+                if (first || pre.indexType != int32_t(indexType))
+                {
+                    vkCmdBindIndexBuffer(cmd, s_ring, 0, indexType);
+                    pre.indexType = int32_t(indexType);
+                }
+                vkCmdDrawIndexed(cmd, vertexCount, 1, uint32_t(indexOffset >> (indices16 ? 1 : 2)), 0, 0);
+            }
+            else
+                vkCmdDraw(cmd, vertexCount, 1, 0, 0);
+            // A depth-only draw: the pre-pass did all it does (no colour, no
+            // stencil, no occlusion count); the pass needn't draw it again.
+            if (!writeMask)
+            {
+                s_prepassCounts.depthOnly++;
+                skipPassDraw = true;
+            }
+        }
         if (zpdCount)
         {
             // Weighted by the guest's samples per pixel (its MSAA; the host
@@ -12093,13 +12388,15 @@ void main()
             }
             if (s_exp & 32)
                 vertexCount = 0;
-            vkCmdDrawIndexed(s_cmd, vertexCount, 1, firstIndex, 0, 0);
+            if (!skipPassDraw)
+                vkCmdDrawIndexed(s_cmd, vertexCount, 1, firstIndex, 0, 0);
         }
         else
         {
             if (s_exp & 32)
                 vertexCount = 0;
-            vkCmdDraw(s_cmd, vertexCount, 1, 0, 0);
+            if (!skipPassDraw)
+                vkCmdDraw(s_cmd, vertexCount, 1, 0, 0);
         }
         // Edge bars (above): the same draw again per rectangle, with the
         // stretched posScale and the rectangle as its scissor (inside this
@@ -12730,6 +13027,15 @@ void main()
         // NFSMW_PASS_BARRIER: per frame of the window ending here, with the
         // level it ran at, before its [perf] line. Vertex barriers cost a
         // pass's overlap (a split: a pass too).
+        if (s_prepassOn && frame % 120 == 0)
+        {
+            static PrepassCounts last{};
+            const PrepassCounts& c = s_prepassCounts;
+            fprintf(stderr, "[prepass] per frame: %.1f passes, %.0f of their %.0f draws in a pre-pass (%.0f of them only there: depth only), "
+                "%.0f waiting for its pipeline\n", double(c.passes - last.passes) / 120, double(c.prepassed - last.prepassed) / 120,
+                double(c.draws - last.draws) / 120, double(c.depthOnly - last.depthOnly) / 120, double(c.waiting - last.waiting) / 120);
+            last = c;
+        }
         if (frame % 120 == 0 && std::getenv("NFSMW_CLEAR_STATS"))
         {
             static ClearCounts last{};
