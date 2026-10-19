@@ -2802,8 +2802,9 @@ void main()
         features.dualSrcBlend = supported.dualSrcBlend;
         features.depthClamp = supported.depthClamp;
         features.samplerAnisotropy = supported.samplerAnisotropy;
-        static const bool passStats = [] { const char* v = std::getenv("NFSMW_PASS_STATS"); return v && v[0] == '1'; }();
+        static const bool passStats = [] { const char* v = std::getenv("NFSMW_PASS_STATS"); return v && (v[0] == '1' || v[0] == '2'); }();
         features.pipelineStatisticsQuery = passStats && supported.pipelineStatisticsQuery;
+        features.occlusionQueryPrecise = passStats && supported.occlusionQueryPrecise;  // (NFSMW_PASS_STATS=2's samples)
         features.textureCompressionBC = supported.textureCompressionBC;
         features.shaderInt16 = supported.shaderInt16;
         VkPhysicalDeviceDynamicRenderingFeaturesKHR dynamicRendering{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR };
@@ -2836,7 +2837,7 @@ void main()
             }
             hostQueryReset.pNext = nullptr;
             hostQueryReset.hostQueryReset = occlusionCounting && hostQueryReset.hostQueryReset;
-            features.occlusionQueryPrecise = occlusionCounting ? VK_TRUE : VK_FALSE;
+            features.occlusionQueryPrecise = occlusionCounting || features.occlusionQueryPrecise ? VK_TRUE : VK_FALSE;
             if (occlusionCounting)
                 fprintf(stderr, "[video] occlusion queries counted on the GPU (NFSMW_OCCLUSION=0 turns it off; host query reset: %s)\n",
                     hostQueryReset.hostQueryReset ? "yes" : "no, reset in command buffers");

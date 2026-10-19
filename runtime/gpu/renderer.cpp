@@ -751,12 +751,27 @@ namespace gpu::renderer
         // it (PassBreak), whether that pass had the same targets (a break
         // that only the reason forced), and for a submit its site (s_submitWhy).
         struct PassInfo { std::string desc; uint32_t draws = 0; uint32_t slot, query; uint32_t resolves = 0, uploads = 0, submits = 0; uint64_t shadowKB = 0;
-            uint8_t why = 0, same = 0, submitWhy = 0; bool stats = false; uint64_t areaPx = 0; };
+            uint8_t why = 0, same = 0, submitWhy = 0; bool stats = false; uint64_t areaPx = 0;
+            // NFSMW_PASS_STATS: its draws a depth pre-pass could take
+            // (PrepassReason), and the others by why not.
+            uint32_t prepass[8] = {}; };
+        // Why a draw couldn't be in a depth pre-pass of its pass (0: it could:
+        // it tests and writes depth with LESS_OR_EQUAL, no stencil test, no
+        // blending into what it writes, no alpha test, kill or depth export).
+        enum PrepassReason : uint8_t { kPrepassOk, kPrepassNoDepth, kPrepassNoWrite, kPrepassFunc, kPrepassStencil, kPrepassBlend,
+            kPrepassDiscard, kPrepassOther };
+        constexpr const char* kPrepassReasonNames[] = { "ok", "no depth", "no depth write", "depth func", "stencil", "blend",
+            "alpha test/kill/depth out", "other" };
         // NFSMW_PASS_STATS=1 (with NFSMW_PASS_PROFILE): each pass's vertex and
         // fragment shader invocations (a pipeline statistics query, its index
         // the pass's first timestamp's / 2), and its fragments per pixel of
         // its area: how much of the frame is shaded more than once.
         VkQueryPool s_passStats = VK_NULL_HANDLE;
+        // NFSMW_PASS_STATS=2, with the game's occlusion queries off
+        // (NFSMW_OCCLUSION=0; one occlusion query at a time): also each
+        // pass's samples that passed the depth and stencil tests (a precise
+        // occlusion query), so fragments shaded per sample that was kept.
+        VkQueryPool s_passSamples = VK_NULL_HANDLE;
         struct GapCounters { uint64_t resolves = 0, uploads = 0, submits = 0, shadowBytes = 0; } s_gapLast;
         std::vector<PassInfo> s_passInfos;
         bool s_profiling = false;
@@ -2744,7 +2759,11 @@ shaderPreamble;
             ZpdEndSegment();  // a segment never outlives its pass
             s_vk->cmdEndRendering(s_cmd);
             if (s_profiling && s_passEndPending && s_passStats && s_passInfos.back().stats)
+            {
                 vkCmdEndQuery(s_cmd, s_passStats, s_passInfos.back().query / 2);
+                if (s_passSamples)
+                    vkCmdEndQuery(s_cmd, s_passSamples, s_passInfos.back().query / 2);
+            }
             s_passActive = false;
             s_passBreak = why;
             std::copy(s_passColor, s_passColor + 4, s_lastPassTargets);
@@ -3029,6 +3048,11 @@ shaderPreamble;
                 {
                     vkCmdResetQueryPool(s_cmd, s_passStats, pi.query / 2, 1);
                     vkCmdBeginQuery(s_cmd, s_passStats, pi.query / 2, 0);
+                    if (s_passSamples)
+                    {
+                        vkCmdResetQueryPool(s_cmd, s_passSamples, pi.query / 2, 1);
+                        vkCmdBeginQuery(s_cmd, s_passSamples, pi.query / 2, VK_QUERY_CONTROL_PRECISE_BIT);
+                    }
                     pi.stats = true;
                     pi.areaPx = uint64_t(s_passArea.extent.width) * s_passArea.extent.height;
                 }
@@ -9966,6 +9990,14 @@ void main()
                         VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT;
                     if (vkCreateQueryPool(s_dev, &sci, nullptr, &s_passStats) != VK_SUCCESS)
                         s_passStats = VK_NULL_HANDLE;
+                    const char* v = std::getenv("NFSMW_PASS_STATS");
+                    if (v && v[0] == '2' && !s_vk->occlusionCounting)
+                    {
+                        sci.queryType = VK_QUERY_TYPE_OCCLUSION;
+                        sci.pipelineStatistics = 0;
+                        if (vkCreateQueryPool(s_dev, &sci, nullptr, &s_passSamples) != VK_SUCCESS)
+                            s_passSamples = VK_NULL_HANDLE;
+                    }
                     fprintf(stderr, "[renderer] NFSMW_PASS_STATS: shader invocations per pass in the profile%s\n",
                         s_passStats ? "" : " unavailable (no query pool)");
                 }
@@ -11932,6 +11964,21 @@ void main()
         }
 #endif
 
+        if (s_profiling && s_passStats && s_passActive && !s_passInfos.empty())
+        {
+            const gpu::draw_state::DepthStencil t = gpu::draw_state::FromDepthControl(depthState);
+            bool blends = false;
+            for (int i = 0; i < 4; i++)
+                blends = blends || (color[i] && ((writeMask >> (4 * i)) & 0xF) && key.blend[i] != ~0u);
+            PrepassReason why = !depth || adoptedDepth ? kPrepassNoDepth
+                : !t.depthTest || !t.depthWrite ? kPrepassNoWrite
+                : t.depthCompareOp != VK_COMPARE_OP_LESS_OR_EQUAL ? kPrepassFunc
+                : t.stencilTest ? kPrepassStencil
+                : blends ? kPrepassBlend
+                : (rasterState & 32u) || (s_ps && (s_ps->info.usesKill || s_ps->info.writesDepth)) ? kPrepassDiscard
+                : barPlan.rectCount || zpdCount ? kPrepassOther : kPrepassOk;
+            s_passInfos.back().prepass[why]++;
+        }
         uint32_t dynamicOffset = uint32_t(constantsOffset);
         if (fresh || bound.setOffset != dynamicOffset)
         {
@@ -12859,6 +12906,15 @@ void main()
                 if (vkGetQueryPoolResults(s_dev, s_passStats, pi.query / 2, 1, sizeof(st), st, sizeof(st), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
                     stats = std::format("  | VS {:.0f}k, FS {:.2f} Mpx = {:.2f} a pixel", double(st[0]) / 1e3, double(st[1]) / 1e6,
                         pi.areaPx ? double(st[1]) / double(pi.areaPx) : 0.0);
+                uint64_t kept = 0;
+                if (s_passSamples &&
+                    vkGetQueryPoolResults(s_dev, s_passSamples, pi.query / 2, 1, sizeof(kept), &kept, sizeof(kept), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
+                    stats += std::format(", samples kept {:.2f} M = {:.2f} a pixel", double(kept) / 1e6,
+                        pi.areaPx ? double(kept) / double(pi.areaPx) : 0.0);
+                stats += " | pre-pass:";
+                for (int r = 0; r < 8; r++)
+                    if (pi.prepass[r])
+                        stats += std::format(" {} {}", kPrepassReasonNames[r], pi.prepass[r]);
             }
             fprintf(stderr, "[profile] %8.1f us  %4u draws  (+%7.1f us before: %u resolves, %u uploads, %u submits, %llu KB synced)  %s%s%s\n",
                 us, pi.draws, gap, pi.resolves, pi.uploads, pi.submits, (unsigned long long)pi.shadowKB, pi.desc.c_str(), why.c_str(),
