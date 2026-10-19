@@ -4472,7 +4472,7 @@ void main()
             // resolve storing into it. The cache evicts the oldest
             // (TrimTextureCache), never one used since the last swap.
             uint64_t lastUsed = 0;
-            // NFSMW_RESOLVE_RENAME (off by default): sampled from this image
+            // NFSMW_RESOLVE_RENAME: sampled from this image
             // instead of its own (a depth target's, which a resolve handed it
             // whole: renamedFormat, its depth aspect), whose texels are stale
             // meanwhile (MaterializeRename).
@@ -6617,7 +6617,8 @@ void main()
             return v ? std::clamp(std::atoi(v), 0, 2) : kResolveDeferDefault;
         }();
         const bool s_resolveDeferColor = s_resolveDeferColorMode == 1;
-        // NFSMW_RESOLVE_LAZY=1 (off by default): more resolves into cached
+        // NFSMW_RESOLVE_LAZY=1 (by default on x86-64 Linux, as
+        // NFSMW_RESOLVE_DEFER; 0 turns it off): more resolves into cached
         // textures store the texture only, their guest bytes written back
         // from it when something reads them, as NFSMW_RESOLVE_DEFER_COLOR's,
         // where the CPU hasn't locked that texture lately (gpu/cpu_locks.h:
@@ -6637,10 +6638,11 @@ void main()
         // stored as before, then compared with what the write-back writes.
         const int s_hleLazyMode = [] {
             const char* v = std::getenv("NFSMW_RESOLVE_LAZY");
-            return v ? std::clamp(std::atoi(v), 0, 2) : 0;
+            return v ? std::clamp(std::atoi(v), 0, 2) : kResolveDeferDefault;
         }();
         const bool s_hleLazy = s_hleLazyMode == 1;
-        // NFSMW_RESOLVE_RENAME=1 (with NFSMW_RESOLVE_DEFER, off by default): a
+        // NFSMW_RESOLVE_RENAME=1 (with NFSMW_RESOLVE_DEFER; by default on x86-64
+        // Linux, 0 turns it off): a
         // depth resolve of a whole target with its clear, into a cached
         // texture exactly the target's size (shadow map 2), renames the
         // target's image instead of copying it: NFSMW_RESOLVE_DEFER already
@@ -6653,7 +6655,7 @@ void main()
         // not rounded to 24 bits as the store rounds it. Its views change
         // each frame: the cached lookups of that texture alone are made
         // again (ForgetTextureLookups).
-        const bool s_hleRename = [] { const char* v = std::getenv("NFSMW_RESOLVE_RENAME"); return v && v[0] == '1'; }();
+        const bool s_hleRename = [] { const char* v = std::getenv("NFSMW_RESOLVE_RENAME"); return v ? v[0] == '1' : kResolveDeferDefault == 1; }();
         // A depth image going back to the spares (its deferred resolve
         // written, replaced or out of room): a texture renamed to it gets its
         // own texels first, else the next defer to take that spare as its
@@ -6988,7 +6990,9 @@ void main()
                     ++it;
         }
 
-        // NFSMW_RESOLVE_PRESENT=1 (off by default): the resolve into the front
+        // NFSMW_RESOLVE_PRESENT=1 (by default on x86-64 Linux, 0 turns it off;
+        // Steam Deck at 5 W, the three together: -1.4 ms GPU a frame, +6% fps,
+        // the same pictures): the resolve into the front
         // buffer, a whole 1x one of 32-bit texels into a front buffer a swap
         // presented lately, also stores the picture into the presenter's
         // front image, as the swap's conversion would from those guest bytes
@@ -7000,7 +7004,7 @@ void main()
         // for the presenter a moment before the swap would. A front buffer
         // written again before the swap (a resolve, the CPU), or presented
         // in another format, takes the conversion as before.
-        const bool s_hlePresent = [] { const char* v = std::getenv("NFSMW_RESOLVE_PRESENT"); return v && v[0] == '1'; }();
+        const bool s_hlePresent = [] { const char* v = std::getenv("NFSMW_RESOLVE_PRESENT"); return v ? v[0] == '1' : kResolveDeferDefault == 1; }();
         struct FrontSeen { uint32_t base = 0, pitch = 0, width = 0, height = 0, endian = 0, format = 0, swizzle = 0; uint64_t frame = 0; };
         FrontSeen s_frontSeen[4];  // the last front buffers presented (tiled, 1x), by base
         // (And what it was stored as: a front buffer written since, by a
