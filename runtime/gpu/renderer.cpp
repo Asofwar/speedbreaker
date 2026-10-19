@@ -292,7 +292,10 @@ namespace gpu::renderer
         // the GPU finished with it.
         constexpr uint32_t kSlots = 12;
         constexpr VkDeviceSize kSlotSize = 16ull << 20;
-        constexpr VkDeviceSize kRingSize = kSlots * kSlotSize;
+        // After the slots: the region vertex snapshots stay in across draws
+        // (CP_OPT_SNAPSHOT_CACHE, see SnapshotEntry).
+        constexpr VkDeviceSize kSnapshotCacheSize = 32ull << 20;
+        constexpr VkDeviceSize kRingSize = kSlots * kSlotSize + kSnapshotCacheSize;
         VkBuffer s_ring = VK_NULL_HANDLE;
         VkDeviceMemory s_ringMemory = VK_NULL_HANDLE;
         uint8_t* s_ringHost = nullptr;
@@ -760,6 +763,7 @@ namespace gpu::renderer
         Submission s_submissions[kSlots];
         uint32_t s_slot = 0;
         uint64_t s_submissionCounter = 1;       // bumps on every submit
+        std::atomic<uint64_t> s_completedSubmission{ 0 };  // the last one the GPU finished (CachedSnapshot)
         VkDeviceSize s_lastConstantsOffset = 0;
         uint64_t s_lastConstantsSubmission = 0; // submission holding s_lastConstantsOffset
         const void* s_lastConstLayoutVs = nullptr;  // the layout of that upload (see Draw)
@@ -1264,6 +1268,7 @@ namespace gpu::renderer
                     }
                     sub.events.clear();
                     writewatch::SetCompleted(sub.number);
+                    s_completedSubmission.store(sub.number, std::memory_order_release);
                     s_inFlight.pop_front();
                     timeline::Mark(timeline::Complete, slot);
                     if (s_inFlight.empty())
@@ -1614,6 +1619,260 @@ namespace gpu::renderer
             }
             s_ringOffset = offset + size;
             return VkDeviceSize(s_slot) * kSlotSize + offset;
+        }
+
+        // CP_OPT_SNAPSHOT_CACHE (off by default, see renderer.h): vertex
+        // snapshots kept across draws. In a race on the Steam Deck ~97% of
+        // the snapshots equal the range's last one: 10-16 MB a frame copied
+        // into the ring and read back by the GPU. A range's copy (the fetch
+        // constant's base and size) goes into the region after the slots,
+        // with a host copy of it (s_cacheMirror), and every later draw
+        // reading inside the span copied uses it while the guest's bytes
+        // still equal the host copy. (The write watch can't tell: the
+        // game's vertex pages aren't protected, and watching them faulted
+        // ~550 pages a frame, dynamic buffers mostly; a sequence read before
+        // the watch misses a store between the two.) The region is written
+        // round; an entry in the way of a new copy is dropped once the last
+        // submission that read it completed (s_completedSubmission), and
+        // while one is still in flight the draw copies into its slot as
+        // before (Stats::snapshotFallbacks). A range written after it was
+        // cached isn't cached again for kCacheBurnFrames. Command processor
+        // only. Measured at 5 W: the compares cost more than the copies
+        // (command processor +2.4 ms a frame) and the GPU reads the
+        // scattered copies slower (+0.8 ms a frame), with the pictures the
+        // same: kept for the record, off.
+        struct SnapshotEntry
+        {
+            uint32_t base, size;     // the range (the key)
+            uint32_t start, length;  // the span copied, bytes from base
+            VkDeviceSize offset;     // in the ring buffer
+            uint64_t sequence;       // the span's write sequence when copied
+            uint64_t lastUse;        // the submission of the last draw reading it
+            bool valid;              // false: this draw's copy only (a page was written as it was made)
+        };
+        // CP_OPT_INDEX_CACHE: a draw's converted indices (ConvertIndices)
+        // kept the same way, with the vertex range they span, by the index
+        // buffer's address and the conversion.
+        struct IndexEntry
+        {
+            uint32_t base, bytes;    // the guest bytes converted
+            uint32_t how;            // the conversion's bits (CachedIndices)
+            VkDeviceSize offset;
+            uint64_t sequence, lastUse;
+            vsnap::IndexRange vertices;
+            bool valid;
+        };
+        std::unordered_map<uint64_t, SnapshotEntry> s_snapshotCache;
+        std::unordered_map<uint64_t, IndexEntry> s_indexCache;
+        // The region's bytes in use, by offset: an entry's (its kind and key),
+        // or a replaced entry's, kept until the last submission reading it
+        // completed (dead: no key).
+        struct CachedSpace { bool index, dead; uint64_t key, lastUse; };
+        std::map<VkDeviceSize, CachedSpace> s_snapshotByOffset;
+        VkDeviceSize s_snapshotCursor = 0;  // the region's next byte to write
+        // Host copies of the region's bytes (cached memory): a hit compares
+        // the guest's bytes with them, since the write watch misses stores
+        // to pages it doesn't protect (and a store between the sequence
+        // read and the watch). s_cacheRaw: for indices, the guest bytes
+        // converted (the region holds the conversion).
+        std::vector<uint8_t> s_cacheMirror, s_cacheRaw;
+        uint8_t* CacheMirror(VkDeviceSize offset) { return s_cacheMirror.data() + (offset - VkDeviceSize(kSlots) * kSlotSize); }
+        uint8_t* CacheRaw(VkDeviceSize offset) { return s_cacheRaw.data() + (offset - VkDeviceSize(kSlots) * kSlotSize); }
+        // Ranges written after they were cached, by the frame it was seen:
+        // a range written again within kCacheBurnFrames isn't cached (its
+        // draws copy into the slot as before): dynamic vertex data (particles,
+        // the front end) faulted ~550 pages a frame when every range was watched.
+        std::unordered_map<uint64_t, uint64_t> s_snapshotBurned, s_indexBurned;
+        constexpr uint64_t kCacheBurnFrames = 120;
+        uint64_t s_cacheFrame = 0;  // s_frame (set with it: declared later)
+        bool Burned(std::unordered_map<uint64_t, uint64_t>& burned, uint64_t key)
+        {
+            auto it = burned.find(key);
+            if (it == burned.end())
+                return false;
+            if (s_cacheFrame - it->second < kCacheBurnFrames)
+                return true;
+            burned.erase(it);
+            return false;
+        }
+        constexpr uint64_t SnapshotKey(uint32_t base, uint32_t size) { return uint64_t(base) << 32 | size; }
+        // NFSMW_SNAPSHOT_VERIFY=1: every hit's bytes are compared with the
+        // guest's now (reading the ring back, slowly); a mismatch is logged
+        // and the entry dropped.
+        const bool s_snapshotVerify = [] { const char* v = std::getenv("NFSMW_SNAPSHOT_VERIFY"); return v && v[0] == '1'; }();
+        // NFSMW_SNAPSHOT_SHADOW=1 (a bisection): the cache is kept as usual,
+        // but every draw copies into its slot as before and the GPU reads that.
+        const bool s_snapshotShadow = [] { const char* v = std::getenv("NFSMW_SNAPSHOT_SHADOW"); return v && v[0] == '1'; }();
+        uint64_t s_snapshotVerified = 0, s_snapshotBad = 0;
+
+        // An entry goes (replaced); its bytes stay reserved until the GPU is done with them.
+        void DropSnapshot(std::unordered_map<uint64_t, SnapshotEntry>::iterator it)
+        {
+            CachedSpace& space = s_snapshotByOffset[it->second.offset];
+            space.dead = true;
+            space.lastUse = it->second.lastUse;
+            s_snapshotCache.erase(it);
+        }
+        void DropIndices(std::unordered_map<uint64_t, IndexEntry>::iterator it)
+        {
+            CachedSpace& space = s_snapshotByOffset[it->second.offset];
+            space.dead = true;
+            space.lastUse = it->second.lastUse;
+            s_indexCache.erase(it);
+        }
+
+        // Room for `length` bytes of the region at `offset`: the entries in
+        // the way go, unless the GPU may still read one (false: use the slot).
+        bool AllocateCached(uint32_t length, VkDeviceSize& offset)
+        {
+            const VkDeviceSize need = (VkDeviceSize(length) + 255) & ~VkDeviceSize(255);
+            if (need > kSnapshotCacheSize)
+                return false;
+            if (s_snapshotCursor + need > kSnapshotCacheSize)
+                s_snapshotCursor = 0;
+            const uint64_t completed = s_completedSubmission.load(std::memory_order_acquire);
+            const VkDeviceSize at = VkDeviceSize(kSlots) * kSlotSize + s_snapshotCursor;  // (the records' keys are ring offsets)
+            for (auto o = s_snapshotByOffset.lower_bound(at); o != s_snapshotByOffset.end() && o->first < at + need;)
+            {
+                CachedSpace& space = o->second;
+                if (!space.dead)
+                {
+                    if (space.index)
+                        space.lastUse = s_indexCache.find(space.key)->second.lastUse;
+                    else
+                        space.lastUse = s_snapshotCache.find(space.key)->second.lastUse;
+                }
+                if (space.lastUse > completed)
+                {
+                    s_stats.snapshotFallbacks++;
+                    return false;
+                }
+                if (!space.dead)
+                {
+                    if (space.index)
+                        s_indexCache.erase(space.key);
+                    else
+                        s_snapshotCache.erase(space.key);
+                }
+                o = s_snapshotByOffset.erase(o);
+            }
+            offset = at;
+            s_snapshotCursor += need;
+            return true;
+        }
+
+        // The cached copy of range [base, base + size) that holds its bytes
+        // [start, start + length), made now if none does; null when the
+        // region has no room the GPU is done with (copy into the slot).
+        const SnapshotEntry* CachedSnapshot(uint32_t base, uint32_t size, uint32_t start, uint32_t length)
+        {
+            const uint64_t key = SnapshotKey(base, size);
+            auto it = s_snapshotCache.find(key);
+            if (it != s_snapshotCache.end())
+            {
+                SnapshotEntry& e = it->second;
+                bool stale = !e.valid || memcmp(CacheMirror(e.offset), s_sharedHost + base + e.start, e.length) != 0;
+                if (!stale && s_snapshotVerify && start >= e.start && start + length <= e.start + e.length)
+                {
+                    s_snapshotVerified++;
+                    if (memcmp(s_ringHost + e.offset + (start - e.start), s_sharedHost + base + start, length) != 0)
+                    {
+                        stale = true;
+                        if (s_snapshotBad++ < 20)
+                            fprintf(stderr, "[snapshot-verify] vertex range %08X+%u span %u+%u: cached at %llu (sequence %llu, now %llu, valid %d) differs from the guest; %llu checked\n",
+                                base, size, start, length, (unsigned long long)e.offset, (unsigned long long)e.sequence,
+                                (unsigned long long)writewatch::WriteSequence(base + e.start, e.length), int(e.valid), (unsigned long long)s_snapshotVerified);
+                    }
+                }
+                if (!stale && start >= e.start && start + length <= e.start + e.length)
+                {
+                    e.lastUse = s_submissionCounter;
+                    s_stats.snapshotHits++;
+                    return &e;
+                }
+                DropSnapshot(it);
+                if (stale)
+                {
+                    s_snapshotBurned[key] = s_cacheFrame;
+                    return nullptr;
+                }
+            }
+            else if (Burned(s_snapshotBurned, key))
+                return nullptr;
+            VkDeviceSize offset;
+            if (!AllocateCached(length, offset))
+                return nullptr;
+            if (s_cacheMirror.empty())
+                s_cacheMirror.resize(size_t(kSnapshotCacheSize));
+            memcpy(CacheMirror(offset), s_sharedHost + base + start, length);
+            memcpy(s_ringHost + offset, CacheMirror(offset), length);
+            s_stats.snapshotBytes += (VkDeviceSize(length) + 255) & ~VkDeviceSize(255);
+            SnapshotEntry& e = s_snapshotCache[key] = SnapshotEntry{ base, size, start, length, offset, 0, s_submissionCounter, true };
+            s_snapshotByOffset[offset] = { false, false, key, s_submissionCounter };
+            return &e;
+        }
+
+        // The converted indices of `count` from `src` as `convert` makes
+        // them (into the region), by their guest bytes and the conversion's
+        // bits (`how`): cached while those bytes stay unwritten. Null when
+        // the region has no room (convert into the slot).
+        template <typename Convert>
+        const IndexEntry* CachedIndices(uint32_t base, uint32_t bytes, uint32_t how, Convert convert)
+        {
+            const uint64_t key = uint64_t(base >> 1) << 35 | uint64_t(how & 31u) << 30 | (bytes & 0x3FFFFFFFu);
+            auto it = s_indexCache.find(key);
+            if (it != s_indexCache.end())
+            {
+                IndexEntry& e = it->second;
+                bool stale = !e.valid || memcmp(CacheRaw(e.offset), s_sharedHost + base, bytes) != 0;
+                if (!stale && s_snapshotVerify && e.base == base && e.bytes == bytes && e.how == how)
+                {
+                    std::vector<uint8_t> fresh(bytes);
+                    const vsnap::IndexRange v = convert(fresh.data());
+                    s_snapshotVerified++;
+                    if (memcmp(s_ringHost + e.offset, fresh.data(), bytes) != 0 || v.lo != e.vertices.lo || v.hi != e.vertices.hi)
+                    {
+                        stale = true;
+                        if (s_snapshotBad++ < 20)
+                            fprintf(stderr, "[snapshot-verify] indices %08X+%u how %u: cached at %llu (sequence %llu, now %llu, valid %d) differ (range %u..%u vs %u..%u); %llu checked\n",
+                                base, bytes, how, (unsigned long long)e.offset, (unsigned long long)e.sequence,
+                                (unsigned long long)writewatch::WriteSequence(base, bytes), int(e.valid), e.vertices.lo, e.vertices.hi, v.lo, v.hi,
+                                (unsigned long long)s_snapshotVerified);
+                    }
+                }
+                if (!stale && e.base == base && e.bytes == bytes && e.how == how)
+                {
+                    e.lastUse = s_submissionCounter;
+                    s_stats.snapshotHits++;
+                    return &e;
+                }
+                DropIndices(it);
+                if (stale)
+                {
+                    s_indexBurned[key] = s_cacheFrame;
+                    return nullptr;
+                }
+            }
+            else if (Burned(s_indexBurned, key))
+                return nullptr;
+            VkDeviceSize offset;
+            if (!AllocateCached(bytes, offset))
+                return nullptr;
+            if (s_cacheRaw.empty())
+            {
+                s_cacheRaw.resize(size_t(kSnapshotCacheSize));
+                s_cacheMirror.resize(size_t(kSnapshotCacheSize));
+            }
+            // The guest bytes first (a store meanwhile shows at the next compare).
+            memcpy(CacheRaw(offset), s_sharedHost + base, bytes);
+            const vsnap::IndexRange vertices = convert(s_ringHost + offset);
+            s_stats.snapshotBytes += (VkDeviceSize(bytes) + 255) & ~VkDeviceSize(255);
+            // The conversion read the guest again: a store between the two reads
+            // makes the raw copy differ from what was converted; compare once.
+            const bool valid = memcmp(CacheRaw(offset), s_sharedHost + base, bytes) == 0;
+            IndexEntry& e = s_indexCache[key] = IndexEntry{ base, bytes, how, offset, 0, s_submissionCounter, vertices, valid };
+            s_snapshotByOffset[offset] = { true, false, key, s_submissionCounter };
+            return &e;
         }
 
         // ---------------------------------------------------------------
@@ -10291,7 +10550,22 @@ void main()
                 indexOffset = (at + (uploadConstants ? kConstantsSize : 0) + 255) & ~VkDeviceSize(255);
                 if (directIndices)
                 {
-                    vertices = ConvertIndices(s_ringHost + indexOffset, src, count, indices16, restart, resetIndex);
+                    const IndexEntry* cached = nullptr;
+                    if (g_cpOpt & CP_OPT_INDEX_CACHE)
+                    {
+                        // (Only a restart index the output's own: the bits below say the rest.)
+                        const uint32_t how = (src.is32 ? 1u : 0u) | (src.endian & 3u) << 1 | (indices16 ? 8u : 0u) | (restart ? 16u : 0u);
+                        if (!restart || resetIndex == (src.is32 ? 0xFFFFFFu : 0xFFFFu))
+                            cached = CachedIndices(src.base & (src.is32 ? 0x1FFFFFFCu : 0x1FFFFFFEu), uint32_t(count) * (src.is32 ? 4 : 2), how,
+                                [&](uint8_t* dst) { return ConvertIndices(dst, src, count, indices16, restart, resetIndex); });
+                    }
+                    if (cached)
+                    {
+                        indexOffset = cached->offset;
+                        vertices = cached->vertices;
+                    }
+                    else
+                        vertices = ConvertIndices(s_ringHost + indexOffset, src, count, indices16, restart, resetIndex);
                     // NFSMW_CP_OPT_VERIFY=1: compare with the plain conversion
                     // (and its range). It reads the ring back, slowly: =spans
                     // checks only the vertex snapshots' spans (below).
@@ -10366,6 +10640,18 @@ void main()
                         memcpy(s_ringHost + snapshot + start, s_sharedHost + copies[i].base + start, size);
                         start = 0;
                         size = copies[i].size;
+                    }
+                    else if (g_cpOpt & CP_OPT_SNAPSHOT_CACHE)
+                    {
+                        const SnapshotEntry* e = CachedSnapshot(copies[i].base, copies[i].size, start, size);
+                        if (e && !s_snapshotShadow)
+                        {
+                            pc.vfRedirect[i][0] = copies[i].base + e->start;
+                            pc.vfRedirect[i][1] = e->length;
+                            pc.vfRedirect[i][2] = uint32_t(e->offset);
+                            continue;
+                        }
+                        memcpy(s_ringHost + snapshot, s_sharedHost + copies[i].base + start, size);
                     }
                     else
                         memcpy(s_ringHost + snapshot, s_sharedHost + copies[i].base + start, size);
@@ -12207,6 +12493,7 @@ void main()
             writewatch::SetWriterFrame(frame);
         }
         s_frame = frame;
+        s_cacheFrame = frame;
         if (s_vk)
             TrimTextureCache();
         // NFSMW_RESOLVE_STATS's window.

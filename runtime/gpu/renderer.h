@@ -98,6 +98,7 @@ namespace gpu::renderer
     struct Stats
     {
         uint64_t draws, skipped, resolves, submits, pipelines, uploads, gpuBusyUs, passes, constantUploads, gpuExecUs, tileSkips, snapshotBytes, shadowWaits, shaderCacheHits, pipelineSkips, lateFrames;
+        uint64_t snapshotHits, snapshotFallbacks;  // CP_OPT_SNAPSHOT_CACHE: ranges served from the cache; copies into the slot for want of room
     };
     Stats GetStats();
     // The scaled data path (internal resolution above 1x), totals so far:
@@ -182,8 +183,19 @@ namespace gpu::renderer
                                      // first changed row
         CP_OPT_TEXTURE_MEMO = 1024,  // a draw's textures are the draw before's, not looked up, while nothing they
                                      // depend on changed (renderer.cpp, TextureDrawMemo; needs CP_OPT_TEXTURE_CACHE)
+        CP_OPT_SNAPSHOT_CACHE = 2048, // vertex snapshots kept across draws while their guest bytes stay unchanged
+                                     // (renderer.cpp, SnapshotEntry). Off by default: measured on a Steam Deck at
+                                     // 5 W (NFSMW_CP_OPT=0xffffefff vs the default, 3 pairs), the compares cost the
+                                     // command processor 2.4 ms a frame more than the copies did and the GPU took
+                                     // 0.8 ms more a frame reading the scattered copies.
+        CP_OPT_INDEX_CACHE = 4096,   // converted indices kept the same way (renderer.cpp, CachedIndices); off, as above
+        CP_OPT_NO_CONSTANT_MIRROR = 8192, // shader constants written in runs skip the guest-visible register
+                                     // mirror (command_processor.cpp, WriteRegistersBulk)
     };
-    inline const uint32_t g_cpOpt = [] { const char* v = std::getenv("NFSMW_CP_OPT"); return v ? uint32_t(strtoul(v, nullptr, 0)) : ~0u; }();
+    inline const uint32_t g_cpOpt = [] {
+        const char* v = std::getenv("NFSMW_CP_OPT");
+        return v ? uint32_t(strtoul(v, nullptr, 0)) : ~0u & ~uint32_t(CP_OPT_SNAPSHOT_CACHE | CP_OPT_INDEX_CACHE);
+    }();
 
     // Command-processor thread time, for the [perf] line: busy in ring
     // batches, i.e. not blocked (WAIT_REG_MEM, the frame throttle, GPU and

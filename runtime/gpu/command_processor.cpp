@@ -353,7 +353,10 @@ namespace gpu
         // shader constants in runs.
         void WriteRegistersBulk(uint32_t base, const uint8_t* src, uint32_t count)
         {
-            memcpy(MmioRegister(base), src, size_t(count) * 4);
+            // CP_OPT_NO_CONSTANT_MIRROR: the guest reads no shader constant
+            // back through the register window (~2.4 MB a frame of copies).
+            if (!(renderer::g_cpOpt & renderer::CP_OPT_NO_CONSTANT_MIRROR) || base < 0x4000 || base + count > 0x4928)
+                memcpy(MmioRegister(base), src, size_t(count) * 4);
             for (uint32_t m = 0; m < count; m++)
             {
                 uint32_t v;
@@ -682,7 +685,7 @@ namespace gpu
                             double(guard.snapFull - lastGuard.snapFull) / 120, double(guard.snapWhole - lastGuard.snapWhole) / 120,
                             double(guard.snapReading - lastGuard.snapReading) / 120, double(guard.snapWaits - lastGuard.snapWaits) / 120,
                             double(guard.snapGaveUp - lastGuard.snapGaveUp) / 120);
-                    fprintf(stderr, "[perf] %.1f fps (worst frame %.1f ms) | CP busy %.1f ms/frame (%.2f us/draw) | per frame: %.0f draws (%.0f skipped as later tiles, %.0f constant uploads), %.1f passes, %.1f resolves, %.1f submits, %.1f uploads, GPU busy %.1f ms (executing %.1f ms%s) | guard: %.1f faults (%.1f opened), %.2f stalls, %.2f ms stalled%s | %.0f KB snapshots | shadow: %.0f KB up, %.0f KB back, %.2f waits"
+                    fprintf(stderr, "[perf] %.1f fps (worst frame %.1f ms) | CP busy %.1f ms/frame (%.2f us/draw) | per frame: %.0f draws (%.0f skipped as later tiles, %.0f constant uploads), %.1f passes, %.1f resolves, %.1f submits, %.1f uploads, GPU busy %.1f ms (executing %.1f ms%s) | guard: %.1f faults (%.1f opened), %.2f stalls, %.2f ms stalled%s | %.0f KB snapshots (%.0f cached, %.0f uncacheable) | shadow: %.0f KB up, %.0f KB back, %.2f waits"
                         " | scaled: %.1f loads, %.0f MB untiled, %.0f MB resolved, %.2f allocations, %.2f evictions, %.2f fallbacks | post-processing GPU %.2f ms (AA %.2f ms)"
                         " | display: %llu dropped, %llu repeated | world: %llu frames, %llu without a step, %llu with 2+ | late %llu"
                         " | memory: %.0f MB (targets %.0f in %u, textures %.0f in %u, scaled %.0f, front %.0f), device %.0f of %.0f MB,"
@@ -698,6 +701,7 @@ namespace gpu
                         clockText.c_str(), double(guard.faults - lastGuard.faults) / 120, double(guard.opened - lastGuard.opened) / 120, double(guard.stalls - lastGuard.stalls) / 120,
                         double(guard.stallUs - lastGuard.stallUs) / 1000.0 / 120, subpagesText.c_str(),
                         double(st.snapshotBytes - last.snapshotBytes) / 1024.0 / 120,
+                        double(st.snapshotHits - last.snapshotHits) / 120, double(st.snapshotFallbacks - last.snapshotFallbacks) / 120,
                         double(guard.uploadBytes - lastGuard.uploadBytes) / 1024.0 / 120, double(guard.readbackBytes - lastGuard.readbackBytes) / 1024.0 / 120,
                         double(st.shadowWaits - last.shadowWaits) / 120, double(scaled.loads - lastScaled.loads) / 120,
                         double(scaled.untiledBytes - lastScaled.untiledBytes) / 1048576.0 / 120,
