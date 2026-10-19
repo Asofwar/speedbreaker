@@ -813,7 +813,11 @@ namespace gpu::renderer
         // keep the last of LESS_OR_EQUAL draws, as before.
         // s_cmd is the pass's buffer while one records (s_preCmd the
         // pre-pass's, s_primaryCmd the submission's).
-        const bool s_prepassOn = [] { const char* v = std::getenv("NFSMW_PREPASS"); return v && v[0] == '1'; }();
+        // NFSMW_PREPASS=2: alpha-tested draws and those with kills too, with
+        // their pixel shader in the pre-pass (a variant writing no colour:
+        // only what decides the discard is left of it).
+        const uint32_t s_prepassLevel = [] { const char* v = std::getenv("NFSMW_PREPASS"); return v ? uint32_t(std::clamp(std::atoi(v), 0, 2)) : 0u; }();
+        const bool s_prepassOn = s_prepassLevel >= 1;
         bool s_passSecondary = false;
         VkCommandBuffer s_primaryCmd = VK_NULL_HANDLE, s_preCmd = VK_NULL_HANDLE;
         uint64_t s_preEpoch = 1;  // the pre-pass buffer's bound state (Draw)
@@ -3377,12 +3381,14 @@ shaderPreamble;
                     outputs |= 1u << i;
             // Raster bit 7: an NFSMW_PREPASS pipeline, depth only (no fragment
             // stage, no colour writes).
-            const bool prepass = (key.raster >> 7) & 1;
-            if (!prepass)
+            // Bit 8 with it: the guest's pixel shader writing no colour (its
+            // discards: alpha test, kills).
+            const bool prepass = (key.raster >> 7) & 1, prepassDiscards = prepass && ((key.raster >> 8) & 1);
+            if (!prepass || prepassDiscards)
             {
                 uint32_t psRegs = std::min(16u, ps.info.registerCount);
                 uint32_t inputs = vs.info.interpolatorMask & ((1u << psRegs) - 1);
-                VkShaderModule psModule = PixelVariant(ps, outputs, inputs, (key.raster >> 5) & 1);
+                VkShaderModule psModule = PixelVariant(ps, prepass ? 0u : outputs, inputs, (key.raster >> 5) & 1);
                 if (!psModule)
                     return VK_NULL_HANDLE;
                 stages[1] = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT,
@@ -3483,7 +3489,7 @@ shaderPreamble;
 
             VkGraphicsPipelineCreateInfo gpci{ VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO };
             gpci.pNext = &rci;
-            gpci.stageCount = prepass ? 1 : 2;
+            gpci.stageCount = prepass && !prepassDiscards ? 1 : 2;
             gpci.pStages = stages;
             gpci.pVertexInputState = &vi;
             gpci.pInputAssemblyState = &ia;
@@ -3744,7 +3750,7 @@ shaderPreamble;
             auto p = s_pendingPipelines.find(key);
             if (p == s_pendingPipelines.end())
             {
-                QueuePipeline(key, layout, s_shaders[key.vs].get(), DepthOnlyPixelShader(), false);
+                QueuePipeline(key, layout, s_shaders[key.vs].get(), (key.raster >> 8) & 1 ? s_shaders[key.ps].get() : DepthOnlyPixelShader(), false);
                 return VK_NULL_HANDLE;
             }
             std::shared_ptr<PendingPipeline> job = p->second;
@@ -12053,6 +12059,7 @@ void main()
         }
         // NFSMW_PREPASS (see s_prepassOn): this draw in the pre-pass too?
         VkPipeline prePipeline = VK_NULL_HANDLE;
+        bool prepassDiscards = false;  // with its pixel shader (NFSMW_PREPASS=2)
         if (s_passSecondary && !(s_exp & 1))
         {
             s_prepassCounts.draws++;
@@ -12060,15 +12067,24 @@ void main()
             bool blends = false;
             for (int i = 0; i < 4; i++)
                 blends = blends || (color[i] && ((writeMask >> (4 * i)) & 0xF) && key.blend[i] != ~0u);
+            const bool discards = (rasterState & 32u) || (s_ps && s_ps->info.usesKill);
             if (depth && !adoptedDepth && t.depthTest && t.depthWrite && t.depthCompareOp == VK_COMPARE_OP_LESS_OR_EQUAL && !t.stencilTest &&
-                !blends && !(rasterState & 32u) && s_ps && !s_ps->info.usesKill && !s_ps->info.writesDepth && !barPlan.rectCount && !zpdCount)
+                !blends && (!discards || s_prepassLevel >= 2) && s_ps && !s_ps->info.writesDepth && !barPlan.rectCount && !zpdCount)
             {
                 PipelineKey pk = key;
-                pk.ps = DepthOnlyPixelShader()->hash;
                 for (uint32_t& b : pk.blend)
                     b = ~0u;
                 pk.colorMask = 0;
-                pk.raster = (key.raster & ~32u) | 128u;
+                if (discards)
+                {
+                    pk.raster = key.raster | 128u | 256u;  // (the alpha test bit kept)
+                    prepassDiscards = true;
+                }
+                else
+                {
+                    pk.ps = DepthOnlyPixelShader()->hash;
+                    pk.raster = (key.raster & ~32u) | 128u;
+                }
                 prePipeline = PrepassPipeline(pk, layout.pipeline);
                 if (prePipeline)
                     s_prepassCounts.prepassed++;
@@ -12295,7 +12311,7 @@ void main()
                 pre.setOffset = dynamicOffset;
             }
             // The textures only where the vertex shader fetches some.
-            if (textureCount && s_vs && (s_vs->info.texture2DMask | s_vs->info.texture3DMask | s_vs->info.textureCubeMask) &&
+            if (textureCount && (prepassDiscards || (s_vs && (s_vs->info.texture2DMask | s_vs->info.texture3DMask | s_vs->info.textureCubeMask))) &&
                 (first || pre.textureLayout != layout.pipeline || pre.textureSerial != textureCache.infosSerial))
             {
                 VkWriteDescriptorSet writes[96];
