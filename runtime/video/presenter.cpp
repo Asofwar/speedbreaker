@@ -1253,212 +1253,6 @@ void main()
 }
 )";
 
-        // NFSMW_FUSED_POST=1: kAaCs's anti-aliasing and kScaleFs's scaling of
-        // a picture as wide as the frame (its bicubic mode 2: each column
-        // scaled, a Steam Deck's 1280x720 -> 1280x800) in one pass, into an
-        // image of the swapchain's picture size that the scale pass then
-        // draws 1:1 (with the tone table). A group makes a 16x32 tile of the
-        // output: it loads the source texels its anti-aliasing reads around
-        // each pixel (a 1-texel border) into shared memory once, anti-aliases
-        // the rows and columns the tile's scaling reads there, and scales
-        // from those. The two passes before took a 32-bit image of the frame
-        // between them and 8 texture fetches a pixel for the scaling: on the
-        // Deck at 5 W ~2.07 ms for both, of which the scaling ~1.0.
-        // The same picture: the anti-aliasing's neighbours are the texels
-        // its fetches at their centres return, the edge walk and the final
-        // sample are the same fetches, and each anti-aliased texel is
-        // rounded to 8 bits as the image held it. The scaling's bilinear
-        // taps are blends of two of those with the weight rounded to 1/256,
-        // as the texture unit's; the tone table then reads the 8-bit result
-        // (it read the unrounded one): at most a level apart.
-        const char* kAaScaleCs = R"(#version 460
-layout(local_size_x = 16, local_size_y = 16) in;
-layout(set = 0, binding = 0) uniform sampler2D src;
-layout(set = 0, binding = 1, rgba8) uniform writeonly image2D dst;
-// size: the frame; outSize: the picture (as wide, taller); uvScale: the
-// frame's part of a larger image (as kAaCs's); band, bandOn: as kAaCs's and
-// kScaleFs's (the 16:9 band's columns x..y and rows z..w).
-layout(push_constant) uniform P { ivec2 size; ivec2 outSize; vec2 uvScale; float subpixel; float sharpen; ivec4 band; uint bandOn; } p;
-
-const int TW = 16, TH = 32;          // the output tile
-const int FC = TW + 1, FR = TH + 4;  // anti-aliased texels it may read (the clamp's right column; rows at a scale of 1 or more)
-const int LC = FC + 2, LR = FR + 2;  // source texels loaded: those and a border
-shared uint s_src[LR * LC];
-shared float s_luma[LR * LC];
-shared uint s_aa[FR * FC];
-
-const float kEdgeMin = 0.0312;
-const float kEdgeRelative = 0.125;
-
-float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
-
-// band_filter.h's SpanOf: [0, lo), [lo, hi) or [hi, size) holding t.
-ivec2 spanOf(float t, int lo, int hi, int size)
-{
-    return t < float(lo) ? ivec2(0, lo) : t < float(hi) ? ivec2(lo, hi) : ivec2(hi, size);
-}
-// The spans (texels [x, y) of columns, [z, w) of rows) holding a position
-// in texels: the whole frame without the band.
-ivec4 spansAt(vec2 pos)
-{
-    if (p.bandOn == 0u)
-        return ivec4(-1 << 20, 1 << 20, -1 << 20, 1 << 20);
-    ivec2 sx = spanOf(pos.x, p.band.x, p.band.y, p.size.x), sy = spanOf(pos.y, p.band.z, p.band.w, p.size.y);
-    return ivec4(sx, sy);
-}
-
-// kAaCs's at(): its fetch, clamped to the pixel's spans.
-vec2 spanLo, spanHi;
-vec3 at(vec2 uv)
-{
-    if (p.bandOn != 0u)
-        uv = clamp(uv, spanLo, spanHi);
-    return textureLod(src, uv * p.uvScale, 0.0).rgb;
-}
-
-// The scaling's row k (its taps' first) for output row y, and its fraction.
-int rowOf(int y, out float f)
-{
-    float pos = (float(y) + 0.5) / float(p.outSize.y) * float(p.size.y);
-    float c = floor(pos - 0.5) + 0.5;
-    f = pos - c;
-    return int(c - 0.5);
-}
-
-// The texture unit's blend: its weight in 1/256 steps.
-vec3 blend(vec3 a, vec3 b, float t) { return mix(a, b, floor(t * 256.0 + 0.5) / 256.0); }
-
-int g_x0, g_rowLo;
-ivec4 g_span;  // the output pixel's spans (phase 3)
-// An anti-aliased texel as the image of them gave it (its edges clamp).
-vec3 aa(int x, int y)
-{
-    x = clamp(x, 0, p.size.x - 1);
-    y = clamp(y, 0, p.size.y - 1);
-    return unpackUnorm4x8(s_aa[(y - g_rowLo) * FC + x - g_x0]).rgb;
-}
-// kScaleFs's at() at a texel's centre: clamped to the spans.
-vec3 tap(int x, int y) { return aa(clamp(x, g_span.x, g_span.y - 1), clamp(y, g_span.z, g_span.w - 1)); }
-// kScaleFs's at() on column x at row position y (in texels): clamped to
-// the spans, then the sampler's blend of the two rows around it.
-vec3 tapY(int x, float y)
-{
-    x = clamp(x, g_span.x, g_span.y - 1);
-    if (p.bandOn != 0u)
-        y = clamp(y, float(g_span.z) + 0.5, float(g_span.w) - 0.5);
-    float b = y - 0.5, k = floor(b);
-    return blend(aa(x, int(k)), aa(x, int(k) + 1), b - k);
-}
-
-void main()
-{
-    g_x0 = int(gl_WorkGroupID.x) * TW;
-    const int y0 = int(gl_WorkGroupID.y) * TH;
-    const uint tid = gl_LocalInvocationIndex;
-    float unused;
-    g_rowLo = rowOf(y0, unused) - 1;  // the tile's first anti-aliased row (may be above the frame)
-    const vec2 texel = 1.0 / vec2(p.size);
-
-    // 1. Source texels (rows rowLo - 1.., columns x0 - 1..), as kAaCs's
-    // fetches at their centres return them (unclamped: each pixel clamps
-    // its neighbours below).
-    for (uint i = tid; i < uint(LR * LC); i += 256u)
-    {
-        ivec2 t = ivec2(int(i) % LC, int(i) / LC) + ivec2(g_x0 - 1, g_rowLo - 1);
-        vec3 c = textureLod(src, (vec2(t) + 0.5) * texel * p.uvScale, 0.0).rgb;
-        s_src[i] = packUnorm4x8(vec4(c, 1.0));
-        s_luma[i] = luma(c);
-    }
-    barrier();
-
-    // 2. kAaCs for texels (x0.., rowLo..) of the frame.
-    for (uint i = tid; i < uint(FR * FC); i += 256u)
-    {
-        const int fx = int(i) % FC, fy = int(i) / FC;
-        const ivec2 pix = ivec2(g_x0 + fx, g_rowLo + fy);
-        if (pix.x >= p.size.x || pix.y < 0 || pix.y >= p.size.y)
-            continue;
-        vec2 uv = (vec2(pix) + 0.5) * texel;
-        const ivec4 span = spansAt(vec2(pix) + 0.5);
-        spanLo = (vec2(span.xz) + 0.5) * texel;
-        spanHi = (vec2(span.yw) - 0.5) * texel;
-        // A neighbour: its texel clamped to the spans, from the loaded ones.
-        #define NB(dx, dy) (clamp(pix.y + (dy), span.z, span.w - 1) - g_rowLo + 1) * LC + clamp(pix.x + (dx), span.x, span.y - 1) - g_x0 + 1
-        const int l = NB(0, 0);
-        vec3 center = unpackUnorm4x8(s_src[l]).rgb;
-        float lM = s_luma[l];
-        float lN = s_luma[NB(0, -1)], lS = s_luma[NB(0, 1)];
-        float lW = s_luma[NB(-1, 0)], lE = s_luma[NB(1, 0)];
-        float lMin = min(lM, min(min(lN, lS), min(lW, lE)));
-        float lMax = max(lM, max(max(lN, lS), max(lW, lE)));
-        float range = lMax - lMin;
-        if (range < max(kEdgeMin, lMax * kEdgeRelative))
-        {
-            s_aa[i] = packUnorm4x8(vec4(center, 1.0));
-            continue;
-        }
-        float lNW = s_luma[NB(-1, -1)], lSE = s_luma[NB(1, 1)];
-        float lNE = s_luma[NB(1, -1)], lSW = s_luma[NB(-1, 1)];
-        #undef NB
-        float acrossRows = abs(lNW + lSW - 2.0 * lW) + 2.0 * abs(lN + lS - 2.0 * lM) + abs(lNE + lSE - 2.0 * lE);
-        float acrossColumns = abs(lNW + lNE - 2.0 * lN) + 2.0 * abs(lW + lE - 2.0 * lM) + abs(lSW + lSE - 2.0 * lS);
-        bool horizontal = acrossRows >= acrossColumns;
-        float lBefore = horizontal ? lN : lW, lAfter = horizontal ? lS : lE;
-        float gBefore = abs(lBefore - lM), gAfter = abs(lAfter - lM);
-        bool before = gBefore >= gAfter;
-        float threshold = 0.25 * max(gBefore, gAfter);
-        float step = horizontal ? texel.y : texel.x;
-        float edgeLuma = 0.5 * ((before ? lBefore : lAfter) + lM);
-        if (before)
-            step = -step;
-        vec2 onEdge = uv;
-        if (horizontal) onEdge.y += 0.5 * step; else onEdge.x += 0.5 * step;
-        vec2 along = horizontal ? vec2(texel.x, 0.0) : vec2(0.0, texel.y);
-        vec2 uvA = onEdge - along, uvB = onEdge + along;
-        float dA = luma(at(uvA)) - edgeLuma, dB = luma(at(uvB)) - edgeLuma;
-        bool endA = abs(dA) >= threshold, endB = abs(dB) >= threshold;
-        const float strides[10] = float[](1.0, 1.0, 1.0, 1.5, 2.0, 2.0, 2.0, 2.0, 4.0, 8.0);
-        for (int k = 0; k < 10 && !(endA && endB); k++)
-        {
-            if (!endA) { uvA -= along * strides[k]; dA = luma(at(uvA)) - edgeLuma; endA = abs(dA) >= threshold; }
-            if (!endB) { uvB += along * strides[k]; dB = luma(at(uvB)) - edgeLuma; endB = abs(dB) >= threshold; }
-        }
-        float distA = horizontal ? uv.x - uvA.x : uv.y - uvA.y;
-        float distB = horizontal ? uvB.x - uv.x : uvB.y - uv.y;
-        bool nearerA = distA < distB;
-        float offset = 0.5 - min(distA, distB) / (distA + distB);
-        if (((nearerA ? dA : dB) < 0.0) == (lM < edgeLuma))
-            offset = 0.0;
-        float average = (2.0 * (lN + lS + lW + lE) + lNW + lNE + lSW + lSE) / 12.0;
-        float sub = clamp(abs(average - lM) / range, 0.0, 1.0);
-        sub = (3.0 - 2.0 * sub) * sub * sub;
-        offset = max(offset, sub * sub * p.subpixel);
-        vec2 sampleUv = uv;
-        if (horizontal) sampleUv.y += offset * step; else sampleUv.x += offset * step;
-        s_aa[i] = packUnorm4x8(vec4(at(sampleUv), 1.0));
-    }
-    barrier();
-
-    // 3. kScaleFs's mode 2 over the anti-aliased texels.
-    for (int r = 0; r < TH; r += 16)
-    {
-        const ivec2 o = ivec2(g_x0, y0) + ivec2(gl_LocalInvocationID.xy) + ivec2(0, r);
-        if (o.x >= p.outSize.x || o.y >= p.outSize.y)
-            continue;
-        float f;
-        const int k = rowOf(o.y, f);
-        const float pos = float(k) + 0.5 + f;
-        g_span = spansAt(vec2(float(o.x) + 0.5, pos));
-        float w0 = f * (-0.5 + f * (1.0 - 0.5 * f)), w3 = f * f * (-0.5 + 0.5 * f);
-        float w2 = f * (0.5 + f * (2.0 - 1.5 * f)), w12 = 1.0 + f * f * (-2.5 + 1.5 * f) + w2;
-        vec3 v = tap(o.x, k - 1) * w0 + tapY(o.x, float(k) + 0.5 + w2 / w12) * w12 + tap(o.x, k + 2) * w3;
-        vec3 a = tap(o.x, k), b = tap(o.x + 1, k), d = tap(o.x, k + 1), e = tap(o.x + 1, k + 1);
-        vec3 lo = min(min(a, b), min(d, e)), hi = max(max(a, b), max(d, e));
-        imageStore(dst, o, vec4(clamp(v + p.sharpen * (v - tapY(o.x, pos)), lo, hi), 1.0));
-    }
-}
-)";
-
         const char* kScaleFs = R"(#version 460
 layout(location = 0) in vec2 uv;
 layout(location = 0) out vec4 color;
@@ -1719,18 +1513,7 @@ void main()
             VkDeviceMemory aaMemory = VK_NULL_HANDLE;
             VkImageView aaView = VK_NULL_HANDLE;
             uint32_t aaWidth = 0, aaHeight = 0;
-            // NFSMW_FUSED_POST: kAaScaleCs's pipeline (aaSet, a 32-byte
-            // push), and the picture it makes, at the picture's size.
-            VkPipelineLayout fusedLayout = VK_NULL_HANDLE;
-            VkPipeline fused = VK_NULL_HANDLE;
-            VkImage fusedImage = VK_NULL_HANDLE;
-            VkDeviceMemory fusedMemory = VK_NULL_HANDLE;
-            VkImageView fusedView = VK_NULL_HANDLE;
-            uint32_t fusedWidth = 0, fusedHeight = 0;
         } s_post;
-        // NFSMW_FUSED_POST=1: anti-aliasing and scaling in one pass where the
-        // picture is as wide as the frame (see kAaScaleCs).
-        const bool s_fusedPost = [] { const char* v = std::getenv("NFSMW_FUSED_POST"); return v && v[0] == '1'; }();
         // Read every frame: the settings menu changes them live.
         bool AaEnabled() { return settings::GetBool(settings::Id::AntiAliasing); }
         bool Bicubic() { return settings::GetInt(settings::Id::Scaling) == int32_t(settings::ScalingMode::Bicubic); }
@@ -1866,21 +1649,6 @@ void main()
             cpci.layout = s_post.aaLayout;
             if (vkCreateComputePipelines(s_device, VK_NULL_HANDLE, 1, &cpci, nullptr, &s_post.aa) != VK_SUCCESS)
                 return false;
-            if (s_fusedPost)
-            {
-                // (Without it the frames take the two passes.)
-                VkPushConstantRange fusedRange{ VK_SHADER_STAGE_COMPUTE_BIT, 0, 64 };
-                plci.pSetLayouts = &s_post.aaSet;
-                plci.pPushConstantRanges = &fusedRange;
-                vkCreatePipelineLayout(s_device, &plci, nullptr, &s_post.fusedLayout);
-                VkShaderModule fcs = PostModule(kAaScaleCs, 2);
-                cpci.stage.module = fcs;
-                cpci.layout = s_post.fusedLayout;
-                if (!fcs || vkCreateComputePipelines(s_device, VK_NULL_HANDLE, 1, &cpci, nullptr, &s_post.fused) != VK_SUCCESS)
-                    s_post.fused = VK_NULL_HANDLE;
-                fprintf(stderr, "[video] NFSMW_FUSED_POST: anti-aliasing and column scaling in one pass%s\n",
-                    s_post.fused ? "" : " unavailable (its pipeline couldn't be made)");
-            }
             if (!EnsureScalePipeline())
                 return false;
             s_post.ready = true;
@@ -1892,26 +1660,16 @@ void main()
             return true;
         }
 
-        void EnsureStorageImage(VkImage& image, VkDeviceMemory& memory, VkImageView& view, uint32_t& w, uint32_t& h, uint32_t width,
-            uint32_t height);
         void EnsureAaImage(uint32_t width, uint32_t height)
         {
-            EnsureStorageImage(s_post.aaImage, s_post.aaMemory, s_post.aaView, s_post.aaWidth, s_post.aaHeight, width, height);
-        }
-
-        // An RGBA8 image that compute stores into and passes sample, of this
-        // size (made again when it changes).
-        void EnsureStorageImage(VkImage& image, VkDeviceMemory& memory, VkImageView& view, uint32_t& w, uint32_t& h, uint32_t width,
-            uint32_t height)
-        {
-            if (image && w == width && h == height)
+            if (s_post.aaImage && s_post.aaWidth == width && s_post.aaHeight == height)
                 return;
             WaitIdle();
-            if (image)
+            if (s_post.aaImage)
             {
-                vkDestroyImageView(s_device, view, nullptr);
-                vkDestroyImage(s_device, image, nullptr);
-                vkFreeMemory(s_device, memory, nullptr);
+                vkDestroyImageView(s_device, s_post.aaView, nullptr);
+                vkDestroyImage(s_device, s_post.aaImage, nullptr);
+                vkFreeMemory(s_device, s_post.aaMemory, nullptr);
             }
             VkImageCreateInfo ii{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
             ii.imageType = VK_IMAGE_TYPE_2D;
@@ -1922,22 +1680,22 @@ void main()
             ii.samples = VK_SAMPLE_COUNT_1_BIT;
             ii.tiling = VK_IMAGE_TILING_OPTIMAL;
             ii.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-            vkCreateImage(s_device, &ii, nullptr, &image);
+            vkCreateImage(s_device, &ii, nullptr, &s_post.aaImage);
             VkMemoryRequirements req;
-            vkGetImageMemoryRequirements(s_device, image, &req);
+            vkGetImageMemoryRequirements(s_device, s_post.aaImage, &req);
             VkMemoryAllocateInfo ai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
             ai.allocationSize = req.size;
             ai.memoryTypeIndex = FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-            vkAllocateMemory(s_device, &ai, nullptr, &memory);
-            vkBindImageMemory(s_device, image, memory, 0);
+            vkAllocateMemory(s_device, &ai, nullptr, &s_post.aaMemory);
+            vkBindImageMemory(s_device, s_post.aaImage, s_post.aaMemory, 0);
             VkImageViewCreateInfo vci{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
-            vci.image = image;
+            vci.image = s_post.aaImage;
             vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
             vci.format = VK_FORMAT_R8G8B8A8_UNORM;
             vci.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-            vkCreateImageView(s_device, &vci, nullptr, &view);
-            w = width;
-            h = height;
+            vkCreateImageView(s_device, &vci, nullptr, &s_post.aaView);
+            s_post.aaWidth = width;
+            s_post.aaHeight = height;
         }
 
         // The tone pipeline's pieces, made the first time Brightness or the
@@ -4263,7 +4021,6 @@ void main()
             // then the UI over it.
             waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
             VkImageView scaleInput = VK_NULL_HANDLE;
-            bool fusedFrame = false;  // NFSMW_FUSED_POST: scaleInput is the picture, drawn 1:1
             if (post)
             {
                 if (!gpuImage)
@@ -4297,45 +4054,7 @@ void main()
                 // with the AA off it copies that part, so the passes after
                 // see a frame-sized image as always.
                 const bool oversized = gpuImage && ((imageW && imageW != w) || (imageH && imageH != h));
-                // NFSMW_FUSED_POST (kAaScaleCs): a picture as wide as the
-                // frame and taller, bicubic, anti-aliased.
-                fusedFrame = s_post.fused && AaEnabled() && !s_fastScale && dw == int32_t(w) && dh > int32_t(h) &&
-                    upscale::Choose(settings::GetInt(settings::Id::Scaling), w, h, dw, dh) == upscale::Pass::Bicubic;
-                if (fusedFrame)
-                {
-                    EnsureStorageImage(s_post.fusedImage, s_post.fusedMemory, s_post.fusedView, s_post.fusedWidth, s_post.fusedHeight,
-                        uint32_t(dw), uint32_t(dh));
-                    Barrier(cmd, s_post.fusedImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT,
-                        VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
-                    VkDescriptorImageInfo in{ s_post.sampler, f.sourceView, VK_IMAGE_LAYOUT_GENERAL };
-                    VkDescriptorImageInfo out{ VK_NULL_HANDLE, s_post.fusedView, VK_IMAGE_LAYOUT_GENERAL };
-                    VkWriteDescriptorSet writes[2] = {
-                        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 0, 0, 1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &in, nullptr, nullptr },
-                        { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, VK_NULL_HANDLE, 1, 0, 1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, &out, nullptr, nullptr },
-                    };
-                    struct
-                    {
-                        int32_t width, height, outWidth, outHeight;
-                        float uvScale[2];
-                        float subpixel, sharpen;
-                        int32_t band[4];
-                        uint32_t bandOn, pad[3];
-                    } pc = { int32_t(w), int32_t(h), dw, dh,
-                        { imageW ? float(w) / float(imageW) : 1.0f, imageH ? float(h) / float(imageH) : 1.0f }, 0.5f, Sharpen(),
-                        { band.x0, band.x1, band.y0, band.y1 }, bandOn ? 1u : 0u, {} };
-                    static_assert(sizeof(pc) == 64);
-                    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_post.fused);
-                    s_post.pushDescriptorSet(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_post.fusedLayout, 0, 2, writes);
-                    vkCmdPushConstants(cmd, s_post.fusedLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-                    vkCmdDispatch(cmd, (uint32_t(dw) + 15) / 16, (uint32_t(dh) + 31) / 32, 1);
-                    Barrier(cmd, s_post.fusedImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT,
-                        VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-                    scaleInput = s_post.fusedView;
-                    static bool logged = false;
-                    if (!std::exchange(logged, true))
-                        fprintf(stderr, "[video] NFSMW_FUSED_POST: %ux%u -> %dx%d anti-aliased and scaled in one pass\n", w, h, dw, dh);
-                }
-                else if (AaEnabled() || oversized)
+                if (AaEnabled() || oversized)
                 {
                     EnsureAaImage(w, h);
                     Barrier(cmd, s_post.aaImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT,
@@ -4400,11 +4119,7 @@ void main()
             s_context.cmdBeginRendering(cmd, &ri);
             if (scaleInput)
             {
-                if (fusedFrame)
-                    DrawPicture(cmd, upscale::Pass::Linear, VK_NULL_HANDLE, tone, scaleInput, uint32_t(dw), uint32_t(dh), band, false, dx, dy,
-                        dw, dh, Sharpen());
-                else
-                    DrawPicture(cmd, pass, rcas, tone, scaleInput, w, h, band, bandOn, dx, dy, dw, dh, Sharpen());
+                DrawPicture(cmd, pass, rcas, tone, scaleInput, w, h, band, bandOn, dx, dy, dw, dh, Sharpen());
                 if ((!captures.empty() || !frameShots.empty()) && pictureRect.extent.width)
                 {
                     // The game's picture alone: pause the pass, copy it out,
