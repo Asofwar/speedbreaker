@@ -104,9 +104,17 @@ PPC_FUNC(sub_82597498)
     timeline::Mark(timeline::GameWaitEnd);
 }
 
+namespace hledraw
+{
+    bool DrawIndexedVertices(PPCContext& ctx, uint8_t* base);  // game/hle_draw.cpp (NFSMW_HLE_DRAW)
+}
+
 extern "C" PPC_FUNC(__imp__sub_82593A58);
 PPC_FUNC(sub_82593A58)
 {
+    // NFSMW_HLE_DRAW: the draw made natively, without this per-draw timing.
+    if (hledraw::DrawIndexedVertices(ctx, base))
+        return;
     timeline::Mark(timeline::GamePresentBegin);
     static std::atomic<int64_t> lastPresent{ 0 };
     int64_t start = NowNs();
