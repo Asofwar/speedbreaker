@@ -1748,7 +1748,8 @@ namespace gpu::renderer
             const std::string& shaderPreamble = {})
         {
             const std::string preamble = std::string(s_splitMemory ? "#define SPLIT_MEMORY\n" : "") +
-                (s_fmulz ? "#define SB_FMULZ\n" : "") + (s_spirvOpt ? "// NFSMW_SPIRV_OPT\n" : "") + shaderPreamble;
+                (s_fmulz ? "#define SB_FMULZ\n" : "") + (s_spirvOpt ? "// NFSMW_SPIRV_OPT\n" : "") +
+shaderPreamble;
             if (!s_shaderCacheEnabled)
                 return CompileGlslUncached(source, stage, log, preamble);
             std::filesystem::path file = ShaderCacheFile(source, stage, preamble);
@@ -4242,6 +4243,10 @@ namespace gpu::renderer
         }
 
         const char* kUntileGlsl = R"(#version 460
+// 24-bit depth to a depth texture's float: as the resolve shader's D24F
+// (NFSMW_RESOLVE_LAZY: SB_D24_EXACT), so a texture loaded here and one a
+// resolve stored hold the same values.
+#define D24F(d) (float(d) / 16777215.0)
 layout(local_size_x = 8, local_size_y = 8) in;
 layout(std430, set = 0, binding = 0) readonly buffer SharedMemory { uint g_mem[]; };)" GLSL_SHARED_MEMORY_READ R"(
 #ifdef TO_IMAGE
@@ -4352,7 +4357,7 @@ void main()
         uint o;
         if (p.convert == 4u)
         {
-            o = floatBitsToUint(float(word(addr(gx, gy)) >> 8) / 16777215.0);
+            o = floatBitsToUint(D24F(word(addr(gx, gy)) >> 8));
         }
         else
         {
@@ -5749,6 +5754,12 @@ void main()
         const uint32_t s_resolvePush = s_fusePartial || s_directCube ? sizeof(ResolveConstants) : offsetof(ResolveConstants, texX);
 
         const char* kResolveGlsl = R"(#version 460
+// 24-bit depth (in a word's low bits) to the float a depth texture holds.
+// NFSMW_RESOLVE_LAZY defines SB_D24_EXACT: one correctly rounded multiply by
+// 1/16777215 (0x33800001), the same value in every shader, so that the
+// write-back finds the d24 it came from (a division may round otherwise in
+// each pipeline: 1 in 24 bits apart on RADV).
+#define D24F(d) (float(d) / 16777215.0)
 #extension GL_EXT_samplerless_texture_functions : require
 #ifdef TEXTURE_ONLY
 layout(local_size_x = 256) in;
@@ -5953,7 +5964,7 @@ void main()
             continue;
 #endif
         uint v = swapWord(swapWord(pack32(px(g.x, g.y)), p.endian), p.texEndian);
-        uint o = p.texConvert == 4u ? floatBitsToUint(float(v >> 8) / 16777215.0) : v;
+        uint o = p.texConvert == 4u ? floatBitsToUint(D24F(v >> 8)) : v;
 #ifdef TEX_OFFSET
         imageStore(t_image, ivec2(int(x + p.texX), int(y + p.texY)), uvec4(o, 0u, 0u, 0u));
 #else
@@ -5988,15 +5999,20 @@ void main()
 #endif
     if (p.texConvert == 4u)
     {
-        // NFSMW_RESOLVE_LAZY: a depth resolve's texel, float(d24) / 16777215 as
+        // NFSMW_RESOLVE_LAZY: a depth resolve's texel, D24F(d24) as
         // TEXTURE_ONLY stored it, back to the word main() writes (d24 << 8,
-        // the stencil byte 0): the 24-bit value whose quotient is this float.
+        // the stencil byte 0): the 24-bit value whose quotient is this float,
+        // the nearest to packDepth24's first (0, -1, +1, ...). Where a driver
+        // divides by multiplying with the reciprocal (RADV), 0xFFFFFE and
+        // 0xFFFFFF (the far plane, a shadow map's clear) both give 1.0: the
+        // clear's comes back, 0xFFFFFE does as 0xFFFFFF (its texture can't
+        // tell them apart either).
         float f = uintBitsToFloat(v);
         uint d0 = packDepth24(f), d = d0;
-        for (int k = -3; k <= 3; k++)
+        for (int k = 0; k < 7; k++)
         {
-            uint c = uint(int(d0) + k);
-            if (c <= 0xFFFFFFu && float(c) / 16777215.0 == f)
+            uint c = uint(int(d0) + ((k & 1) != 0 ? -((k + 1) >> 1) : (k >> 1)));
+            if (c <= 0xFFFFFFu && D24F(c) == f)
             {
                 d = c;
                 break;
@@ -6006,9 +6022,25 @@ void main()
     }
 #ifdef WRITEBACK_CHECK
     // NFSMW_RESOLVE_DEFER_COLOR=2: the word main() stored, compared (the
-    // pool binding counts: [0] words that differ, [1] words compared).
-    if (memLoad(word) != swapWord(v, p.texEndian))
+    // pool binding counts: [0] words that differ, [1] words compared, [2]
+    // the largest difference of a depth word's 24 bits).
+    uint g = memLoad(word);
+    if (g != swapWord(v, p.texEndian))
+    {
         atomicAdd(s_pool[0], 1u);
+        if (p.texConvert == 4u)
+            atomicMax(s_pool[2], uint(abs(int(swapWord(g, p.texEndian) >> 8) - int(v >> 8))));
+        if (atomicCompSwap(s_pool[3], 0u, 1u) == 0u)
+        {
+#ifdef TEX_OFFSET
+            s_pool[4] = imageLoad(t_image, ivec2(int(x + p.texX), int(y + p.texY))).x;
+#else
+            s_pool[4] = imageLoad(t_image, ivec2(int(x), int(y))).x;
+#endif
+            s_pool[5] = g; s_pool[6] = v; s_pool[7] = x; s_pool[8] = y; s_pool[9] = p.destBase; s_pool[10] = p.texConvert;
+            s_pool[11] = p.endian | (p.texEndian << 8) | (p.format << 16);
+        }
+    }
     atomicAdd(s_pool[1], 1u);
 #else
     memStore(word, swapWord(v, p.texEndian));
@@ -6145,7 +6177,7 @@ void main()
         uint v = swapWord(m, p.texEndian);
         // (D24: m is packDepth24's, clamped, so the far plane stores 1.0 here
         // too, not 0.)
-        uint o = p.texConvert == 4u ? floatBitsToUint(float(v >> 8) / 16777215.0) : v;
+        uint o = p.texConvert == 4u ? floatBitsToUint(D24F(v >> 8)) : v;
 #ifdef TEX_OFFSET
         imageStore(t_image, ivec2(int(x + p.texX), int(y + p.texY)), uvec4(o, 0u, 0u, 0u));
 #else
@@ -6802,6 +6834,8 @@ void main()
                 s_colourCheck.counts = static_cast<volatile uint32_t*>(mapped);
                 s_colourCheck.counts[0] = 0;
                 s_colourCheck.counts[1] = 0;
+                for (int i = 2; i < 12; i++)
+                    s_colourCheck.counts[i] = 0;
                 MakeResolvePipeline(false, 1, 1, &s_resolveWritebackCheckPipeline, false, 2);
                 if (!s_resolveWritebackPipeline)
                     MakeResolvePipeline(false, 1, 1, &s_resolveWritebackPipeline, false, 1);
@@ -6820,8 +6854,13 @@ void main()
         void ReportColourCheck(const char* when)
         {
             if (s_colourCheck.counts)
-                fprintf(stderr, "[defer-check] colour %s: %u words compared with their write-back from the texture, %u differ%s\n", when,
-                    s_colourCheck.counts[1], s_colourCheck.counts[0], s_colourCheck.counts[0] ? " (NOT exact)" : "");
+                fprintf(stderr, "[defer-check] colour %s: %u words compared with their write-back from the texture, %u differ%s; "
+                    "largest depth difference %u (24-bit units)\n", when, s_colourCheck.counts[1], s_colourCheck.counts[0],
+                    s_colourCheck.counts[0] ? " (NOT exact)" : "", s_colourCheck.counts[2]);
+            if (s_colourCheck.counts && s_colourCheck.counts[3])
+                fprintf(stderr, "[defer-check] first: texel %08X guest %08X written back %08X at %u,%u dest %08X convert %u endian/tex/format %06X\n",
+                    s_colourCheck.counts[4], s_colourCheck.counts[5], s_colourCheck.counts[6], s_colourCheck.counts[7], s_colourCheck.counts[8],
+                    s_colourCheck.counts[9], s_colourCheck.counts[10], s_colourCheck.counts[11]);
         }
 
         // Before work that reads guest bytes [base, base + size): the deferred
