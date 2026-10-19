@@ -3044,6 +3044,8 @@ void main()
         features.dualSrcBlend = supported.dualSrcBlend;
         features.depthClamp = supported.depthClamp;
         features.samplerAnisotropy = supported.samplerAnisotropy;
+        static const bool passStats = [] { const char* v = std::getenv("NFSMW_PASS_STATS"); return v && v[0] == '1'; }();
+        features.pipelineStatisticsQuery = passStats && supported.pipelineStatisticsQuery;
         features.textureCompressionBC = supported.textureCompressionBC;
         features.shaderInt16 = supported.shaderInt16;
         VkPhysicalDeviceDynamicRenderingFeaturesKHR dynamicRendering{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES_KHR };
@@ -3193,6 +3195,7 @@ void main()
             (PFN_vkCmdEndRenderingKHR)vkGetDeviceProcAddr(s_device, "vkCmdEndRenderingKHR"), rateW, rateH, occlusionCounting,
             hostQueryReset.hostQueryReset ? (PFN_vkResetQueryPool)vkGetDeviceProcAddr(s_device, "vkResetQueryPool") : nullptr,
             mirrorClamp };
+        s_context.pipelineStatistics = features.pipelineStatisticsQuery == VK_TRUE;
 #ifdef VK_EXT_depth_bias_control
         if (depthBiasControl)
         {

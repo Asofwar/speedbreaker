@@ -156,6 +156,10 @@ namespace video
         PFN_vkCmdSetStencilTestEnableEXT cmdSetStencilTestEnable = nullptr;
         PFN_vkCmdSetStencilOpEXT cmdSetStencilOp = nullptr;
 #endif
+        // NFSMW_PASS_STATS=1 on a device with pipeline statistics queries:
+        // the pass profile (NFSMW_PASS_PROFILE) counts each pass's vertex and
+        // fragment shader invocations (gpu/renderer.cpp).
+        bool pipelineStatistics = false;
     };
 
     // nullptr when running headless.

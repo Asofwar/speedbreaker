@@ -82,8 +82,9 @@ namespace gpu::renderer
         // depth-only pixel shader for every draw (no guest pixel shading),
         // 128 a 1x1 scissor for every draw (vertex shading without
         // rasterization), 256 no barrier at a pass's end (what the pass
-        // structure's waits cost: the pictures may be wrong), 512 no clears
-        // of targets in passes (their load ops load, no in-pass clears).
+        // structure's waits cost: the pictures may be wrong), 512 no colour
+        // clears of targets in passes (their load ops load, no in-pass
+        // clears), 1024 the same for depth and stencil.
         const uint32_t s_exp = [] { const char* v = std::getenv("NFSMW_GPU_EXP"); return v ? uint32_t(std::atoi(v)) : 0u; }();
         // Fewer render passes and texture reloads (NFSMW_PASS_MERGE,
         // NFSMW_CLEAR_FLUSH_RECT, NFSMW_DIRECT_CUBE, NFSMW_FUSE_PARTIAL): on
@@ -750,7 +751,12 @@ namespace gpu::renderer
         // it (PassBreak), whether that pass had the same targets (a break
         // that only the reason forced), and for a submit its site (s_submitWhy).
         struct PassInfo { std::string desc; uint32_t draws = 0; uint32_t slot, query; uint32_t resolves = 0, uploads = 0, submits = 0; uint64_t shadowKB = 0;
-            uint8_t why = 0, same = 0, submitWhy = 0; };
+            uint8_t why = 0, same = 0, submitWhy = 0; bool stats = false; uint64_t areaPx = 0; };
+        // NFSMW_PASS_STATS=1 (with NFSMW_PASS_PROFILE): each pass's vertex and
+        // fragment shader invocations (a pipeline statistics query, its index
+        // the pass's first timestamp's / 2), and its fragments per pixel of
+        // its area: how much of the frame is shaded more than once.
+        VkQueryPool s_passStats = VK_NULL_HANDLE;
         struct GapCounters { uint64_t resolves = 0, uploads = 0, submits = 0, shadowBytes = 0; } s_gapLast;
         std::vector<PassInfo> s_passInfos;
         bool s_profiling = false;
@@ -2737,6 +2743,8 @@ shaderPreamble;
                 return;
             ZpdEndSegment();  // a segment never outlives its pass
             s_vk->cmdEndRendering(s_cmd);
+            if (s_profiling && s_passEndPending && s_passStats && s_passInfos.back().stats)
+                vkCmdEndQuery(s_cmd, s_passStats, s_passInfos.back().query / 2);
             s_passActive = false;
             s_passBreak = why;
             std::copy(s_passColor, s_passColor + 4, s_lastPassTargets);
@@ -2846,6 +2854,8 @@ shaderPreamble;
             return { -wo.window_x_offset, -wo.window_y_offset };
         }
 
+        // Clears by how they ran: [depth][0 a load op, 1 in the pass].
+        struct ClearCounts { struct Kind { uint64_t count = 0, pixels = 0; } kind[2][2]; } s_clearCounts;
         struct PendingClear
         {
             RenderTarget* rt;
@@ -2968,10 +2978,16 @@ shaderPreamble;
                     for (int i = 0; i < 4; i++)
                         if (color[i] == it->rt)
                             att = &colors[i];
-                if (s_exp & 512)
+                if (s_exp & (it->rt->depth ? 1024 : 512))
                 {
                     it = s_pendingClears.erase(it);
                     continue;
+                }
+                {
+                    // [clears] (with NFSMW_PASS_BARRIER's line): how each clear runs.
+                    ClearCounts::Kind& k = s_clearCounts.kind[it->rt->depth][whole && att ? 0 : 1];
+                    k.count++;
+                    k.pixels += uint64_t(it->rect.extent.width) * it->rect.extent.height;
                 }
                 if (whole && att)
                 {
@@ -3009,6 +3025,13 @@ shaderPreamble;
                 s_passInfos.push_back({ desc, 0, s_slot, s_passQueryNext, uint32_t(now.resolves - s_gapLast.resolves),
                     uint32_t(now.uploads - s_gapLast.uploads), uint32_t(now.submits - s_gapLast.submits), (now.shadowBytes - s_gapLast.shadowBytes) / 1024 });
                 PassInfo& pi = s_passInfos.back();
+                if (s_passStats)
+                {
+                    vkCmdResetQueryPool(s_cmd, s_passStats, pi.query / 2, 1);
+                    vkCmdBeginQuery(s_cmd, s_passStats, pi.query / 2, 0);
+                    pi.stats = true;
+                    pi.areaPx = uint64_t(s_passArea.extent.width) * s_passArea.extent.height;
+                }
                 pi.why = s_passBreak;
                 pi.same = std::equal(color, color + 4, s_lastPassTargets) && s_lastPassTargets[4] == depth;
                 pi.submitWhy = s_passBreakSubmit;
@@ -9934,6 +9957,18 @@ void main()
             {
                 qpci.queryCount = 512;
                 Check(vkCreateQueryPool(s_dev, &qpci, nullptr, &s_passQueries), "pass query pool");
+                if (s_vk->pipelineStatistics)
+                {
+                    VkQueryPoolCreateInfo sci{ VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+                    sci.queryType = VK_QUERY_TYPE_PIPELINE_STATISTICS;
+                    sci.queryCount = 256;
+                    sci.pipelineStatistics = VK_QUERY_PIPELINE_STATISTIC_VERTEX_SHADER_INVOCATIONS_BIT |
+                        VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT;
+                    if (vkCreateQueryPool(s_dev, &sci, nullptr, &s_passStats) != VK_SUCCESS)
+                        s_passStats = VK_NULL_HANDLE;
+                    fprintf(stderr, "[renderer] NFSMW_PASS_STATS: shader invocations per pass in the profile%s\n",
+                        s_passStats ? "" : " unavailable (no query pool)");
+                }
             }
         }
         // NFSMW_OCCLUSION=1: a pool of occlusion queries per slot, so a reset
@@ -12648,6 +12683,20 @@ void main()
         // NFSMW_PASS_BARRIER: per frame of the window ending here, with the
         // level it ran at, before its [perf] line. Vertex barriers cost a
         // pass's overlap (a split: a pass too).
+        if (frame % 120 == 0 && std::getenv("NFSMW_CLEAR_STATS"))
+        {
+            static ClearCounts last{};
+            const ClearCounts& c = s_clearCounts;
+            auto k = [&](int d, int i, double& n, double& mp) {
+                n = double(c.kind[d][i].count - last.kind[d][i].count) / 120;
+                mp = double(c.kind[d][i].pixels - last.kind[d][i].pixels) / 120 / 1e6;
+            };
+            double n[4], mp[4];
+            k(0, 0, n[0], mp[0]); k(0, 1, n[1], mp[1]); k(1, 0, n[2], mp[2]); k(1, 1, n[3], mp[3]);
+            fprintf(stderr, "[clears] per frame: colour %.1f load ops (%.2f Mpx) %.1f in passes (%.2f Mpx) | depth %.1f load ops (%.2f Mpx) "
+                "%.1f in passes (%.2f Mpx)\n", n[0], mp[0], n[1], mp[1], n[2], mp[2], n[3], mp[3]);
+            last = c;
+        }
         if (s_passBarrierLevel && frame % 120 == 0)
         {
             static BarrierCounts last{};
@@ -12803,8 +12852,17 @@ void main()
             if (pi.desc.starts_with("area"))
                 why = std::format("  | after {}{}, {} targets", kPassBreakNames[std::min<size_t>(pi.why, std::size(kPassBreakNames) - 1)],
                     pi.why == kBreakSubmit ? std::format(" ({})", pi.submitWhy) : std::string(), pi.same ? "same" : "new");
-            fprintf(stderr, "[profile] %8.1f us  %4u draws  (+%7.1f us before: %u resolves, %u uploads, %u submits, %llu KB synced)  %s%s\n",
-                us, pi.draws, gap, pi.resolves, pi.uploads, pi.submits, (unsigned long long)pi.shadowKB, pi.desc.c_str(), why.c_str());
+            std::string stats;
+            if (pi.stats)
+            {
+                uint64_t st[2] = {};
+                if (vkGetQueryPoolResults(s_dev, s_passStats, pi.query / 2, 1, sizeof(st), st, sizeof(st), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS)
+                    stats = std::format("  | VS {:.0f}k, FS {:.2f} Mpx = {:.2f} a pixel", double(st[0]) / 1e3, double(st[1]) / 1e6,
+                        pi.areaPx ? double(st[1]) / double(pi.areaPx) : 0.0);
+            }
+            fprintf(stderr, "[profile] %8.1f us  %4u draws  (+%7.1f us before: %u resolves, %u uploads, %u submits, %llu KB synced)  %s%s%s\n",
+                us, pi.draws, gap, pi.resolves, pi.uploads, pi.submits, (unsigned long long)pi.shadowKB, pi.desc.c_str(), why.c_str(),
+                stats.c_str());
         }
         fprintf(stderr, "[profile] total %.1f us in passes, %.1f us between them\n", total, between);
         if (frame < uint64_t(s_profileFrame) + uint64_t(s_profileFrames))
