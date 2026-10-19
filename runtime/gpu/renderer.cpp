@@ -81,7 +81,9 @@ namespace gpu::renderer
         // vertices (its state changes without its shading), 64 run the empty
         // depth-only pixel shader for every draw (no guest pixel shading),
         // 128 a 1x1 scissor for every draw (vertex shading without
-        // rasterization).
+        // rasterization), 256 no barrier at a pass's end (what the pass
+        // structure's waits cost: the pictures may be wrong), 512 no clears
+        // of targets in passes (their load ops load, no in-pass clears).
         const uint32_t s_exp = [] { const char* v = std::getenv("NFSMW_GPU_EXP"); return v ? uint32_t(std::atoi(v)) : 0u; }();
         // Fewer render passes and texture reloads (NFSMW_PASS_MERGE,
         // NFSMW_CLEAR_FLUSH_RECT, NFSMW_DIRECT_CUBE, NFSMW_FUSE_PARTIAL): on
@@ -1509,6 +1511,8 @@ namespace gpu::renderer
         // read would wait only for its fragment stage.
         void PassEndBarrier()
         {
+            if (s_exp & 256)
+                return;
             if (s_passBarrier < 1 || s_passBarrier == 3)
                 return FullBarrier();
             if (s_narrowPassEnds >= 48)
@@ -2964,6 +2968,11 @@ shaderPreamble;
                     for (int i = 0; i < 4; i++)
                         if (color[i] == it->rt)
                             att = &colors[i];
+                if (s_exp & 512)
+                {
+                    it = s_pendingClears.erase(it);
+                    continue;
+                }
                 if (whole && att)
                 {
                     // Supersedes any older partial clear of this target.
