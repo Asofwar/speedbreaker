@@ -77,7 +77,11 @@ namespace gpu::renderer
         Stats s_stats{};
         // NFSMW_GPU_EXP bitmask, for performance experiments: 1 skip draw
         // calls, 2 skip resolve copies, 4 skip texture loads, 8 bind 1x1
-        // placeholders instead of textures.
+        // placeholders instead of textures, 32 record every draw with no
+        // vertices (its state changes without its shading), 64 run the empty
+        // depth-only pixel shader for every draw (no guest pixel shading),
+        // 128 a 1x1 scissor for every draw (vertex shading without
+        // rasterization).
         const uint32_t s_exp = [] { const char* v = std::getenv("NFSMW_GPU_EXP"); return v ? uint32_t(std::atoi(v)) : 0u; }();
         // Fewer render passes and texture reloads (NFSMW_PASS_MERGE,
         // NFSMW_CLEAR_FLUSH_RECT, NFSMW_DIRECT_CUBE, NFSMW_FUSE_PARTIAL): on
@@ -1676,6 +1680,18 @@ namespace gpu::renderer
             if (!slot->info.ok)
                 fprintf(stderr, "[renderer] %s_%016llx: translation failed: %s\n", type == 0 ? "vs" : "ps",
                     (unsigned long long)hash, slot->info.error.c_str());
+            // NFSMW_DUMP_GLSL=<dir>: each shader's translation as
+            // <dir>/<vs|ps>_<hash>.glsl (the hashes the pass profile prints).
+            static const char* dumpGlsl = std::getenv("NFSMW_DUMP_GLSL");
+            if (dumpGlsl && slot->info.ok)
+            {
+                const std::string path = std::format("{}/{}_{:016x}.glsl", dumpGlsl, type == 0 ? "vs" : "ps", hash);
+                if (FILE* f = fopen(path.c_str(), "w"))
+                {
+                    fputs(slot->info.glsl.c_str(), f);
+                    fclose(f);
+                }
+            }
             // Compiled to SPIR-V with its first pipeline, on a pipeline worker.
             return slot.get();
         }
@@ -9669,7 +9685,7 @@ void main()
             Shader* ps;
             ~RestorePs() { s_ps = ps; }
         } restorePs{ s_ps };
-        if (!gpu::RunsGuestPixelShader(edramMode, s_depthOnlyGuestPs))
+        if (!gpu::RunsGuestPixelShader(edramMode, s_depthOnlyGuestPs) || (s_exp & 64))
             s_ps = DepthOnlyPixelShader();
         s_stats.draws++;
         auto skip = [&](uint64_t key, const char* why) {
@@ -11342,6 +11358,8 @@ void main()
                 reinterpret_cast<const uint8_t*>(&c) + lo);
             bound.pc = c;
         };
+        if (s_exp & 128)
+            scissor = VkRect2D{ { 0, 0 }, { 1, 1 } };
         if (fresh || memcmp(&bound.scissor, &scissor, sizeof(scissor)) != 0)
             setScissor(scissor);
         auto front = Reg<reg::RB_STENCILREFMASK>();
@@ -11566,10 +11584,14 @@ void main()
                 }
                 firstIndex = uint32_t(indexOffset >> (indices16 ? 1 : 2));
             }
+            if (s_exp & 32)
+                vertexCount = 0;
             vkCmdDrawIndexed(s_cmd, vertexCount, 1, firstIndex, 0, 0);
         }
         else
         {
+            if (s_exp & 32)
+                vertexCount = 0;
             vkCmdDraw(s_cmd, vertexCount, 1, 0, 0);
         }
         // Edge bars (above): the same draw again per rectangle, with the
