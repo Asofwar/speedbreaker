@@ -6990,9 +6990,12 @@ void main()
             // above): the cached texture, and the face, holding its texels.
             Texture* texture = nullptr;
             uint32_t layer = 0;
+            // NFSMW_RESOLVE_PRESENT=2: the image is a front ring slot's (the
+            // presenter shows it): the slot returns it to the spares, not this record.
+            bool borrowed = false;
         };
         std::vector<DeferredResolve> s_deferredResolves;
-        constexpr size_t kMaxDeferred = 32;  // more: the oldest is written
+        constexpr size_t kMaxDeferred = 64;  // more: the oldest is written (32 ran over ~0.5 times a frame once NFSMW_RESOLVE_PRESENT=2 added its two)
         constexpr size_t kMaxDeferredDepth = 4;  // of them depth ones (each keeps a target's image)
         // Images of depth targets that went into records and came back, for the
         // next target of their format and size that needs one.
@@ -7080,7 +7083,7 @@ void main()
             GuardGpu(d.rangeBase, d.rangeBytes, true, "resolve");
             writewatch::MarkGpuOwned(d.rangeBase, d.rangeBytes);
             writewatch::DeferredWritten(d.rangeBase, d.rangeBytes);
-            if (!colour)
+            if (!colour && !d.borrowed)
             {
                 ReleaseRenamedImage(d.image.image);
                 s_spareTargets.push_back({ d.image, d.sampleView, d.format, d.width, d.height });
@@ -7184,16 +7187,23 @@ void main()
                 s_spareTargets.erase(it);
                 return old;
             }
-            const VkImageAspectFlags aspect = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+            // (A colour target too, NFSMW_RESOLVE_PRESENT=2: its view samples it as is.)
+            const VkImageAspectFlags aspect = rt.depth ? VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_COLOR_BIT;
             rt.image = CreateImage(VK_IMAGE_TYPE_2D, rt.vkFormat, { rt.width, rt.height, 1 }, 1, VK_IMAGE_USAGE_SAMPLED_BIT |
-                VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                (rt.depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT),
                 VK_IMAGE_VIEW_TYPE_2D, aspect);
-            VkImageViewCreateInfo vci{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
-            vci.image = rt.image.image;
-            vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-            vci.format = rt.vkFormat;
-            vci.subresourceRange = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
-            Check(vkCreateImageView(s_dev, &vci, nullptr, &rt.sampleView), "vkCreateImageView(depth)");
+            if (!rt.depth)
+                rt.sampleView = rt.image.view;
+            else
+            {
+                VkImageViewCreateInfo vci{ VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO };
+                vci.image = rt.image.image;
+                vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+                vci.format = rt.vkFormat;
+                vci.subresourceRange = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 };
+                Check(vkCreateImageView(s_dev, &vci, nullptr, &rt.sampleView), "vkCreateImageView(depth)");
+            }
             EndPass(kBreakResolve);
             Begin();  // (the resolve may have submitted: SubmitIfStarving)
             ToGeneral(rt.image.image, aspect, 1);
@@ -7265,9 +7275,9 @@ void main()
                     ++it;
         }
 
-        // NFSMW_RESOLVE_PRESENT=1 (by default on x86-64 Linux, 0 turns it off;
-        // Steam Deck at 5 W, the three together: -1.4 ms GPU a frame, +6% fps,
-        // the same pictures): the resolve into the front
+        // NFSMW_RESOLVE_PRESENT=1 (=2 by default on x86-64 Linux, see
+        // s_hlePresentMode below; 0 turns it off; Steam Deck at 5 W, the three
+        // together: -1.4 ms GPU a frame, +6% fps, the same pictures): the resolve into the front
         // buffer, a whole 1x one of 32-bit texels into a front buffer a swap
         // presented lately, also stores the picture into the presenter's
         // front image, as the swap's conversion would from those guest bytes
@@ -7279,7 +7289,23 @@ void main()
         // for the presenter a moment before the swap would. A front buffer
         // written again before the swap (a resolve, the CPU), or presented
         // in another format, takes the conversion as before.
-        const bool s_hlePresent = [] { const char* v = std::getenv("NFSMW_RESOLVE_PRESENT"); return v ? v[0] == '1' : kResolveDeferDefault == 1; }();
+        // NFSMW_RESOLVE_PRESENT=2 (the default where =1 is): a resolve into
+        // the front buffer that also clears its target, of a whole 8888
+        // target at least the front image's size, runs nothing: the target's
+        // image itself goes to the presenter (the front ring's slot holds it
+        // until the presenter is done with it, then it becomes a spare
+        // target image), the target goes on in another image (its clear
+        // covers the frame), and the guest bytes are owed as a deferred
+        // resolve from that image (written only if something reads them).
+        // Saves the resolve's read, the front image's store and the guest
+        // write, ~3 x 3.7 MB a frame: on a Steam Deck at 5 W -0.58 ms of GPU
+        // time a frame (3 alternated pairs: -0.58, -0.65, -0.50), the same
+        // pictures (compare_shots --strict) and trace hash.
+        const int s_hlePresentMode = [] {
+            const char* v = std::getenv("NFSMW_RESOLVE_PRESENT");
+            return v ? std::clamp(std::atoi(v), 0, 2) : kResolveDeferDefault ? 2 : 0;
+        }();
+        const bool s_hlePresent = s_hlePresentMode != 0;
         struct FrontSeen { uint32_t base = 0, pitch = 0, width = 0, height = 0, endian = 0, format = 0, swizzle = 0; uint64_t frame = 0; };
         FrontSeen s_frontSeen[4];  // the last front buffers presented (tiled, 1x), by base
         // (And what it was stored as: a front buffer written since, by a
@@ -7299,6 +7325,11 @@ void main()
         // The unscaled front image ring's next image, claimed now for a
         // resolve's FRONT_DIRECT store (false: no ring of that size yet).
         bool ClaimFrontForResolve(uint32_t width, uint32_t height, VkImage& image, VkImageView& view);
+        // NFSMW_RESOLVE_PRESENT=2: the slot of the unscaled front ring the next
+        // swap presents, its previous hand-over recycled (-1: no ring of that
+        // size yet); then the image handed over into it.
+        int ClaimFrontSlotForHandover(uint32_t width, uint32_t height);
+        void HandOverFront(int slot, const Image& image, VkImageView view, VkFormat format, uint32_t width, uint32_t height);
 
         void Resolve()
         {
@@ -7873,7 +7904,46 @@ void main()
                                 front = &f;
                     VkImage frontImage = VK_NULL_HANDLE;
                     VkDescriptorImageInfo fi{ VK_NULL_HANDLE, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_GENERAL };
-                    if (front && ClaimFrontForResolve(front->width, front->height, frontImage, fi.imageView))
+                    // NFSMW_RESOLVE_PRESENT=2 (see s_hlePresentMode): the
+                    // target's image itself, when this resolve clears the whole
+                    // target and it is the front image's size and format.
+                    bool handover = false;
+                    int handoverSlot = -1;
+                    const auto [handX, handY] = TileShift();
+                    // (The target's image is as tall as EDRAM allows, taller
+                    // than the frame: the presenter shows its top-left part.)
+                    if (front && s_hlePresentMode == 2 && copyControl.color_clear_enable && !partial && !rename && !defer &&
+                        source->vkFormat == VK_FORMAT_R8G8B8A8_UNORM && source->width >= front->width && source->height >= front->height &&
+                        r.x0 + handX <= 0 && r.y0 + handY <= 0 && r.x1 + handX >= int32_t(front->width) &&
+                        r.y1 + handY >= int32_t(front->height))
+                        handoverSlot = ClaimFrontSlotForHandover(front->width, front->height);
+                    if (front && s_hlePresentMode == 2 && handoverSlot < 0)
+                        LogOnce(0x3450, "no hand-over of the front buffer's resolve: clear %d partial %d rename %d defer %d format %u (want %u) "
+                            "size %ux%u (front %ux%u) rect %d,%d-%d,%d shift %d,%d guest %ux%u slot %d",
+                            int(copyControl.color_clear_enable), int(partial), int(rename), int(defer), unsigned(source->vkFormat),
+                            unsigned(VK_FORMAT_R8G8B8A8_UNORM), source->width, source->height, front->width, front->height, r.x0, r.y0, r.x1, r.y1,
+                            handX, handY, source->guestWidth, source->guestHeight, handoverSlot);
+                    if (handoverSlot >= 0)
+                    {
+                        // (A hand-over's image is the ring's: the limit on
+                        // records keeping a target image doesn't count it.)
+                        if (s_deferredResolves.size() >= kMaxDeferred)
+                        {
+                            s_deferForRoom++;
+                            WriteDeferred(0);
+                        }
+                        auto [image, view] = SwapTargetImage(*source);
+                        HandOverFront(handoverSlot, image, view, source->vkFormat, source->width, source->height);
+                        frontImage = image.image;
+                        handover = true;
+                        s_deferredResolves.push_back({ rangeBase, rangeBytes, rc, image, view, source->vkFormat, source->width, source->height,
+                            nullptr, 0, true });
+                        s_deferredCount++;
+                        s_hle.presented += s_hleCounting;
+                        LogOnce(0x3440, "the resolve into the front buffer hands the target's image to the presenter (NFSMW_RESOLVE_PRESENT=2; "
+                            "the first: %ux%u at %08X)", front->width, front->height, rc.destBase);
+                    }
+                    else if (front && ClaimFrontForResolve(front->width, front->height, frontImage, fi.imageView))
                     {
                         if (!s_resolveFrontPipeline)
                             MakeResolvePipeline(false, 1, 1, &s_resolveFrontPipeline, false, 3);
@@ -7898,10 +7968,10 @@ void main()
                             scaledWrite ? std::format("scaled {}", gpu::ScaleName(source->scale)).c_str()
                             : !source->scale.IsOne() ? "1x (from a scaled target)" : "1x", fused ? " fused" : "",
                             rename ? ", renamed (NFSMW_RESOLVE_RENAME)" : textureOnly ? ", texture only (deferred)" : "",
-                            front ? ", to the presenter" : "");
+                            handover ? ", its image handed to the presenter" : front ? ", to the presenter" : "");
                         ProfileCompute(desc);
                     }
-                    if (!rename)
+                    if (!rename && !handover)
                     {
                         vkCmdBindPipeline(s_cmd, VK_PIPELINE_BIND_POINT_COMPUTE, textureOnly ? s_resolveTexturePipeline
                             : front ? s_resolveFrontPipeline : ResolvePipeline(coalesced, source->scale));
@@ -7924,7 +7994,7 @@ void main()
                         else
                             ResolveBarrier(rangeBase, rangeBytes, fused ? fused->guestStart : 0);
                     }
-                    else
+                    else if (rename)
                         ResolveBarrier(0, 0, fused->guestStart);  // (its texture now holds the pass's depth writes)
                     ProfileComputeEnd();
                     if (front)
@@ -7996,7 +8066,7 @@ void main()
                     }
                     // Deferred: its bytes owed first, so that no CPU access
                     // finds the pages guarded and not owed.
-                    if (textureOnly)
+                    if (textureOnly || handover)
                         writewatch::DeferWrite(rangeBase, rangeBytes);
                     GuardGpu(rangeBase, rangeBytes, true, "resolve");
                     writewatch::MarkGpuOwned(rangeBase, rangeBytes);
@@ -8004,7 +8074,7 @@ void main()
                     {
                         s_deferReplaced++;
                         writewatch::DeferredWritten(replaced->rangeBase, replaced->rangeBytes);
-                        if (!replaced->texture)
+                        if (!replaced->texture && !replaced->borrowed)
                         {
                             ReleaseRenamedImage(replaced->image.image, rename ? fused : nullptr);
                             s_spareTargets.push_back({ replaced->image, replaced->sampleView, replaced->format, replaced->width, replaced->height });
@@ -8035,7 +8105,7 @@ void main()
                     }
                     if (defer)
                     {
-                        auto depthRecord = [](const DeferredResolve& d) { return d.texture == nullptr; };
+                        auto depthRecord = [](const DeferredResolve& d) { return d.texture == nullptr && !d.borrowed; };
                         if (s_deferredResolves.size() >= kMaxDeferred ||
                             size_t(std::count_if(s_deferredResolves.begin(), s_deferredResolves.end(), depthRecord)) >= kMaxDeferredDepth)
                         {
@@ -8623,6 +8693,11 @@ void main()
         struct FrontRing
         {
             std::array<Image, gpu::kMaxFrontImages> images;
+            // NFSMW_RESOLVE_PRESENT=2: a slot shows a target's image handed
+            // over (external) instead of its own; `current` is the image the
+            // presenter is given for the slot (its own when none is handed over).
+            std::array<SpareTarget, gpu::kMaxFrontImages> external{};
+            std::array<VkImage, gpu::kMaxFrontImages> current{};
             uint32_t width = 0, height = 0;
         };
         FrontRing s_front, s_frontScaled;
@@ -8634,18 +8709,64 @@ void main()
             return v ? std::clamp(std::atoi(v), 1, gpu::kMaxFrontImages) : gpu::kFrontImages;
         }();
 
+        // The slot of `ring` the next swap presents (gpu/front_ring.h): the
+        // presenter neither holds its image nor waits to take it, so its read
+        // of that image is queued already: a hand-over the slot holds goes
+        // back to the spare target images (or stays with the record owing
+        // its guest bytes), and the slot shows its own image again.
+        int ClaimFrontSlot(FrontRing& ring)
+        {
+            std::array<VkImage, gpu::kMaxFrontImages> handles{};
+            for (int i = 0; i < s_frontImages; i++)
+                handles[i] = ring.current[i] ? ring.current[i] : ring.images[i].image;
+            const int slot = video::ClaimFrontImage(handles.data(), s_frontImages);
+            SpareTarget& external = ring.external[size_t(slot)];
+            if (external.image.image)
+            {
+                // A record still owing the image's guest bytes (the frame was
+                // never shown, taken back for a newer one, and the next
+                // resolve into its front buffer hasn't replaced it yet) keeps
+                // the image as its own: it goes to the spares with the record.
+                bool owed = false;
+                for (DeferredResolve& d : s_deferredResolves)
+                    if (d.borrowed && d.image.image == external.image.image)
+                    {
+                        d.borrowed = false;
+                        owed = true;
+                        break;
+                    }
+                if (!owed)
+                    s_spareTargets.push_back(external);
+                external = {};
+            }
+            ring.current[size_t(slot)] = ring.images[size_t(slot)].image;
+            return slot;
+        }
+
         bool ClaimFrontForResolve(uint32_t width, uint32_t height, VkImage& image, VkImageView& view)
         {
             FrontRing& ring = s_front;
             if (ring.width != width || ring.height != height || !ring.images[0].image)
                 return false;
-            std::array<VkImage, gpu::kMaxFrontImages> handles{};
-            for (int i = 0; i < s_frontImages; i++)
-                handles[i] = ring.images[i].image;
-            const Image& front = ring.images[video::ClaimFrontImage(handles.data(), s_frontImages)];
+            const Image& front = ring.images[size_t(ClaimFrontSlot(ring))];
             image = front.image;
             view = front.view;
             return true;
+        }
+
+        int ClaimFrontSlotForHandover(uint32_t width, uint32_t height)
+        {
+            FrontRing& ring = s_front;
+            if (ring.width != width || ring.height != height || !ring.images[0].image)
+                return -1;
+            return ClaimFrontSlot(ring);
+        }
+
+        void HandOverFront(int slot, const Image& image, VkImageView view, VkFormat format, uint32_t width, uint32_t height)
+        {
+            FrontRing& ring = s_front;
+            ring.external[size_t(slot)] = { image, view, format, width, height };
+            ring.current[size_t(slot)] = image.image;
         }
         // The image the last PresentFrontBuffer wrote, for ReadBackFrontImage
         // (the timedemo's shots); null once destroyed.
@@ -8664,14 +8785,23 @@ void main()
         void DestroyFrontImages(FrontRing& ring)
         {
             Flush();
-            for (const Image& front : ring.images)
-                if (front.image)
-                    video::ReleaseFrontImage(front.image);
-            video::WaitGpuIdle();
-            for (Image& front : ring.images)
+            for (size_t i = 0; i < ring.images.size(); i++)
             {
-                if (front.image == s_lastFront.image)
+                if (ring.current[i])
+                    video::ReleaseFrontImage(ring.current[i]);
+                if (ring.images[i].image && ring.images[i].image != ring.current[i])
+                    video::ReleaseFrontImage(ring.images[i].image);
+            }
+            video::WaitGpuIdle();
+            for (size_t i = 0; i < ring.images.size(); i++)
+            {
+                Image& front = ring.images[i];
+                if (front.image == s_lastFront.image || ring.current[i] == s_lastFront.image)
                     s_lastFront = {};
+                if (ring.external[i].image.image)
+                    s_spareTargets.push_back(ring.external[i]);
+                ring.external[i] = {};
+                ring.current[i] = VK_NULL_HANDLE;
                 DestroyImage(front);
             }
             ring.width = ring.height = 0;
@@ -12179,6 +12309,7 @@ void main()
                 image = CreateImage(VK_IMAGE_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM, { outW, outH, 1 }, 1,
                     VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,  // sampled: presenter post-processing
                     VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_COLOR_BIT);
+                ring.current[size_t(i)] = image.image;
                 Begin();
                 ToGeneral(image.image, VK_IMAGE_ASPECT_COLOR_BIT, 1);
             }
@@ -12219,7 +12350,7 @@ void main()
                 as.width == width && as.height == height && as.endian == pc.endian && as.format == pc.format && as.swizzle == pc.swizzle &&
                 s_frontDirect.written && !writewatch::WrittenSince(pc.base, frontBytes, s_frontDirect.written))
                 for (int i = 0; i < s_frontImages; i++)
-                    if (ring.images[i].image == s_frontDirect.image)
+                    if (ring.current[size_t(i)] == s_frontDirect.image)
                         directImage = i;
         }
         s_frontDirect.pending = false;
@@ -12238,10 +12369,7 @@ void main()
         Image* written = nullptr;
         if (directImage < 0)
         {
-            std::array<VkImage, gpu::kMaxFrontImages> handles{};
-            for (int i = 0; i < s_frontImages; i++)
-                handles[i] = ring.images[i].image;
-            Image& front = ring.images[video::ClaimFrontImage(handles.data(), s_frontImages)];
+            Image& front = ring.images[size_t(ClaimFrontSlot(ring))];
             VkDescriptorImageInfo ii{ VK_NULL_HANDLE, front.view, VK_IMAGE_LAYOUT_GENERAL };
             VkDescriptorBufferInfo pool = DummyStorage(s_scaled.pool);
             VkDescriptorBufferInfo table = DummyStorage(s_scaled.table);
@@ -12269,14 +12397,17 @@ void main()
         else
         {
             Image& front = ring.images[directImage];
+            const VkImage shown = ring.current[size_t(directImage)];  // (the resolve's store, or a target's image handed over)
             if (s_profiling)
             {
-                ProfileCompute(std::format("front buffer {}x{} at {:08X}: the resolve's (NFSMW_RESOLVE_PRESENT)", outW, outH, pc.base).c_str());
+                ProfileCompute(std::format("front buffer {}x{} at {:08X}: the resolve's (NFSMW_RESOLVE_PRESENT{})", outW, outH, pc.base,
+                    shown != front.image ? "=2, its target's image" : "").c_str());
                 ProfileComputeEnd();
             }
             SubmitRecorded(7);
-            video::SubmitFrontImage(front.image, outW, outH, width, height);
-            s_lastFront = { front.image, outW, outH };
+            const SpareTarget& ext = ring.external[size_t(directImage)];
+            video::SubmitFrontImage(shown, outW, outH, width, height, ext.image.image ? ext.width : 0, ext.image.image ? ext.height : 0);
+            s_lastFront = { shown, outW, outH };
             written = &front;
         }
         Image& front = *written;
@@ -12335,7 +12466,7 @@ void main()
             region.bufferOffset = at;
             region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
             region.imageExtent = { width, height, 1 };
-            vkCmdCopyImageToBuffer(s_cmd, front.image, VK_IMAGE_LAYOUT_GENERAL, s_ring, 1, &region);
+            vkCmdCopyImageToBuffer(s_cmd, s_lastFront.image, VK_IMAGE_LAYOUT_GENERAL, s_ring, 1, &region);  // (the image shown: a hand-over's too)
             Flush();
             if (FILE* f = fopen(checkPath.c_str(), "wb"))
             {

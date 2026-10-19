@@ -337,7 +337,12 @@ static void TestSources(const char* rendererPath, const char* presenterPath)
     const std::string renderer = ReadStripped(rendererPath);
     const std::string present = Between(renderer, "boolPresentFrontBuffer(", "voidOnSwap(");
     CHECK(!present.empty(), "PresentFrontBuffer not found in %s", rendererPath);
-    const size_t claim = present.find("Image&front=ring.images[video::ClaimFrontImage(handles.data(),s_frontImages)];");
+    // (ClaimFrontSlot: video::ClaimFrontImage over the slots' current images,
+    // and a target's image handed over to the slot recycled, NFSMW_RESOLVE_PRESENT=2.)
+    const size_t claim = present.find("Image&front=ring.images[size_t(ClaimFrontSlot(ring))];");
+    const std::string claimSlot = Between(renderer, "intClaimFrontSlot(FrontRing&ring){", "returnslot;}");
+    CHECK(claimSlot.find("video::ClaimFrontImage(handles.data(),s_frontImages)") != std::string::npos,
+        "ClaimFrontSlot picks the slot with video::ClaimFrontImage");
     const size_t view = present.find("VkDescriptorImageInfoii{VK_NULL_HANDLE,front.view,");
     const size_t dispatch = present.find("vkCmdDispatch(");
     const size_t submit = present.find("SubmitRecorded(7);");

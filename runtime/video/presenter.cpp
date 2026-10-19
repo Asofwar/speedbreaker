@@ -148,6 +148,7 @@ namespace video
         std::vector<uint32_t> s_pending;
         uint32_t s_pendingWidth = 0, s_pendingHeight = 0;
         uint32_t s_pendingAspectW = 0, s_pendingAspectH = 0;  // the frame's shape (0: the image's)
+        uint32_t s_pendingImageW = 0, s_pendingImageH = 0;    // the image's size when larger than the frame (0: the frame's)
         bool s_pendingNew = false;
         // Or a GPU image from the renderer (VK_IMAGE_LAYOUT_GENERAL, written by
         // an earlier queue submission).
@@ -198,7 +199,7 @@ namespace video
         // ReleaseFrontImage), where ClaimFrontImage reads it: the renderer
         // doesn't write the image of the frame the presenter took last.
         VkImage s_lastImage = VK_NULL_HANDLE;
-        uint32_t s_lastWidth = 0, s_lastHeight = 0, s_lastAspectW = 0, s_lastAspectH = 0;
+        uint32_t s_lastWidth = 0, s_lastHeight = 0, s_lastAspectW = 0, s_lastAspectH = 0, s_lastImageW = 0, s_lastImageH = 0;
         // Held from taking the renderer's image until the frame using it is
         // submitted, so ReleaseFrontImage can make it safe to destroy.
         std::mutex s_frontUseMutex;
@@ -1146,7 +1147,7 @@ layout(set = 0, binding = 0) uniform sampler2D src;
 layout(set = 0, binding = 1, rgba8) uniform writeonly image2D dst;
 // band: the 16:9 band's columns x..y and rows z..w (video::BandOf), used
 // when bandOn is 1 (video/band_filter.h).
-layout(push_constant) uniform P { ivec2 size; float subpixel; uint bandOn; ivec4 band; } p;
+layout(push_constant) uniform P { ivec2 size; float subpixel; uint bandOn; ivec4 band; vec2 uvScale; uint copyOnly; uint pad; } p;
 
 const float kEdgeMin = 0.0312;      // no AA on darker contrast than this
 const float kEdgeRelative = 0.125;  // ... or than this fraction of the local maximum
@@ -1160,7 +1161,7 @@ vec3 at(vec2 uv)
 {
     if (p.bandOn != 0u)
         uv = clamp(uv, spanLo, spanHi);
-    return textureLod(src, uv, 0.0).rgb;
+    return textureLod(src, uv * p.uvScale, 0.0).rgb;  // (uvScale: the frame's part of a larger image)
 }
 
 // band_filter.h's SpanOf: [0, lo), [lo, hi) or [hi, size) holding t.
@@ -1183,6 +1184,11 @@ void main()
         spanHi = (vec2(sx.y, sy.y) - 0.5) * texel;
     }
     vec3 center = at(uv);
+    if (p.copyOnly != 0u)
+    {
+        imageStore(dst, pix, vec4(center, 1.0));
+        return;
+    }
     float lM = luma(center);
     float lN = luma(at(uv + vec2(0.0, -texel.y))), lS = luma(at(uv + vec2(0.0, texel.y)));
     float lW = luma(at(uv + vec2(-texel.x, 0.0))), lE = luma(at(uv + vec2(texel.x, 0.0)));
@@ -3686,7 +3692,7 @@ void main()
         // (ReleaseFrontImage waits for it before that image is destroyed).
         std::unique_lock frontLock(s_frontUseMutex);
         std::vector<uint32_t> pixels;
-        uint32_t w = 0, h = 0, aspectW = 0, aspectH = 0;
+        uint32_t w = 0, h = 0, aspectW = 0, aspectH = 0, imageW = 0, imageH = 0;
         VkImage gpuImage = VK_NULL_HANDLE;
         int64_t frameVblank = 0;
         {
@@ -3700,6 +3706,8 @@ void main()
                 h = s_pendingHeight;
                 aspectW = s_pendingAspectW;
                 aspectH = s_pendingAspectH;
+                imageW = s_pendingImageW;
+                imageH = s_pendingImageH;
                 s_pendingNew = false;
                 frameVblank = s_pendingVblank;
                 if (!pixels.empty() || gpuImage)
@@ -3725,6 +3733,8 @@ void main()
             s_lastHeight = h;
             s_lastAspectW = aspectW;
             s_lastAspectH = aspectH;
+            s_lastImageW = imageW;
+            s_lastImageH = imageH;
             s_lastGameFrame = std::chrono::steady_clock::now();
             ui::NoteGameFrame();
         }
@@ -3752,6 +3762,8 @@ void main()
             h = s_lastHeight;
             aspectW = s_lastAspectW;
             aspectH = s_lastAspectH;
+            imageW = s_lastImageW;
+            imageH = s_lastImageH;
             if (!gpuImage && !(s_source && s_sourceWidth == w && s_sourceHeight == h))
                 w = h = 0;
         }
@@ -4034,7 +4046,12 @@ void main()
                     f.timed = true;
                 }
 
-                if (AaEnabled())
+                // An image larger than the frame (NFSMW_RESOLVE_PRESENT=2:
+                // a render target's): the AA pass samples its frame part;
+                // with the AA off it copies that part, so the passes after
+                // see a frame-sized image as always.
+                const bool oversized = gpuImage && ((imageW && imageW != w) || (imageH && imageH != h));
+                if (AaEnabled() || oversized)
                 {
                     EnsureAaImage(w, h);
                     Barrier(cmd, s_post.aaImage, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_READ_BIT,
@@ -4051,8 +4068,11 @@ void main()
                         float subpixel;
                         uint32_t bandOn;
                         int32_t band[4];
-                    } pc = { int32_t(w), int32_t(h), 0.5f, bandOn ? 1u : 0u, { band.x0, band.x1, band.y0, band.y1 } };
-                    static_assert(sizeof(pc) == 32);
+                        float uvScale[2];
+                        uint32_t copyOnly, pad;
+                    } pc = { int32_t(w), int32_t(h), 0.5f, bandOn ? 1u : 0u, { band.x0, band.x1, band.y0, band.y1 },
+                        { imageW ? float(w) / float(imageW) : 1.0f, imageH ? float(h) / float(imageH) : 1.0f }, AaEnabled() ? 0u : 1u, 0u };
+                    static_assert(sizeof(pc) == 48);
                     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_post.aa);
                     s_post.pushDescriptorSet(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_post.aaLayout, 0, 2, writes);
                     vkCmdPushConstants(cmd, s_post.aaLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
@@ -4428,7 +4448,8 @@ void main()
         return true;
     }
 
-    void SubmitFrontImage(VkImage image, uint32_t width, uint32_t height, uint32_t aspectWidth, uint32_t aspectHeight)
+    void SubmitFrontImage(VkImage image, uint32_t width, uint32_t height, uint32_t aspectWidth, uint32_t aspectHeight,
+        uint32_t imageWidth, uint32_t imageHeight)
     {
         if (!s_window)
             return;
@@ -4441,6 +4462,8 @@ void main()
         s_pendingHeight = height;
         s_pendingAspectW = aspectWidth;
         s_pendingAspectH = aspectHeight;
+        s_pendingImageW = imageWidth;
+        s_pendingImageH = imageHeight;
         s_pendingNew = true;
         s_pendingVblank = s_guestVblank.load(std::memory_order_relaxed);
         s_pendingSerial = ++s_frontSerial;

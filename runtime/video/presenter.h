@@ -27,7 +27,11 @@ namespace video
     // written by a queue submission made before this call. `aspectWidth` x
     // `aspectHeight`: the frame's shape when the image is at another
     // resolution (internal resolution scaling; 0: the image's own).
-    void SubmitFrontImage(VkImage image, uint32_t width, uint32_t height, uint32_t aspectWidth = 0, uint32_t aspectHeight = 0);
+    // imageWidth x imageHeight: the image's own size when it is larger than
+    // the frame (NFSMW_RESOLVE_PRESENT=2 hands over a render target's
+    // image, taller than the frame): the frame is its top-left part.
+    void SubmitFrontImage(VkImage image, uint32_t width, uint32_t height, uint32_t aspectWidth = 0, uint32_t aspectHeight = 0,
+        uint32_t imageWidth = 0, uint32_t imageHeight = 0);
 
     // Any thread (the renderer), before it records a write of one of its
     // front images: the index of the one of `images` (a ring, `count` of
