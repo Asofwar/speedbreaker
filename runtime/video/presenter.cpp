@@ -1253,6 +1253,121 @@ void main()
 }
 )";
 
+        // NFSMW_AA_LDS=1: kAaCs with each 16x16 tile's source texels (and a
+        // 1-texel border) loaded into shared memory once, its neighbours read
+        // from there: 324 fetches a tile for the 3x3 lumas instead of 5-9 a
+        // pixel. The edge walk and the final sample are kAaCs's fetches. The
+        // same picture: the neighbours are the texels kAaCs's fetches at
+        // their centres return, clamped to the pixel's spans as at() clamps.
+        const char* kAaLdsCs = R"(#version 460
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 0) uniform sampler2D src;
+layout(set = 0, binding = 1, rgba8) uniform writeonly image2D dst;
+layout(push_constant) uniform P { ivec2 size; float subpixel; uint bandOn; ivec4 band; vec2 uvScale; uint copyOnly; uint pad; } p;
+
+const float kEdgeMin = 0.0312;
+const float kEdgeRelative = 0.125;
+const int L = 18;  // the tile and its border
+shared vec3 s_rgb[L * L];
+shared float s_luma[L * L];
+
+vec2 spanLo = vec2(0.0), spanHi = vec2(1.0);
+float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+vec3 at(vec2 uv)
+{
+    if (p.bandOn != 0u)
+        uv = clamp(uv, spanLo, spanHi);
+    return textureLod(src, uv * p.uvScale, 0.0).rgb;
+}
+vec2 spanOf(float t, int lo, int hi, int size)
+{
+    return t < float(lo) ? vec2(0.0, float(lo)) : t < float(hi) ? vec2(float(lo), float(hi)) : vec2(float(hi), float(size));
+}
+
+void main()
+{
+    const ivec2 origin = ivec2(gl_WorkGroupID.xy) * 16 - 1;
+    const vec2 texel = 1.0 / vec2(p.size);
+    for (uint i = gl_LocalInvocationIndex; i < uint(L * L); i += 256u)
+    {
+        ivec2 t = origin + ivec2(int(i) % L, int(i) / L);
+        vec3 c = textureLod(src, (vec2(t) + 0.5) * texel * p.uvScale, 0.0).rgb;
+        s_rgb[i] = c;
+        s_luma[i] = luma(c);
+    }
+    barrier();
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy);
+    if (pix.x >= p.size.x || pix.y >= p.size.y)
+        return;
+    vec2 uv = (vec2(pix) + 0.5) * texel;
+    ivec4 span = ivec4(-1 << 20, 1 << 20, -1 << 20, 1 << 20);
+    if (p.bandOn != 0u)
+    {
+        vec2 sx = spanOf(float(pix.x) + 0.5, p.band.x, p.band.y, p.size.x), sy = spanOf(float(pix.y) + 0.5, p.band.z, p.band.w, p.size.y);
+        spanLo = (vec2(sx.x, sy.x) + 0.5) * texel;
+        spanHi = (vec2(sx.y, sy.y) - 0.5) * texel;
+        span = ivec4(int(sx.x), int(sx.y), int(sy.x), int(sy.y));
+    }
+    #define NB(dx, dy) ((clamp(pix.y + (dy), span.z, span.w - 1) - origin.y) * L + clamp(pix.x + (dx), span.x, span.y - 1) - origin.x)
+    vec3 center = s_rgb[NB(0, 0)];
+    if (p.copyOnly != 0u)
+    {
+        imageStore(dst, pix, vec4(center, 1.0));
+        return;
+    }
+    float lM = s_luma[NB(0, 0)];
+    float lN = s_luma[NB(0, -1)], lS = s_luma[NB(0, 1)];
+    float lW = s_luma[NB(-1, 0)], lE = s_luma[NB(1, 0)];
+    float lMin = min(lM, min(min(lN, lS), min(lW, lE)));
+    float lMax = max(lM, max(max(lN, lS), max(lW, lE)));
+    float range = lMax - lMin;
+    if (range < max(kEdgeMin, lMax * kEdgeRelative))
+    {
+        imageStore(dst, pix, vec4(center, 1.0));
+        return;
+    }
+    float lNW = s_luma[NB(-1, -1)], lSE = s_luma[NB(1, 1)];
+    float lNE = s_luma[NB(1, -1)], lSW = s_luma[NB(-1, 1)];
+    #undef NB
+    float acrossRows = abs(lNW + lSW - 2.0 * lW) + 2.0 * abs(lN + lS - 2.0 * lM) + abs(lNE + lSE - 2.0 * lE);
+    float acrossColumns = abs(lNW + lNE - 2.0 * lN) + 2.0 * abs(lW + lE - 2.0 * lM) + abs(lSW + lSE - 2.0 * lS);
+    bool horizontal = acrossRows >= acrossColumns;
+    float lBefore = horizontal ? lN : lW, lAfter = horizontal ? lS : lE;
+    float gBefore = abs(lBefore - lM), gAfter = abs(lAfter - lM);
+    bool before = gBefore >= gAfter;
+    float threshold = 0.25 * max(gBefore, gAfter);
+    float step = horizontal ? texel.y : texel.x;
+    float edgeLuma = 0.5 * ((before ? lBefore : lAfter) + lM);
+    if (before)
+        step = -step;
+    vec2 onEdge = uv;
+    if (horizontal) onEdge.y += 0.5 * step; else onEdge.x += 0.5 * step;
+    vec2 along = horizontal ? vec2(texel.x, 0.0) : vec2(0.0, texel.y);
+    vec2 uvA = onEdge - along, uvB = onEdge + along;
+    float dA = luma(at(uvA)) - edgeLuma, dB = luma(at(uvB)) - edgeLuma;
+    bool endA = abs(dA) >= threshold, endB = abs(dB) >= threshold;
+    const float strides[10] = float[](1.0, 1.0, 1.0, 1.5, 2.0, 2.0, 2.0, 2.0, 4.0, 8.0);
+    for (int i = 0; i < 10 && !(endA && endB); i++)
+    {
+        if (!endA) { uvA -= along * strides[i]; dA = luma(at(uvA)) - edgeLuma; endA = abs(dA) >= threshold; }
+        if (!endB) { uvB += along * strides[i]; dB = luma(at(uvB)) - edgeLuma; endB = abs(dB) >= threshold; }
+    }
+    float distA = horizontal ? uv.x - uvA.x : uv.y - uvA.y;
+    float distB = horizontal ? uvB.x - uv.x : uvB.y - uv.y;
+    bool nearerA = distA < distB;
+    float offset = 0.5 - min(distA, distB) / (distA + distB);
+    if (((nearerA ? dA : dB) < 0.0) == (lM < edgeLuma))
+        offset = 0.0;
+    float average = (2.0 * (lN + lS + lW + lE) + lNW + lNE + lSW + lSE) / 12.0;
+    float sub = clamp(abs(average - lM) / range, 0.0, 1.0);
+    sub = (3.0 - 2.0 * sub) * sub * sub;
+    offset = max(offset, sub * sub * p.subpixel);
+    vec2 sampleUv = uv;
+    if (horizontal) sampleUv.y += offset * step; else sampleUv.x += offset * step;
+    imageStore(dst, pix, vec4(at(sampleUv), 1.0));
+}
+)";
+
         const char* kScaleFs = R"(#version 460
 layout(location = 0) in vec2 uv;
 layout(location = 0) out vec4 color;
@@ -1546,6 +1661,7 @@ void main()
             VkDeviceMemory aaMemory = VK_NULL_HANDLE;
             VkImageView aaView = VK_NULL_HANDLE;
             uint32_t aaWidth = 0, aaHeight = 0;
+            uint32_t aaGroup = 8;  // the AA pass's group size (NFSMW_AA_LDS: 16)
         } s_post;
         // Read every frame: the settings menu changes them live.
         bool AaEnabled() { return settings::GetBool(settings::Id::AntiAliasing); }
@@ -1672,7 +1788,10 @@ void main()
             plci.pPushConstantRanges = &scaleRange;
             vkCreatePipelineLayout(s_device, &plci, nullptr, &s_post.scaleLayout);
 
-            VkShaderModule cs = PostModule(kAaCs, 2);
+            // NFSMW_AA_LDS=1: kAaLdsCs (16x16 groups) in its place.
+            static const bool aaLds = [] { const char* v = std::getenv("NFSMW_AA_LDS"); return v && v[0] == '1'; }();
+            s_post.aaGroup = aaLds ? 16u : 8u;
+            VkShaderModule cs = PostModule(aaLds ? kAaLdsCs : kAaCs, 2);
             s_post.vs = PostModule(kFullscreenVs, 0);
             s_post.fs = PostModule(ScaleSource().c_str(), 1);
             if (!cs || !s_post.vs || !s_post.fs)
@@ -4135,7 +4254,7 @@ void main()
                     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_post.aa);
                     s_post.pushDescriptorSet(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, s_post.aaLayout, 0, 2, writes);
                     vkCmdPushConstants(cmd, s_post.aaLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-                    vkCmdDispatch(cmd, (w + 7) / 8, (h + 7) / 8, 1);
+                    vkCmdDispatch(cmd, (w + s_post.aaGroup - 1) / s_post.aaGroup, (h + s_post.aaGroup - 1) / s_post.aaGroup, 1);
                     Barrier(cmd, s_post.aaImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT,
                         VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
                     scaleInput = s_post.aaView;
