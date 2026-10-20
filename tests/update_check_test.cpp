@@ -61,8 +61,8 @@ static void Versions()
 // A release as GitHub's API returns it (abridged), with members named like
 // ours in nested objects that must not be read.
 static const char kRelease[] = R"({
-  "url": "https://api.github.com/repos/SpeedBreakerProject/speedbreaker/releases/1",
-  "html_url": "https://github.com/SpeedBreakerProject/speedbreaker/releases/tag/v0.1.2",
+  "url": "https://api.github.com/repos/Asofwar/speedbreaker-hle/releases/1",
+  "html_url": "https://github.com/Asofwar/speedbreaker-hle/releases/tag/v0.1.2",
   "id": 255474781, "size": -1.5e+3, "zero": 0, "frac": 0.25, "neg": -0,
   "author": { "login": "x", "name": "not the release", "tag_name": "v9.9.9", "site_admin": false },
   "tag_name": "v0.1.2",
@@ -81,7 +81,7 @@ static void Json()
     std::string error;
     CHECK(ParseRelease(kRelease, r, error), "the release: %s", error.c_str());
     CHECK(r.hasTag && r.tag == "v0.1.2", "tag: '%s' (not the nested one)", r.tag.c_str());
-    CHECK(r.url == "https://github.com/SpeedBreakerProject/speedbreaker/releases/tag/v0.1.2", "html_url: '%s'", r.url.c_str());
+    CHECK(r.url == "https://github.com/Asofwar/speedbreaker-hle/releases/tag/v0.1.2", "html_url: '%s'", r.url.c_str());
     CHECK(r.name == "SpeedBreaker v0.1.2 \xE2\x80\x94 \"Rockport\" \xF0\x9F\x8F\x8E", "name, \\u escapes and a surrogate pair: '%s'",
         r.name.c_str());
     CHECK(r.body == "## What's new\r\n\r\n- Caf\xC3\xA9 \\ path/x\ttab\n- r\xC3\xA9sum\xC3\xA9 \xE2\x82\xAC" "10 \xF0\x9F\x98\x80\nend",
@@ -335,7 +335,7 @@ static Fetched Answer(int status, std::string body, std::vector<std::pair<std::s
 static std::string ReleaseJson(const char* tag, const char* extra = "")
 {
     return std::string(R"({"tag_name":")") + tag +
-           R"(","name":"SpeedBreaker )" + tag + R"(","html_url":"https://github.com/SpeedBreakerProject/speedbreaker/releases/tag/)" + tag +
+           R"(","name":"SpeedBreaker )" + tag + R"(","html_url":"https://github.com/Asofwar/speedbreaker-hle/releases/tag/)" + tag +
            R"(","body":"### Fixed\n- Shadows","draft":false,"prerelease":false)" + extra + "}";
 }
 
@@ -349,9 +349,9 @@ static void Outcomes()
     r = Evaluate(Answer(200, ReleaseJson("v0.1.2")), "0.1.1", now);
     CHECK(r.outcome == Outcome::Available && r.headline == "v0.1.2 is available" && r.message == "You have v0.1.1.", "available: '%s' '%s'",
         r.headline.c_str(), r.message.c_str());
-    CHECK(r.url == "https://github.com/SpeedBreakerProject/speedbreaker/releases/tag/v0.1.2" && r.name == "SpeedBreaker v0.1.2", "page, name");
+    CHECK(r.url == "https://github.com/Asofwar/speedbreaker-hle/releases/tag/v0.1.2" && r.name == "SpeedBreaker v0.1.2", "page, name");
     CHECK(Dump(r.notes) == "H:Fixed|B:Shadows|", "notes: %s", Dump(r.notes).c_str());
-    CHECK(r.log == "v0.1.2 is available (running v0.1.1): https://github.com/SpeedBreakerProject/speedbreaker/releases/tag/v0.1.2", "log: '%s'",
+    CHECK(r.log == "v0.1.2 is available (running v0.1.1): https://github.com/Asofwar/speedbreaker-hle/releases/tag/v0.1.2", "log: '%s'",
         r.log.c_str());
 
     r = Evaluate(Answer(200, ReleaseJson("v0.1.0")), "0.0.9", now);
@@ -375,17 +375,17 @@ static void Outcomes()
     // The download page: only this project's releases.
     r = Evaluate(Answer(200, R"({"tag_name":"v0.9.0","html_url":"https://evil.example/releases/"})"), "0.1.1", now);
     CHECK(r.url == kReleasesPage, "another site: '%s'", r.url.c_str());
-    for (const char* bad : { "javascript:alert(1)", "https://github.com/SpeedBreakerProject/speedbreakerx/releases/tag/v1",
-             "https://github.com/SpeedBreakerProject/speedbreaker/releases/", "https://github.com/SpeedBreakerProject/speedbreaker/releases/../../x",
-             "https://github.com/SpeedBreakerProject/speedbreaker/releases/tag/v1 x", "https://github.com/SpeedBreakerProject/speedbreaker/releases/tag/\"x",
-             "https://github.com/SpeedBreakerProject/speedbreaker/releases/tag/\xC3\xA9", "" })
+    for (const char* bad : { "javascript:alert(1)", "https://github.com/Asofwar/speedbreaker-hlex/releases/tag/v1", "https://github.com/SpeedBreakerProject/speedbreaker/releases/tag/v1",
+             "https://github.com/Asofwar/speedbreaker-hle/releases/", "https://github.com/Asofwar/speedbreaker-hle/releases/../../x",
+             "https://github.com/Asofwar/speedbreaker-hle/releases/tag/v1 x", "https://github.com/Asofwar/speedbreaker-hle/releases/tag/\"x",
+             "https://github.com/Asofwar/speedbreaker-hle/releases/tag/\xC3\xA9", "" })
         CHECK(SafePageUrl(bad) == kReleasesPage, "'%s' isn't used", bad);
-    CHECK(SafePageUrl("https://github.com/SpeedBreakerProject/speedbreaker/releases/tag/v0.1.2") ==
-              "https://github.com/SpeedBreakerProject/speedbreaker/releases/tag/v0.1.2",
+    CHECK(SafePageUrl("https://github.com/Asofwar/speedbreaker-hle/releases/tag/v0.1.2") ==
+              "https://github.com/Asofwar/speedbreaker-hle/releases/tag/v0.1.2",
         "the release's page is");
     // Escapes of a dot, a slash, a backslash or '%' lead elsewhere once the
     // browser (or the server) decodes them: releases/%2e%2e/%2e%2e/x is
-    // github.com/SpeedBreakerProject/x. Never used, nor a broken escape, a
+    // github.com/Asofwar/x. Never used, nor a broken escape, a
     // control character or a byte outside ASCII.
     const std::string page = kPagePrefix;
     for (const char* bad : { "%2e%2e/%2e%2e/x", "%2E%2E/%2E%2E/x", ".%2e/.%2e/x", "%2e./x", "tag%2f..%2f..%2fx", "tag%2F..%2F..%2Fx",
@@ -394,7 +394,7 @@ static void Outcomes()
         CHECK(SafePageUrl(page + bad) == kReleasesPage, "'%s' isn't used", (page + bad).c_str());
     CHECK(SafePageUrl(page + "tag/v1.0.0%2Bbuild.5") == page + "tag/v1.0.0%2Bbuild.5", "an escaped '+' (build metadata) is");
     CHECK(SafePageUrl(page + "tag/v1.0.0+build.5") == page + "tag/v1.0.0+build.5", "so is a plain one");
-    r = Evaluate(Answer(200, R"({"tag_name":"v0.9.0","html_url":"https://github.com/SpeedBreakerProject/speedbreaker/releases/%2e%2e/%2e%2e/x"})"),
+    r = Evaluate(Answer(200, R"({"tag_name":"v0.9.0","html_url":"https://github.com/Asofwar/speedbreaker-hle/releases/%2e%2e/%2e%2e/x"})"),
         "0.1.1", now);
     CHECK(r.outcome == Outcome::Available && r.url == kReleasesPage, "a forged answer's escaped dots: '%s'", r.url.c_str());
 

@@ -174,6 +174,8 @@ namespace update
     {
         static const std::string version = [] {
             std::string v = report::Version();
+            if (!v.empty() && v.find('-') == std::string::npos)
+                v += std::string("-") + kForkRevision;  // (the HLE fork's builds: see kForkRevision)
             if (const char* test = std::getenv("NFSMW_TEST_VERSION"); test && *test)
             {
                 Semver parsed;

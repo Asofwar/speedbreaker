@@ -22,12 +22,21 @@
 
 namespace update
 {
-    // GitHub's newest release that is neither a draft nor a pre-release.
-    inline constexpr const char kApiUrl[] = "https://api.github.com/repos/SpeedBreakerProject/speedbreaker/releases/latest";
+    // GitHub's newest release that is neither a draft nor a pre-release: the
+    // HLE fork's (its builds update to its own releases, not the original
+    // project's, which have none of its renderer work).
+    inline constexpr const char kApiUrl[] = "https://api.github.com/repos/Asofwar/speedbreaker-hle/releases/latest";
     // Where "Open download page" goes when the answer names no page of this
     // project's releases.
-    inline constexpr const char kReleasesPage[] = "https://github.com/SpeedBreakerProject/speedbreaker/releases/latest";
-    inline constexpr const char kPagePrefix[] = "https://github.com/SpeedBreakerProject/speedbreaker/releases/";
+    inline constexpr const char kReleasesPage[] = "https://github.com/Asofwar/speedbreaker-hle/releases/latest";
+    inline constexpr const char kPagePrefix[] = "https://github.com/Asofwar/speedbreaker-hle/releases/";
+    // The fork's revision of the original version it is built on: the running
+    // version is "<version>-<kForkRevision>" ("0.1.7-hle.1"), its release tag
+    // "v0.1.7-hle.1" (scripts/steamos/release_hle.sh checks). Semantic
+    // Versioning orders them: 0.1.7-hle.1 < 0.1.7-hle.2 < 0.1.8-hle.1. Raise it
+    // with each fork release on the same original version; back to "hle.1"
+    // on a new one.
+    inline constexpr const char kForkRevision[] = "hle.1";
     // The whole exchange, connecting included.
     inline constexpr double kTimeoutSeconds = 10.0;
     // A release's JSON is a few KB (its notes are at most 125,000 characters).

@@ -28,6 +28,8 @@ cd "$(dirname "$0")/../.."
 ROOT="$PWD"
 VERSION="$(sed -n 's/^CMAKE_PROJECT_VERSION:STATIC=//p' "$BUILD/CMakeCache.txt")"
 [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "release_hle.sh: no version in $BUILD/CMakeCache.txt" >&2; exit 1; }
+FORK="$(sed -n 's/.*kForkRevision\[\] = "\(.*\)";.*/\1/p' runtime/update/check.h)"
+[ "$TAG" = "v$VERSION-$FORK" ] || { echo "release_hle.sh: the tag must be v$VERSION-$FORK (runtime/update/check.h's kForkRevision), not $TAG" >&2; exit 1; }
 OUT="$ROOT/dist/$TAG"
 rm -rf "$OUT"
 mkdir -p "$OUT/up"
