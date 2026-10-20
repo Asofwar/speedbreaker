@@ -129,7 +129,7 @@ should say OK. What changed in each release is in [CHANGELOG.md](CHANGELOG.md).
 
 - **Everyone:** a disc image of your own **USA (NTSC-U) Xbox 360 disc** (see
   [Quick start](#quick-start)), about **7.2 GB** of free space, and a display running at about
-  **60 Hz**.
+  **60 Hz** (or 120 Hz, 180 Hz or 240 Hz on SteamOS and Linux).
 - **Steam Deck, Steam Machine and Linux PCs** (the x86-64 SteamOS download): a 64-bit x86 CPU
   with AVX2 (x86-64-v3): Intel Haswell (2013) or newer, or AMD Excavator, Zen or newer. A
   Vulkan 1.2 graphics card.
@@ -202,7 +202,9 @@ should say OK. What changed in each release is in [CHANGELOG.md](CHANGELOG.md).
    formatted by SteamOS, or Game Mode won't find the game.
 5. **Check the screen settings.**
    - **Steam Deck OLED: set the refresh rate to 60 Hz** (Quick Access > Performance). At 90 Hz
-     the game stutters. On any Deck, leave the Framerate Limit off.
+     the game stutters, and since v0.1.7 a note says so, once, the first time it runs at 90 Hz.
+     Turn on Steam's per-game profile there and it keeps 60 Hz for this game. On any Deck, leave
+     the Framerate Limit off.
    - **Docked, or on a Steam Machine:** in the shortcut's Properties > General > Game
      Resolution, choose **Native**.
    - The picture fills the Deck's 16:10 screen, with a slightly taller view and the HUD kept at
@@ -440,6 +442,11 @@ online, and only when you press it). The page also shows which build you're runn
 
 - **Run your display at 60 Hz.** On a Steam Deck OLED, set the refresh rate to 60 Hz and leave
   Steam's Framerate Limit off.
+- **A 120 Hz monitor works too** on SteamOS and Linux (and 180 or 240 Hz): since v0.1.7 each frame
+  stays on screen for two refreshes (three or four), evenly. That was tested on simulated 120,
+  180 and 240 Hz screens, not yet on a real one: a report from yours would help. 90, 144 and
+  165 Hz can't show 60 fps evenly; the game says so once, and 60 or 120 Hz (or variable refresh)
+  is smooth.
 - **MacBook Pro with a 120 Hz (ProMotion) screen:** since v0.1.4 SpeedBreaker asks for each frame
   to reach the screen 1/60 s after the last. Measured in fullscreen on an M1 Pro: 99.9% of frames
   in menus and about 94% while driving (fewer in the heaviest scenes). Other screens show frames
@@ -498,7 +505,8 @@ Security (see [Mac setup](#mac)), again after each update. SpeedBreaker needs ma
 or later on Apple silicon.
 
 **The game stutters on my Steam Deck OLED.** Set the screen to 60 Hz (see
-[Steam Deck setup](#steam-deck-and-steam-machine)).
+[Steam Deck setup](#steam-deck-and-steam-machine)); with Steam's per-game profile on, it stays at
+60 Hz for this game.
 
 **My laptop runs the game on the slow built-in graphics.** Since v0.1.2 SpeedBreaker is meant to
 pick the dedicated GPU by itself (not yet confirmed on a real two-GPU laptop). If it doesn't, see
@@ -559,7 +567,7 @@ SpeedBreaker folder instead: `data/`, `data/game` and `cache/`.
 2. A notice says where the zip file went: your **Desktop** (on SteamOS, pick it up in Desktop
    Mode, or in the Desktop app on a Steam Frame), the **SpeedBreaker** folder in the Files app on
    iPhone and iPad, or the data folder above when there is no Desktop. Its name says which
-   version you were running, for example `speedbreaker-bug-report-v0.1.6-<date>_<time>.zip`.
+   version you were running, for example `speedbreaker-bug-report-v0.1.7-<date>_<time>.zip`.
 3. Open an [issue][issues], attach the zip, and say what you were doing, what you expected, what
    happened, and roughly how long into the session it happened.
 
@@ -596,7 +604,8 @@ native program for x86-64 or arm64. A runtime written for this project stands in
 - **Resolution:** the 3D scene renders at 1x, 1.5x, 2x or 3x; the bloom and haze stay at the original
   resolution, so the game keeps its colour grade.
 - **Frame pacing:** the game's clock locks to the display's measured refresh (58.5 to 61.5 Hz),
-  one game step per refresh. 30 fps runs two game steps per frame. On a Mac the clock's thread
+  one game step per refresh, or on SteamOS and Linux to every 2nd, 3rd or 4th refresh of a 120,
+  180 or 240 Hz display. 30 fps runs two game steps per frame. On a Mac the clock's thread
   runs with real-time priority, and on a 120 Hz ProMotion screen each frame is shown at a set time
   after its tick (turned off for the session if the screen doesn't keep those times).
 - **Sun glare:** the game measures the sun with occlusion queries; SpeedBreaker counts them on

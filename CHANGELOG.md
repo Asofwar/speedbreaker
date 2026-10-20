@@ -4,6 +4,40 @@ What changed in each SpeedBreaker release, newest first. Each release's notes on
 its entry here, and the game shows the entry once, the first time a new version starts (offline:
 it's built into the game).
 
+## v0.1.7
+
+### What's new
+
+- Smoother on 120 Hz screens on SteamOS and Linux, and on 180 and 240 Hz ones: each frame now
+  stays on screen for exactly two refreshes (three at 180 Hz, four at 240 Hz), as a 60 Hz screen
+  shows each for one. Until now some frames stayed for one refresh and the next for three,
+  a small, uneven stutter that came and went. Macs are unchanged.
+- A note, once, when your screen runs at a rate 60 frames a second can't share evenly (90 Hz on a
+  Steam Deck OLED, 144 or 165 Hz monitors), which makes motion stutter: it says how to set the
+  screen to 60 Hz or 120 Hz, or to turn on variable refresh. It waits for a menu or a pause rather
+  than coming up mid-race, pauses the game while it's open, and doesn't come back for that rate
+  once closed. It never shows with variable refresh, nor on a Mac's ProMotion screen.
+
+### More about it
+
+- Tested on simulated 120, 180 and 240 Hz screens (a nested gamescope session on a Steam Machine,
+  whose own TV tops out at 60 Hz): 99.9% or more of frames shown evenly, against 77-88% at 120 and
+  240 Hz before. Not yet on a real 120 Hz panel: a report from yours would help.
+- Each frame reaches a 120 Hz screen about as soon as it did in v0.1.6, now evenly. While frames
+  take longer (loading, a heavy scene), each is shown a refresh or two later, evenly, rather than
+  some on time and some late.
+- As at 60 Hz, this needs a graphics driver that reports when each frame reaches the screen
+  (Vulkan's present wait); the log's "[vblank] locked to every 2nd refresh" line says it took.
+  With variable refresh on, the game leaves the screen to follow its frames, as before.
+  NFSMW_REFRESH_MULTIPLE=0 brings back v0.1.6's behaviour.
+- The note's words are in the log too ("[video] refresh notice"), and NFSMW_REFRESH_NOTICE=0 turns
+  it off. Where your screen's rate is recorded once the note is closed: settings.toml's [app]
+  refresh_notices. On a Steam Deck it points to Quick Access > Performance; the names of Steam's
+  settings in it haven't been checked on a Deck yet.
+- Updating keeps your saves, settings and the installed game, and needs no disc image: on a Mac,
+  drag the new app into Applications and choose Replace, then Open Anyway once more; on SteamOS,
+  unpack the new download over the old folder.
+
 ## v0.1.6
 
 ### What's new

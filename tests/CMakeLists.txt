@@ -157,7 +157,16 @@ sb_test(scale_budget_test SOURCES ${RT}/video/scale_budget.cpp ${RT}/video/pictu
 # tone shader's wrapping of the scale shaders, settings.cpp for the two
 # options' defaults (Xbox 360 Display Gamma on since v0.1.4).
 sb_test(display_tone_test ARGS ${RT}/video/presenter.cpp ${RT}/user/settings.cpp)
+# The display's refresh measured from present completions, at 60 Hz and at
+# whole multiples of it (video/refresh_fit.cpp, video/refresh_multiple.h).
 sb_test(refresh_fit_test SOURCES ${RT}/video/refresh_fit.cpp)
+# The one-time notice on a screen whose rate 60 fps can't divide evenly (90,
+# 144, 165 Hz): when it shows (variable refresh, Game Mode, a Mac's ProMotion,
+# dismissed, the moment), its words, the grid check under it, and the
+# dismissal in settings.toml, in a scratch folder (video/refresh_notice.h,
+# user/settings.cpp).
+sb_test(refresh_notice_test SOURCES ${RT}/video/refresh_fit.cpp ${RT}/user/settings.cpp
+    ARGS ${CMAKE_CURRENT_BINARY_DIR}/refresh_notice_scratch)
 # How late the guest vblank's thread wakes on this machine, alone and with
 # every core busy (video/vblank_timer.cpp; checked on macOS, where its
 # scheduling changed in v0.1.4). Its thresholds (1.5 ms in 99% of vblanks,
@@ -385,3 +394,9 @@ endif()
 # The guest vblank lock's closed-loop simulation (a tool more than a test).
 add_executable(vblank_lock_sim ${CMAKE_CURRENT_SOURCE_DIR}/vblank_lock_sim.cpp ${RT}/video/refresh_fit.cpp ${RT}/video/vblank_lock.cpp)
 target_include_directories(vblank_lock_sim PRIVATE ${RT})
+target_compile_options(vblank_lock_sim PRIVATE -O2 -UNDEBUG)
+# Its displays at a whole multiple of 60 Hz (120, 180, 240: every 2nd-4th
+# refresh, frames held for theirs), the rates that aren't, variable refresh,
+# Frame Rate 30, Windows' late vblank wake-ups, and planted faults (about 40 s;
+# the 60 Hz tables, a minute and a half, by hand).
+add_test(NAME vblank_lock_sim_multiples COMMAND vblank_lock_sim --multiples)

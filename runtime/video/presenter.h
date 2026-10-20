@@ -78,9 +78,10 @@ namespace video
     void NoteGuestVblank(int64_t t);
     // Any thread: guest vblanks so far, and when the last one fired.
     uint64_t GuestVblanks();
-    // Display refreshes per guest vblank: 1, or 2 at Frame Rate 30 (the
-    // game then shows a frame every other refresh, and each guest vblank
-    // is two world steps: game/frame_time.cpp).
+    // Lock periods (1/60 s, VblankLock::PeriodNs: one refresh at 60 Hz, two
+    // at 120 Hz) per guest vblank: 1, or 2 at Frame Rate 30 (the game then
+    // shows a frame every other period, and each guest vblank is two world
+    // steps: game/frame_time.cpp).
     int GuestVblankDivider();
     int64_t LastGuestVblank();
 

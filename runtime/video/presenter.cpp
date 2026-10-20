@@ -9,6 +9,7 @@
 #include <apu/audio.h>
 #include <gpu/renderer.h>
 #include <game/ultrawide.h>
+#include <game/movie_pacing.h>
 #include "gpu_choice.h"
 #include "present_schedule.h"
 #include "swapchain_use.h"
@@ -19,6 +20,8 @@
 #include <cpu/guest_thread.h>
 #include <cpu/guest_time.h>
 #include "vblank_lock.h"
+#include "refresh_multiple.h"
+#include "refresh_notice.h"
 #include "display_tone.h"
 #include "fsr1.h"
 #include "upscale.h"
@@ -473,6 +476,7 @@ namespace video
             uint64_t swapchain;  // its generation (s_swapchainUse)
             int64_t presented;  // vkQueuePresentKHR (ns, steady clock)
             int64_t vblank;     // a new game frame: the guest vblank it followed; 0: a redraw
+            int64_t ready;      // ready to present (= presented, but for a frame held for its refresh: VblankLock::PresentAt)
         };
         // Never destroyed: the waiter is detached and blocks on them, and
         // glibc's pthread_cond_destroy waits for blocked waiters, so an exit
@@ -485,6 +489,17 @@ namespace video
         SwapchainUse<VkSwapchainKHR>& s_swapchainUse = *new SwapchainUse<VkSwapchainKHR>;
         uint64_t s_swapchainGeneration = 0;
         FILE* s_timingLog = nullptr;          // NFSMW_VBLANK_LOG=<file>: one CSV line per present
+        // Display refreshes per 60 Hz guest vblank the fit should expect: the
+        // display mode's rate over 60 where that is 2-4 (video/refresh_multiple.h),
+        // else 1. Set by the main thread (UpdateRefreshMultiple), read by the
+        // waiter, which owns the fit.
+        std::atomic<int> s_refreshMultiple{ 1 };
+        // The refresh-rate notice's grid check (video/refresh_notice.h): the
+        // mode's rate when it is no whole multiple of 60 Hz (0: no check;
+        // main thread sets it), and whether the waiter's grid fit takes the
+        // present completions at it, since when (ns, steady clock; 0: not).
+        std::atomic<double> s_gridHz{ 0.0 };
+        std::atomic<int64_t> s_gridFixedSince{ 0 };
 
         // macOS: a new frame may be shown a set time after the guest vblank
         // that released it (VK_GOOGLE_display_timing's desiredPresentTime,
@@ -610,16 +625,43 @@ namespace video
             static RefreshFit& refresh = *new RefreshFit;  // never destroyed either (the waiter may be in it at exit)
             static int64_t lastOnScreen = 0, lastVblank = 0;
             VblankLock& vblank = GuestVblank();
+            // A new multiple (another display, another mode) starts the fit
+            // over: the lock free-runs until it is measured again.
+            if (const int multiple = s_refreshMultiple.load(std::memory_order_relaxed); multiple != refresh.Multiple())
+            {
+                refresh.SetMultiple(multiple);
+                vblank.SetDisplay(refresh.Estimate());
+            }
             if (timed)
             {
                 refresh.Add(onScreen);
                 vblank.SetDisplay(refresh.Estimate());
             }
+            // The notice's grid check, beside the lock's fit (never for the lock).
+            if (const double gridHz = s_gridHz.load(std::memory_order_relaxed); gridHz > 0)
+            {
+                static RefreshFit& grid = *new RefreshFit;  // never destroyed, as `refresh`
+                static double checking = 0;
+                if (gridHz != checking)
+                {
+                    checking = gridHz;
+                    grid.SetGridHz(gridHz);
+                    s_gridFixedSince.store(0, std::memory_order_relaxed);
+                }
+                if (timed)
+                {
+                    grid.Add(onScreen);
+                    const bool fixed = grid.Estimate().valid;
+                    const int64_t since = s_gridFixedSince.load(std::memory_order_relaxed);
+                    if (fixed != (since != 0))
+                        s_gridFixedSince.store(fixed ? onScreen : 0, std::memory_order_relaxed);
+                }
+            }
             const RefreshEstimate& display = refresh.Estimate();
             if (s_timingLog)
-                fprintf(s_timingLog, "%llu,%lld,%lld,%lld,%d,%d,%.1f,%lld,%.0f\n", (unsigned long long)t.id, (long long)t.vblank,
+                fprintf(s_timingLog, "%llu,%lld,%lld,%lld,%d,%d,%.1f,%lld,%.0f,%lld,%d\n", (unsigned long long)t.id, (long long)t.vblank,
                     (long long)t.presented, (long long)onScreen, timed, display.valid, display.periodNs, (long long)display.gridNs,
-                    display.rmsNs);
+                    display.rmsNs, (long long)t.ready, display.multiple);
 #if defined(__APPLE__) && !TARGET_OS_IOS
             if (s_pastTiming)
                 ReadDriverReports(t);
@@ -638,15 +680,18 @@ namespace video
             {
                 // The last frame's time on screen, against the vblanks the
                 // game gave it (a gap of more than 0.5 s is a pause, not a repeat).
+                // At a multiple of 60 Hz (refresh_fit.h) a vblank is that
+                // many refreshes, counted in refreshes.
                 double refreshNs = display.valid ? display.periodNs : 1e9 / 60.0;
                 int64_t shownFor = std::llround(double(onScreen - lastOnScreen) / refreshNs);
                 int64_t vblanks = std::max<int64_t>(1, std::llround(double(t.vblank - lastVblank) / vblank.PeriodNs()));
-                if (shownFor > vblanks && shownFor <= 30)
-                    s_repeated += uint64_t(shownFor - vblanks);
+                const int64_t multiple = display.valid ? display.multiple : 1;
+                if (shownFor > vblanks * multiple && shownFor <= 30 * multiple)
+                    s_repeated += uint64_t(shownFor - vblanks * multiple);
             }
             lastOnScreen = onScreen;
             lastVblank = t.vblank;
-            vblank.Observe(t.vblank, t.presented, onScreen);
+            vblank.Observe(t.vblank, t.presented, onScreen, t.ready);
         }
 
         void PresentWaiter()
@@ -755,6 +800,45 @@ namespace video
         }
 
         void UpdateDisplayItem();
+
+        double s_modeHz = 0.0;  // the window's display mode's rate (main thread; UpdateRefreshMultiple)
+        std::chrono::steady_clock::time_point s_modeSince{};
+        // Game frames for the refresh-rate notice: the first, and the first
+        // after the last gap of RefreshNotice::kGapMs (a load). Main thread.
+        std::chrono::steady_clock::time_point s_firstGameFrame{}, s_flowingSince{};
+
+        // The refreshes per guest vblank the fit should expect on the
+        // window's display (video/refresh_multiple.h), and a [vblank] line
+        // when that or the mode's rate changes and there is something to say
+        // (nothing at 60 Hz). Main thread: at start, each swapchain of a new
+        // size, and SDL's display and mode changes.
+        void UpdateRefreshMultiple(const SDL_DisplayMode* mode)
+        {
+            static const RefreshMultiple policy = RefreshMultiple::FromEnv(std::getenv("NFSMW_REFRESH_MULTIPLE"));
+#if defined(__APPLE__)
+            constexpr bool kApple = true;
+#else
+            constexpr bool kApple = false;
+#endif
+            const double hz = mode ? double(mode->refresh_rate) : 0.0;
+            const int multiple = policy.For(hz, kApple);
+            s_refreshMultiple.store(multiple, std::memory_order_relaxed);
+            // The refresh-rate notice: the mode's rate and since when; the
+            // grid check where the rate is no whole multiple of 60 (not on
+            // Apple's systems: their present waits sit on no grid).
+            if (hz != s_modeHz)
+            {
+                s_modeHz = hz;
+                s_modeSince = std::chrono::steady_clock::now();
+            }
+            s_gridHz.store(!kApple && hz >= RefreshFit::kMinHz && RefreshFit::MultipleOf(hz) == 0 ? hz : 0.0, std::memory_order_relaxed);
+            static double loggedHz = -1.0;
+            if (hz == loggedHz)
+                return;
+            loggedHz = hz;
+            if (const std::string line = policy.Describe(hz, multiple, kApple); !line.empty())
+                fprintf(stderr, "[vblank] %s\n", line.c_str());
+        }
 
         void DestroySwapchain()
         {
@@ -2916,7 +3000,7 @@ void main()
             if (const char* path = std::getenv("NFSMW_VBLANK_LOG"))
                 if ((s_timingLog = fopen(path, "w")))
                 {
-                    fprintf(s_timingLog, "id,vblank,presented,on_screen,timed,fit_valid,period_ns,grid_ns,rms_ns\n");
+                    fprintf(s_timingLog, "id,vblank,presented,on_screen,timed,fit_valid,period_ns,grid_ns,rms_ns,ready,multiple\n");
 #if defined(__APPLE__) && !TARGET_OS_IOS
                     if (s_pastTiming && (s_actualLog = fopen((std::string(path) + ".actual.csv").c_str(), "w")))
                         fprintf(s_actualLog, "# steady_ns %lld uptime_raw_ns %llu\nid,actual_ns\n", (long long)NowNs(),
@@ -3088,6 +3172,7 @@ void main()
                 s_schedule.SetDisplayHz(s_displayHz);
             }
 #endif
+            UpdateRefreshMultiple(mode);
             static const std::pair<int, int> native = NativeMonitorMode();
             const auto [nativeW, nativeH] = native;
             int windowW = 0, windowH = 0;
@@ -3606,6 +3691,128 @@ void main()
         }
     }
 
+    namespace
+    {
+        // Linux: a monitor or TV is connected (and on), not only a built-in
+        // panel (eDP): the Deck docked, a Steam Machine. Elsewhere false.
+        bool ExternalScreen()
+        {
+#ifdef __linux__
+            std::error_code ec;
+            for (const auto& entry : std::filesystem::directory_iterator("/sys/class/drm", ec))
+            {
+                const std::string name = entry.path().filename().string();
+                if (name.find('-') == std::string::npos || name.find("eDP") != std::string::npos || name.find("Writeback") != std::string::npos)
+                    continue;
+                std::ifstream status(entry.path() / "status"), enabled(entry.path() / "enabled");
+                std::string state, on;
+                if ((status >> state) && state == "connected" && (enabled >> on) && on == "enabled")
+                    return true;
+            }
+#endif
+            return false;
+        }
+
+        // The one-time refresh-rate notice (video/refresh_notice.h), judged
+        // twice a second; a line for each rate once it is shown or won't be,
+        // and for the first few reasons it waits. Main thread.
+        void MaybeRefreshNotice()
+        {
+            using Notice = RefreshNotice;
+            static const int forced = [] {
+                const char* v = std::getenv("NFSMW_REFRESH_NOTICE");
+                return v && (v[0] == '0' || v[0] == '1') ? v[0] - '0' : -1;
+            }();
+            static auto lastCheck = std::chrono::steady_clock::time_point{};
+            const auto now = std::chrono::steady_clock::now();
+            if (now - lastCheck < std::chrono::milliseconds(500) || !s_window)
+                return;
+            lastCheck = now;
+            const int key = Notice::Key(s_modeHz);
+            static int decided = -1, waitedFor = -1, waitLines = 0;  // the rate decided (shown or never), the rate waited on
+            static const char* lastWait = nullptr;
+            if (key == decided)
+                return;
+            Notice::Inputs in;
+            in.modeHz = s_modeHz;
+            in.modeStableSec = std::chrono::duration<double>(now - s_modeSince).count();
+#if (defined(__APPLE__) && TARGET_OS_IOS) || (defined(__linux__) && defined(__aarch64__))
+            in.platform = Notice::Platform::Excluded;
+#elif defined(__APPLE__)
+            in.platform = Notice::Platform::Mac;
+#else
+            in.platform = s_gameMode ? Notice::Platform::GameMode : Notice::Platform::Desktop;
+#endif
+            const Notice::Decision early = Notice::Decide(in);  // NotApplicable, without the costlier inputs
+            if (early.verdict == Notice::Verdict::NotApplicable)
+                return;
+            static double macMin = 0, macMax = 0;
+#if defined(__APPLE__) && !TARGET_OS_IOS
+            in.macFixed = platform::macos::DisplayRefreshFixed(s_window, &macMin, &macMax);
+#endif
+            // NFSMW_REFRESH_NOTICE_SCREEN=builtin|external: which screen Game
+            // Mode's words are for, whatever is connected (tests: a Steam
+            // Machine has only a TV).
+            static const char* screen = std::getenv("NFSMW_REFRESH_NOTICE_SCREEN");
+            if (in.platform == Notice::Platform::GameMode)
+                in.externalScreen = screen && !strcmp(screen, "builtin") ? false : screen && !strcmp(screen, "external") ? true : ExternalScreen();
+            const int64_t gridSince = s_gridFixedSince.load(std::memory_order_relaxed);
+            in.gridFixed = gridSince != 0;
+            in.gridStableSec = gridSince ? double(NowNs() - gridSince) / 1e9 : 0.0;
+            in.shownBefore = settings::RefreshNoticeShown(key);
+            in.forced = forced;
+            const bool frames = s_firstGameFrame != std::chrono::steady_clock::time_point{};
+            in.sessionSec = frames ? std::chrono::duration<double>(now - s_firstGameFrame).count() : 0.0;
+            in.flowingSec = frames && now - s_lastGameFrame <= std::chrono::duration<double, std::milli>(Notice::kGapMs)
+                ? std::chrono::duration<double>(now - s_flowingSince).count() : 0.0;
+            if (const int64_t movie = game::LastMovieFrameNs())
+                in.movieQuietSec = double(NowNs() - movie) / 1e9;
+            in.idleSec = hid::SecondsSinceInput();
+            in.uiBusy = ui::HasModal() || ui::SettingsOpen();
+            const Notice::Decision d = Notice::Decide(in);
+            const char* where = in.platform == Notice::Platform::GameMode ? (in.externalScreen ? "Game Mode, a monitor or TV" : "Game Mode, the built-in screen")
+                : in.platform == Notice::Platform::Mac ? "macOS" : "a desktop";
+            switch (d.verdict)
+            {
+            case Notice::Verdict::NotApplicable:
+                return;
+            case Notice::Verdict::Never:
+                decided = key;
+                if (in.platform == Notice::Platform::Mac)
+                    fprintf(stderr, "[video] refresh notice for %d Hz: not shown: %s (the screen: %.1f-%.1f Hz)\n", key, d.reason, macMin, macMax);
+                else
+                    fprintf(stderr, "[video] refresh notice for %d Hz: not shown: %s\n", key, d.reason);
+                return;
+            case Notice::Verdict::Wait:
+                if (waitedFor != key)
+                {
+                    waitedFor = key;
+                    waitLines = 0;
+                    lastWait = nullptr;
+                }
+                if (d.reason != lastWait && waitLines < 4)
+                {
+                    waitLines++;
+                    lastWait = d.reason;
+                    fprintf(stderr, "[video] refresh notice for %d Hz (%s): not yet: %s (%.0f s in)\n", key, where, d.reason, in.sessionSec);
+                }
+                return;
+            case Notice::Verdict::Show:
+                break;
+            }
+            const bool shown = ui::ShowNotice(Notice::kTitle, Notice::Text(in), [key](const char*) {
+                if (settings::RecordRefreshNotice(key))
+                    fprintf(stderr, "[video] refresh notice for %d Hz: recorded in settings.toml (not shown again for it)\n", key);
+            });
+            if (!shown)
+                return;
+            decided = key;
+            fprintf(stderr, "[video] refresh notice for %d Hz: shown (%s; %.0f s in, the controls idle %.1f s, %s)\n", key, where,
+                in.sessionSec, in.idleSec, in.platform == Notice::Platform::Mac ? "macOS says the screen's refresh is fixed"
+                    : std::format("frames on a fixed {:.2f} Hz grid for {:.0f} s", s_modeHz, in.gridStableSec).c_str());
+        }
+    }
+
     bool RunFrame()
     {
         // Another thread found the device lost (DeviceLost): the player is
@@ -3646,6 +3853,8 @@ void main()
                         s_background.load(std::memory_order_acquire) ? " (app inactive: checked after the resume)" : "", GeometryNote().c_str());
 #endif
             }
+            if (e.type == SDL_EVENT_WINDOW_DISPLAY_CHANGED || e.type == SDL_EVENT_DISPLAY_CURRENT_MODE_CHANGED)
+                UpdateRefreshMultiple(SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(s_window)));
             if (e.type == SDL_EVENT_WINDOW_RESIZED)
                 RememberWindowSize();
             else if (e.type == SDL_EVENT_WINDOW_FOCUS_GAINED || e.type == SDL_EVENT_WINDOW_FOCUS_LOST)
@@ -3708,6 +3917,7 @@ void main()
         hid::SetBlocked(ui::CapturingInput());
         hid::Update();
         ApplySettings();
+        MaybeRefreshNotice();
         if (!s_swapchain && !CreateSwapchain())
         {
             SDL_Delay(16);
@@ -3761,7 +3971,14 @@ void main()
             s_lastAspectH = aspectH;
             s_lastImageW = imageW;
             s_lastImageH = imageH;
-            s_lastGameFrame = std::chrono::steady_clock::now();
+            {
+                const auto now = std::chrono::steady_clock::now();
+                if (s_firstGameFrame == std::chrono::steady_clock::time_point{})
+                    s_firstGameFrame = s_flowingSince = now;
+                else if (now - s_lastGameFrame > std::chrono::duration<double, std::milli>(RefreshNotice::kGapMs))
+                    s_flowingSince = now;
+                s_lastGameFrame = now;
+            }
             ui::NoteGameFrame();
         }
         else
@@ -4384,7 +4601,20 @@ void main()
             }
         }
 #endif
-        int64_t presented = NowNs();
+        const int64_t ready = NowNs();
+        int64_t presented = ready;
+        // On a display at a multiple of 60 Hz, a new frame waits for the
+        // refresh before its own, so FIFO doesn't show it early (VblankLock::
+        // PresentAt; 0 everywhere else). Its GPU work is submitted; the queue
+        // is free meanwhile.
+        // (No hold of more than 100 ms: three vblanks are the most it gives.)
+        if (const int64_t at = frameVblank ? GuestVblank().PresentAt(frameVblank) : 0; at > ready && at - ready < 100'000'000)
+        {
+            queueLock.unlock();
+            std::this_thread::sleep_until(std::chrono::steady_clock::time_point(std::chrono::nanoseconds(at)));
+            queueLock.lock();
+            presented = NowNs();
+        }
         VkResult present = vkQueuePresentKHR(s_queue, &pi);
         queueLock.unlock();
         const SurfaceOutcome shown = ClassifySurfaceResult(present);
@@ -4395,7 +4625,7 @@ void main()
         if (s_presentTiming && shown.image)
         {
             std::lock_guard lock(s_timingMutex);
-            s_timings.push_back({ id, s_swapchainGeneration, presented, frameVblank });
+            s_timings.push_back({ id, s_swapchainGeneration, presented, frameVblank, ready });
             s_timingCv.notify_one();
         }
         s_lastPresent = std::chrono::steady_clock::now();
@@ -4587,6 +4817,17 @@ void main()
                 fprintf(stderr, "[vblank] lock off (NFSMW_VBLANK_LOCK=0): free-running every 16.667 ms\n");
             return VblankLock(fixed ? int64_t(std::llround(1e9 / rate)) : 16'667'000, !fixed && !(on && on[0] == '0'));
         }();
+        // At a multiple of 60 Hz: NFSMW_PRESENT_HOLD=0 presents new frames
+        // when ready (the lock alone, for comparison).
+        static const bool holdChecked = [] {
+            if (const char* hold = std::getenv("NFSMW_PRESENT_HOLD"); hold && hold[0] == '0')
+            {
+                lock.SetHold(false);
+                fprintf(stderr, "[vblank] new frames presented when ready at a multiple of 60 Hz too (NFSMW_PRESENT_HOLD=0)\n");
+            }
+            return true;
+        }();
+        (void)holdChecked;
         return lock;
     }
 
