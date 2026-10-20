@@ -59,3 +59,4 @@ speedbreaker-bug-report-*.zip
 # Python
 __pycache__/
 *.pyc
+/dist/

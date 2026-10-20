@@ -13,7 +13,11 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/SpeedBreakerProject/speedbreaker/releases/latest"><b>Download</b></a>
+  <a href="https://github.com/Asofwar/speedbreaker-hle/releases/latest"><b>Download (HLE fork)</b></a>
+  &nbsp;·&nbsp;
+  <a href="#speedbreaker-hle-this-fork--форк-speedbreaker-hle"><b>По-русски</b></a>
+  &nbsp;·&nbsp;
+  <a href="https://github.com/SpeedBreakerProject/speedbreaker/releases/latest">Original releases</a>
   &nbsp;·&nbsp;
   <a href="#quick-start">Quick start</a>
   &nbsp;·&nbsp;
@@ -37,7 +41,71 @@
 > in-app installer verifies it and installs it. Please don't ask for, or share, game files or
 > disc images. See the full [legal notice](#legal-notice).
 
-**Contents:** [What it is](#what-is-speedbreaker) · [Highlights](#highlights) ·
+## SpeedBreaker HLE (this fork) · форк SpeedBreaker HLE
+
+This is a fork of [SpeedBreaker](https://github.com/SpeedBreakerProject/speedbreaker) that works
+on its renderer for the Steam Deck at a 5 W TDP limit: knowledge of what Direct3D meant, taken
+from the game's own calls, in place of parts of the Xenos emulation (a high-level renderer, HLE).
+Its releases are on [this fork's Releases page](https://github.com/Asofwar/speedbreaker-hle/releases);
+the original project's are on [its own](https://github.com/SpeedBreakerProject/speedbreaker/releases).
+Everything below this section is the original project's description and applies here too.
+
+What the fork changes, on x86-64 Linux (SteamOS) by default, each measured on a Steam Deck at
+5 W with alternated runs and the strict picture check (`scripts/compare_shots.py --strict`):
+
+- resolves without copies where nothing reads their bytes: deferred guest bytes, depth targets
+  renamed into their textures, the front buffer's image handed to the presenter;
+- a depth pre-pass in every pass with colour and depth targets (the race shades each pixel of
+  the scene 2.4 times, its mirror 2.6, the cube faces about 2): −1.8 ms of GPU time a frame;
+- smaller vertex shaders (a rectangle-list variant of its own, one snapshot lookup a fetch);
+- diagnostics: the pass profile's shader invocations (`NFSMW_PASS_STATS`), compiler statistics
+  per pipeline (`NFSMW_PIPELINE_STATS`), clear counts (`NFSMW_CLEAR_STATS`).
+
+The race at 5 W went from 34–39 fps to 44 fps, the same picture. The study, its numbers and
+what didn't pay are in [docs/hle-renderer-study.md](docs/hle-renderer-study.md) (in Russian);
+the Steam Deck measurement scripts are in [survey/hle/deck](survey/hle/deck).
+
+---
+
+**По-русски.** Это форк [SpeedBreaker](https://github.com/SpeedBreakerProject/speedbreaker) —
+неофициальной статической перекомпиляции *Need for Speed: Most Wanted* (2005) для Xbox 360
+(нативный порт, не эмулятор: Steam Deck, Steam Machine и Steam Frame на SteamOS, Linux, Mac,
+iPhone и iPad). Форк занимается рендерером для Steam Deck при ограничении 5 Вт: вместо части
+эмуляции GPU Xenos рендерер использует знание о том, что имел в виду Direct3D (HLE-рендерер).
+Сборки форка — на [странице релизов форка](https://github.com/Asofwar/speedbreaker-hle/releases),
+сборки исходного проекта — на [его странице](https://github.com/SpeedBreakerProject/speedbreaker/releases).
+
+Что меняет форк (по умолчанию на x86-64 Linux / SteamOS; каждый пункт измерен на Steam Deck при
+5 Вт чередующимися прогонами и строгим сравнением кадров):
+
+- resolve-ы без копий там, где их байты никто не читает: отложенная запись в гостевую память,
+  переименование целей глубины в их текстуры, образ front buffer-а прямо в презентер;
+- depth pre-pass в каждом проходе с целями цвета и глубины (в гонке каждый пиксель сцены
+  шейдится 2,4 раза, зеркала — 2,6, граней куба — около 2): −1,8 мс GPU на кадр;
+- более лёгкие вершинные шейдеры (отдельный вариант для rectangle list, один поиск снимка на
+  выборку);
+- диагностика: вызовы шейдеров в профиле проходов (`NFSMW_PASS_STATS`), статистика компилятора
+  по пайплайнам (`NFSMW_PIPELINE_STATS`), счётчики очисток (`NFSMW_CLEAR_STATS`).
+
+Гонка на 5 Вт: было 34–39 fps, стало 44 fps, картинка та же. Исследование, цифры и то, что не
+окупилось, — в [docs/hle-renderer-study.md](docs/hle-renderer-study.md); скрипты замеров на
+Steam Deck — в [survey/hle/deck](survey/hle/deck).
+
+**Как поставить на Steam Deck.** Скачайте `SpeedBreaker-steamos-x86_64.tar.xz` со страницы
+релизов форка, распакуйте в любую папку (например `~/Games/SpeedBreaker`) и добавьте
+`speedbreaker.sh` в Steam как стороннюю игру. При первом запуске встроенный установщик попросит
+образ вашего собственного диска Xbox 360 с игрой (поддерживается только американский, NTSC-U, английский диск) и проверит каждый файл. Подробности — в разделах
+[Quick start](#quick-start) и [Setup by platform](#setup-by-platform) ниже (на английском).
+
+> [!IMPORTANT]
+> **Это неофициальный фанатский проект, он не связан с Electronic Arts Inc., брендом
+> Need for Speed и Valve Corporation и не одобрен ими. Файлы игры не входят в сборки и не
+> распространяются:** для игры нужна ваша собственная законно полученная копия (образ) вашего
+> диска *Need for Speed: Most Wanted* (2005) для Xbox 360. Не просите и не передавайте файлы
+> игры или образы дисков. Полный текст — в разделе [Legal notice](#legal-notice).
+
+
+**Contents:** [This fork / по-русски](#speedbreaker-hle-this-fork--форк-speedbreaker-hle) · [What it is](#what-is-speedbreaker) · [Highlights](#highlights) ·
 [Download](#download) · [Quick start](#quick-start) · [How to update](#how-to-update) ·
 [Setup by platform](#setup-by-platform) ·
 [Controls](#controls) · [Settings](#settings) · [Tips](#tips-for-smooth-play) ·
