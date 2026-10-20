@@ -45,8 +45,8 @@ UPB="$OUT/up/SpeedBreaker"
 # 2. The original release's C library and C++ runtime, and their licenses.
 need_glibc="$(objdump -T "$STAGE/lib/SpeedBreaker" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)"
 need_cxx="$(objdump -T "$STAGE/lib/SpeedBreaker" | grep -o 'GLIBCXX_[0-9.]*' | sort -uV | tail -1)"
-objdump -T "$UPB/lib/glibc/libc.so.6" | grep -q " $need_glibc " || { echo "the original release's glibc has no $need_glibc" >&2; exit 1; }
-objdump -T "$UPB/lib/cxx/libstdc++.so.6" | grep -q " $need_cxx " || { echo "the original release's libstdc++ has no $need_cxx" >&2; exit 1; }
+objdump -p "$UPB/lib/glibc/libc.so.6" | grep -qw "$need_glibc" || { echo "the original release's glibc has no $need_glibc" >&2; exit 1; }
+objdump -p "$UPB/lib/cxx/libstdc++.so.6" | grep -qw "$need_cxx" || { echo "the original release's libstdc++ has no $need_cxx" >&2; exit 1; }
 for d in lib/glibc lib/cxx licenses/glibc licenses/libgcc licenses/libstdc++; do
     rm -rf "${STAGE:?}/$d"
     cp -a "$UPB/$d" "$STAGE/$d"
