@@ -188,6 +188,9 @@ uint32_t XamNotifyCreateListener(uint64_t qwAreas)
 
     listener->areas = qwAreas;
 
+    static const bool logNotify = std::getenv("NFSMW_NET_LOG") != nullptr;
+    if (logNotify)
+        fprintf(stderr, "[net] XamNotifyCreateListener(areas %llX) = %08X\n", (unsigned long long)qwAreas, GetKernelHandle(listener));
     return GetKernelHandle(listener);
 }
 
@@ -233,8 +236,23 @@ void XamNotifyEnqueueEvent(uint32_t dwId, uint32_t dwParam)
 bool XNotifyGetNext(uint32_t hNotification, uint32_t dwMsgFilter, be<uint32_t>* pdwId, be<uint32_t>* pParam)
 {
     static const bool logNotify = std::getenv("NFSMW_NET_LOG") != nullptr;
-    auto& listener = *GetKernelObject<XamListener>(hNotification);
     std::lock_guard lock(gListenersMutex);
+    // Only a live listener's handle is looked at: one that is not (0, or one
+    // read from memory something wrote over) has nothing to deliver, where it
+    // used to be dereferenced.
+    XamListener* found = nullptr;
+    if (hNotification && hNotification != GUEST_INVALID_HANDLE_VALUE)
+        for (auto* l : gListeners)
+            if (GetKernelHandle(l) == hNotification)
+                found = l;
+    if (!found)
+    {
+        static std::atomic<bool> warned{ false };
+        if (!warned.exchange(true))
+            fprintf(stderr, "[xam] XNotifyGetNext(handle %08X): not a listener, nothing to deliver\n", hNotification);
+        return false;
+    }
+    auto& listener = *found;
 
     if (dwMsgFilter)
     {
@@ -266,6 +284,9 @@ bool XNotifyGetNext(uint32_t hNotification, uint32_t dwMsgFilter, be<uint32_t>* 
         if (pParam)
             *pParam = std::get<1>(listener.notifications[0]);
 
+        if (logNotify)
+            fprintf(stderr, "[net] XNotifyGetNext(listener %08X) delivers %08X (%08X)\n", hNotification, std::get<0>(listener.notifications[0]),
+                std::get<1>(listener.notifications[0]));
         listener.notifications.erase(listener.notifications.begin());
 
         return true;

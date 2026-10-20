@@ -235,6 +235,7 @@ uint32_t XamAlloc(uint32_t flags, uint32_t size, be<uint32_t>* out)
 
 uint32_t XamFree(uint32_t address)
 {
+    NETLOG("XamFree(%08X)", address);
     ExFreePool(address);
     return 0;
 }
@@ -277,9 +278,10 @@ int NetDll_WSAGetLastError()
     return int(t_lastError);
 }
 
-void NetDll_WSASetLastError(uint32_t error)
+uint32_t NetDll_WSASetLastError(uint32_t error)  // (no caller argument, as WSAGetLastError)
 {
     t_lastError = error;
+    return 0;
 }
 
 // XNADDR: ina (IN_ADDR, 4), inaOnline (4), wPortOnline (2), abEnet (6), abOnline (20): 36 bytes.
@@ -317,6 +319,49 @@ uint32_t NetDll_XNetGetTitleXnAddr(uint32_t caller, uint8_t* xnaddr)
     // XNET_GET_XNADDR_ETHERNET 0x02 | STATIC 0x04 | GATEWAY 0x20 | DNS 0x40 | ONLINE 0x80. The game's NetConn state machine (sub_82819018) maps the bits to
     // a status: GATEWAY or DNS present is "connected to an ISP" ('+isp') and lets it go on; with fewer it keeps polling ('~eth', '~dns', '~sta').
     return 0x02 | 0x04 | 0x20 | 0x40 | 0x80;
+}
+
+// For the XAM apps' Live messages (kernel/xmsg.cpp): this machine's XNADDR as
+// XNetGetTitleXnAddr gives it, and the stand-in service's address (NFSMW_NET_HOST,
+// the lobby server every name resolves to) in network order.
+void NetOwnXnAddr(uint8_t* xnaddr)
+{
+    memset(xnaddr, 0, 36);
+    const uint32_t ina = LocalAddress();
+    xnaddr[0] = uint8_t(ina >> 24); xnaddr[1] = uint8_t(ina >> 16); xnaddr[2] = uint8_t(ina >> 8); xnaddr[3] = uint8_t(ina);
+    xnaddr[10] = 0x00; xnaddr[11] = 0x22; xnaddr[12] = 0x48; xnaddr[13] = xnaddr[1]; xnaddr[14] = xnaddr[2]; xnaddr[15] = xnaddr[3];
+    memcpy(xnaddr + 4, xnaddr, 4);
+    for (int i = 0; i < 20; i++)
+        xnaddr[16 + i] = uint8_t(0x40 + i + xnaddr[3]);
+}
+
+uint32_t NetServiceAddress()
+{
+    in_addr a{};
+    const char* v = std::getenv("NFSMW_NET_HOST");
+    if (!v || inet_pton(AF_INET, v, &a) != 1)
+        inet_pton(AF_INET, "127.0.0.1", &a);
+    return a.s_addr;
+}
+
+// The logon's identity, which the game's online code asks for once signed in
+// (Xenia's answers): its title (NFS Most Wanted, 0x454107D9), a machine id, and
+// the user's country (103, the United States: the disc is NTSC-U).
+uint32_t XNetLogonGetTitleID(uint32_t caller)
+{
+    return 0x454107D9;
+}
+
+uint32_t XNetLogonGetMachineID(be<uint64_t>* machineId)
+{
+    if (machineId)
+        *machineId = 0xFA00000000000000ull | LocalAddress();
+    return 0;
+}
+
+uint32_t XamUserGetOnlineCountryFromXUID(uint64_t xuid)
+{
+    return 103;
 }
 
 uint32_t NetDll_XNetGetDebugXnAddr(uint32_t caller, uint8_t* xnaddr)
@@ -488,30 +533,69 @@ int NetDll_XNetDnsRelease(uint32_t caller, uint32_t dns)
     return 0;
 }
 
+// QoS: the game measures its peers (and the lobby's gateways) before a race and
+// waits for the measurement. A peer here is a host address the game reaches
+// directly: every lookup is complete at once, each target contacted, 10 ms
+// away, 1 Mbit/s each way. XNQOS: cxnqos, cxnqosPending, then a 24-byte
+// XNQOSINFO a target: bFlags, bReserved, cProbesXmit, cProbesRecv, cbData,
+// pbData, wRttMinInMsecs, wRttMedInMsecs, dwUpBitsPerSec, dwDnBitsPerSec.
 int NetDll_XNetQosListen(uint32_t caller, const uint8_t* kid, const uint8_t* data, uint32_t size, uint32_t bitsPerSec, uint32_t flags)
 {
-    NETLOG("XNetQosListen: not supported");
-    return WSAEOPNOTSUPP;
+    NETLOG("XNetQosListen(flags %08X, %u bytes): accepted", flags, size);
+    return 0;
+}
+
+namespace
+{
+    uint32_t CompleteQos(uint32_t targets, uint32_t probes, uint32_t event)
+    {
+        const uint32_t size = 8 + 24 * std::max(targets, 1u);
+        const uint32_t block = ExAllocatePoolWithTag(size, 0);
+        uint8_t* base = g_memory.base;
+        memset(base + block, 0, size);
+        PPC_STORE_U32(block, targets);
+        PPC_STORE_U32(block + 4, 0);
+        for (uint32_t i = 0; i < targets; i++)
+        {
+            const uint32_t q = block + 8 + 24 * i;
+            base[q] = 0x01 | 0x02;  // XNET_XNQOSINFO_COMPLETE | TARGET_CONTACTED
+            PPC_STORE_U16(q + 2, uint16_t(probes ? probes : 4));
+            PPC_STORE_U16(q + 4, uint16_t(probes ? probes : 4));
+            PPC_STORE_U16(q + 12, 10);
+            PPC_STORE_U16(q + 14, 10);
+            PPC_STORE_U32(q + 16, 1000000);
+            PPC_STORE_U32(q + 20, 1000000);
+        }
+        if (event && IsKernelObject(event))
+            if (auto* e = dynamic_cast<EventObject*>(GetKernelObject(event)))
+                e->Set();
+        return block;
+    }
 }
 
 int NetDll_XNetQosLookup(uint32_t caller, uint32_t count, const uint32_t* xnaddrs, const uint32_t* kids, const uint32_t* keys, uint32_t numGateways,
     const uint32_t* gatewayAddrs, const uint32_t* serviceIds, uint32_t probes, uint32_t bitsPerSec, uint32_t flags, uint32_t event, be<uint32_t>* result)
 {
-    NETLOG("XNetQosLookup: not supported");
+    const uint32_t block = CompleteQos(count + numGateways, probes, event);
+    NETLOG("XNetQosLookup(%u peers, %u gateways, %u probes): complete at once (%08X)", count, numGateways, probes, block);
     if (result)
-        *result = 0;
-    return WSAEOPNOTSUPP;
+        *result = block;
+    return 0;
 }
 
 int NetDll_XNetQosServiceLookup(uint32_t caller, uint32_t flags, uint32_t event, be<uint32_t>* result)
 {
+    // No Live services to measure: an empty, finished result.
+    const uint32_t block = CompleteQos(0, 0, event);
+    NETLOG("XNetQosServiceLookup: no services (%08X)", block);
     if (result)
-        *result = 0;
-    return WSAEOPNOTSUPP;
+        *result = block;
+    return 0;
 }
 
 int NetDll_XNetQosRelease(uint32_t caller, uint32_t qos)
 {
+    ExFreePool(qos);
     return 0;
 }
 
@@ -778,6 +862,19 @@ int NetDll_recv(uint32_t caller, uint32_t s, uint8_t* buffer, int length, int fl
     if (fd < 0)
         return (t_lastError = WSAENOTSOCK, SOCKET_ERROR_);
     const ssize_t n = recv(fd, buffer, size_t(length), flags & 2 ? MSG_PEEK : 0);
+    const int err = errno;
+    if (s_log && (n >= 0 || (err != EAGAIN && err != EWOULDBLOCK)))
+    {
+        static std::atomic<uint32_t> count{ 0 };
+        if (count.fetch_add(1) < 40)
+        {
+            std::string text;
+            for (ssize_t i = 0; i < std::min<ssize_t>(n, 64); i++)
+                text += buffer[i] >= 0x20 && buffer[i] < 0x7F ? char(buffer[i]) : '.';
+            NETLOG("recv(socket %u, %d, flags %d) = %zd (errno %d): %s", s, length, flags, n, n < 0 ? err : 0, text.c_str());
+        }
+    }
+    errno = err;
     return n < 0 ? Fail() : int(n);
 }
 
@@ -1013,6 +1110,10 @@ GUEST_FUNCTION_HOOK(__imp__NetDll_XNetCleanup, NetDll_XNetCleanup);
 GUEST_FUNCTION_HOOK(__imp__NetDll_WSAStartup, NetDll_WSAStartup);
 GUEST_FUNCTION_HOOK(__imp__NetDll_WSACleanup, NetDll_WSACleanup);
 GUEST_FUNCTION_HOOK(__imp__NetDll_WSAGetLastError, NetDll_WSAGetLastError);
+GUEST_FUNCTION_HOOK(__imp__NetDll_WSASetLastError, NetDll_WSASetLastError);
+GUEST_FUNCTION_HOOK(__imp__XNetLogonGetTitleID, XNetLogonGetTitleID);
+GUEST_FUNCTION_HOOK(__imp__XNetLogonGetMachineID, XNetLogonGetMachineID);
+GUEST_FUNCTION_HOOK(__imp__XamUserGetOnlineCountryFromXUID, XamUserGetOnlineCountryFromXUID);
 GUEST_FUNCTION_HOOK(__imp__NetDll_XNetGetTitleXnAddr, NetDll_XNetGetTitleXnAddr);
 GUEST_FUNCTION_HOOK(__imp__NetDll_XNetGetDebugXnAddr, NetDll_XNetGetDebugXnAddr);
 GUEST_FUNCTION_HOOK(__imp__NetDll_XNetGetEthernetLinkStatus, NetDll_XNetGetEthernetLinkStatus);

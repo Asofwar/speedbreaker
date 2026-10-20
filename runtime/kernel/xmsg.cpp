@@ -4,13 +4,20 @@
 // games ask about custom soundtracks) is implemented, following Xenia's
 // kernel/xam/apps/xmp_app.cc message by message. XGI (0xFB: achievements,
 // sessions, stats) and XLiveBase (0xFC) messages fail with X_E_FAIL and a log
-// line, as Xenia's unknown messages do; add them as the game needs them.
+// line, as Xenia's unknown messages do, unless NFSMW_FAKE_LIVE=1 (below).
 #include <stdafx.h>
 #include "function.h"
 #include "overlapped.h"
 #include "xam.h"
 
 #include <cpu/guest_thread.h>
+#include <kernel/memory.h>
+
+#include <mutex>
+#include <set>
+
+void NetOwnXnAddr(uint8_t* xnaddr);  // kernel/imports_net.cpp
+uint32_t NetServiceAddress();
 
 namespace
 {
@@ -121,10 +128,105 @@ namespace
         return X_E_FAIL;
     }
 
+    // NFSMW_FAKE_LIVE=1 (the game's own Xbox Live race against a stand-in EA
+    // lobby server, NFSMW_NET_HOST; kernel/imports_net.cpp): the XAM apps'
+    // Live messages answered as a signed-in console's are. Their buffers'
+    // layouts are Xenia's (xgi_app.cc, xlivebase_app.cc); what NFS Most
+    // Wanted needs of them is what victorgbd's NFSMW Recompiled found
+    // (github.com/victorgbd/NFSMW-Recompiled-Mobile, docs/diario).
+    const bool s_fakeLive = std::getenv("NFSMW_FAKE_LIVE") != nullptr;
+
+    void LiveLogOnce(uint32_t app, uint32_t message, const char* what)
+    {
+        static std::mutex mutex;
+        static std::set<uint64_t> seen;
+        std::lock_guard lock(mutex);
+        if (seen.insert(uint64_t(app) << 32 | message).second)
+            fprintf(stderr, "[live] app %02X message %08X: %s\n", app, message, what);
+    }
+
+    // XGI (sessions, contexts, properties, stats). The game's matchmaking is
+    // EA's lobby: the session here only has to exist. A host's XSessionCreate
+    // gets its XSESSION_INFO (XNKID 8 bytes, the host's XNADDR 36, XNKEY 16)
+    // and a nonce, which the game sends to the others through the lobby.
+    uint32_t XgiDispatch(uint32_t message, uint32_t buffer, uint32_t length)
+    {
+        uint8_t* base = g_memory.base;
+        if (message == 0x000B0010 && buffer)  // XSessionCreate
+        {
+            const uint32_t flags = PPC_LOAD_U32(buffer + 4), info = PPC_LOAD_U32(buffer + 20), nonce = PPC_LOAD_U32(buffer + 24);
+            if ((flags & 1) && info)  // XSESSION_CREATE_HOST
+            {
+                static uint32_t count = 0;
+                count++;
+                uint8_t* p = base + info;
+                uint8_t own[36];
+                NetOwnXnAddr(own);
+                const uint8_t kid[8] = { 0x80, own[0], own[1], own[2], own[3], 0x00, uint8_t(count >> 8), uint8_t(count) };
+                memcpy(p, kid, 8);
+                memcpy(p + 8, own, 36);
+                for (int i = 0; i < 16; i++)
+                    p[44 + i] = uint8_t(kid[i % 8] ^ (0x5A + i));
+                if (nonce)
+                    for (int i = 0; i < 8; i++)
+                        base[nonce + i] = uint8_t(kid[i] ^ 0xA5);
+                fprintf(stderr, "[live] XSessionCreate (host): XNKID %02X%02X%02X%02X%02X%02X%02X%02X\n", kid[0], kid[1], kid[2], kid[3], kid[4], kid[5],
+                    kid[6], kid[7]);
+            }
+        }
+        LiveLogOnce(0xFB, message, "success");
+        return X_E_SUCCESS;
+    }
+
+    // XLiveBase: logon, NAT type, service addresses, presence. The game asks
+    // for EA's service (0x45410004) and opens its gateway to the address it
+    // gets: the stand-in server's. Without it its NetConn stays at "-svc"
+    // and the game says the connection to Xbox Live was lost.
+    uint32_t XLiveBaseDispatch(uint32_t message, uint32_t buffer, uint32_t length)
+    {
+        uint8_t* base = g_memory.base;
+        switch (message)
+        {
+        case 0x00058004:  // the logon id (a bool)
+        case 0x00058006:  // the NAT type: XONLINE_NAT_OPEN
+            if (buffer)
+                PPC_STORE_U32(buffer, 1);
+            break;
+        case 0x00058007:  // XOnlineGetServiceInfo(service id, XONLINE_SERVICE_INFO*): { id, IN_ADDR, port, reserved }
+            if (length)
+            {
+                const uint32_t ip = NetServiceAddress();
+                PPC_STORE_U32(length, buffer);
+                memcpy(base + length + 4, &ip, 4);  // (network order, as an IN_ADDR)
+                PPC_STORE_U16(length + 8, 0);
+                PPC_STORE_U16(length + 10, 0);
+                fprintf(stderr, "[live] XOnlineGetServiceInfo(%08X): the stand-in server\n", buffer);
+            }
+            break;
+        case 0x0005800E:  // XUserMuteListQuery({ user, pad, XUID, result }, BOOL* muted): nobody is muted
+            if (length)
+                PPC_STORE_U32(length, 0);
+            if (buffer)
+                PPC_STORE_U32(buffer + 16, 0);
+            break;
+        case 0x00058020:  // the friends list's enumerator (CXLiveFriends::Enumerate): none, as Xenia
+            LiveLogOnce(0xFC, message, "failed (no friends list)");
+            return X_E_FAIL;
+        default:
+            break;
+        }
+        LiveLogOnce(0xFC, message, "success");
+        return X_E_SUCCESS;
+    }
+
     uint32_t Dispatch(uint32_t app, uint32_t message, uint32_t buffer, uint32_t length)
     {
         if (app == 0xFA)
             return XmpDispatch(message, buffer, length);
+        if (s_fakeLive && app == 0xFB)
+            return XgiDispatch(message, buffer, length);
+        if (s_fakeLive && app == 0xFC)
+            return XLiveBaseDispatch(message, buffer, length);
         if (app == 0xFB || app == 0xFC)
         {
             fprintf(stderr, "[xmsg] app %02X message %08X not implemented (returning X_E_FAIL)\n", app, message);
