@@ -1244,6 +1244,10 @@ void main()
     // runVertex() has ONE call site: compilers inline every call, and the
     // rectangle's synthesised corner used to add three more copies of the
     // whole shader (RADV took ~10x longer to compile every vertex shader).
+#ifdef SB_RECT
+    // (Rectangle lists only, a variant of its own: the loop keeps the first
+    // corner's outputs live across the others', doubling the registers every
+    // draw's shader held - 128 VGPRs and 8 waves a SIMD for the race's.)
     uint first = vid, count = 1u;
     if (mode == 1u)
     {
@@ -1278,6 +1282,17 @@ void main()
             for (int i = 0; i < 16; i++) it[i] = it[i] + o_interpT[i] - it0[i];
         }
     }
+#else
+    uint first = vid;
+    if (mode == 2u)
+    {
+        uint quad = vid / 6u, k = vid % 6u;
+        first = quad * 4u + (k == 0u ? 0u : k == 1u ? 1u : k == 2u ? 2u : k == 3u ? 0u : k == 4u ? 2u : 3u);
+    }
+    runVertex(first);
+    vec4 pos = o_position;
+    vec4 it[16] = o_interpT;
+#endif
 @@VS_OUTPUTS@@    // PA_CL_VTE_CNTL formats (as Xenia): bit 1 W is not 1/W, bit 2 XY were
     // already divided by W, bit 3 Z was.
     if ((pc.flags & 2u) == 0u) pos.w = 1.0 / pos.w;

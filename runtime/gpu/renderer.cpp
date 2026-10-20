@@ -1963,7 +1963,8 @@ namespace gpu::renderer
             // again in a later session (gpu/pipeline_keys.h).
             std::vector<uint32_t> words;
             std::mutex compileMutex;
-            bool vertexCompiled = false;
+            bool vertexCompiled = false, rectCompiled = false;
+            VkShaderModule moduleRect = VK_NULL_HANDLE;  // VS with SB_RECT: for rectangle lists (raster bit 9)
             VkShaderModule module = VK_NULL_HANDLE;  // VS
             // PS variants by (colour outputs, interpolator inputs, alpha test).
             std::unordered_map<uint32_t, VkShaderModule> variants;
@@ -2305,20 +2306,23 @@ shaderPreamble;
         // A pixel shader variant: colour outputs only for bound attachments
         // (Metal rejects others), inputs only for interpolators the vertex
         // shader writes, and the alpha test compiled in only when enabled.
-        VkShaderModule VertexModule(Shader& vs)
+        VkShaderModule VertexModule(Shader& vs, bool rect = false)
         {
             std::lock_guard lock(vs.compileMutex);
-            if (!vs.vertexCompiled)
+            bool& compiled = rect ? vs.rectCompiled : vs.vertexCompiled;
+            VkShaderModule& module = rect ? vs.moduleRect : vs.module;
+            if (!compiled)
             {
-                vs.vertexCompiled = true;
+                compiled = true;
                 std::string log;
-                auto spirv = CompileGlsl(vs.info.glsl, GLSLANG_STAGE_VERTEX, log);
+                auto spirv = CompileGlsl(vs.info.glsl, GLSLANG_STAGE_VERTEX, log, rect ? "#define SB_RECT\n" : "");
                 if (spirv.empty())
-                    fprintf(stderr, "[renderer] vs_%016llx: GLSL compile failed:\n%s\n", (unsigned long long)vs.hash, log.c_str());
+                    fprintf(stderr, "[renderer] vs_%016llx%s: GLSL compile failed:\n%s\n", (unsigned long long)vs.hash, rect ? " (SB_RECT)" : "",
+                        log.c_str());
                 else
-                    vs.module = CreateModule(spirv);
+                    module = CreateModule(spirv);
             }
-            return vs.module;
+            return module;
         }
 
         VkShaderModule PixelVariant(Shader& ps, uint32_t outputs, uint32_t inputs, bool alphaTest)
@@ -3380,7 +3384,7 @@ shaderPreamble;
         // locked modules and the (internally synchronized) pipeline cache.
         VkPipeline BuildPipeline(const PipelineKey& key, VkPipelineLayout layout, Shader& vs, Shader& ps)
         {
-            VkShaderModule vsModule = VertexModule(vs);
+            VkShaderModule vsModule = VertexModule(vs, (key.raster >> 9) & 1);
             if (!vsModule)
                 return VK_NULL_HANDLE;
             VkPipelineShaderStageCreateInfo stages[2]{};
@@ -10571,6 +10575,10 @@ void main()
             useIndices = true;
         };
 
+        // NFSMW_VS_RECT=1 (an A/B switch): every draw with the rectangle list
+        // variant of its vertex shader, as before it had one.
+        static const bool s_vsRectAll = [] { const char* v = std::getenv("NFSMW_VS_RECT"); return v && v[0] == '1'; }();
+        bool rectList = s_vsRectAll;  // a rectangle list: the vertex shader's SB_RECT variant
         switch (initiator.prim_type)
         {
         case xenos::PrimitiveType::kPointList:
@@ -10635,6 +10643,7 @@ void main()
             topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
             vertexCount = count / 3 * 6;
             pc.indexInfo = 1u << 3;
+            rectList = true;
             if (src.indexed)
             {
                 pc.indexAddress = src.base;
@@ -10722,7 +10731,8 @@ void main()
         // (The alpha test tests the pixel shader's alpha: none depth-only.)
         bool alphaTest = colorControlKey.alpha_test_enable && colorControlKey.alpha_func != xenos::CompareFunction::kAlways &&
             gpu::RunsGuestPixelShader(edramMode, s_depthOnlyGuestPs);
-        key.raster = cull | (modeCntl.face ? 4u : 0u) | (clipCntl.clip_disable ? 8u : 0u) | (depthBias ? 16u : 0u) |
+        // (Raster bit 9: the rectangle list variant of the vertex shader.)
+        key.raster = (rectList ? 512u : 0u) | cull | (modeCntl.face ? 4u : 0u) | (clipCntl.clip_disable ? 8u : 0u) | (depthBias ? 16u : 0u) |
             (alphaTest ? 32u : 0u);
         // CP_OPT_DYNAMIC_STATE: cull mode, front face and the depth and
         // stencil tests are set per draw (below, from these), so draws that
