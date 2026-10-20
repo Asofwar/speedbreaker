@@ -364,6 +364,27 @@ uint32_t XamUserGetOnlineCountryFromXUID(uint64_t xuid)
     return 103;
 }
 
+// An XSession's handle (XamSessionCreateHandle), which the game hands to XGI's
+// session messages (kernel/xmsg.cpp) and closes when it is done: a kernel
+// object of its own, so that closing it is ordinary; its object, as
+// ObReferenceObjectByHandle gives one, is the handle itself.
+uint32_t XamSessionCreateHandle(be<uint32_t>* handle)
+{
+    if (!handle)
+        return 0x80070057;  // E_INVALIDARG
+    *handle = GetKernelHandle(CreateKernelObject<EventObject>(true, false));
+    NETLOG("XamSessionCreateHandle = %08X", uint32_t(*handle));
+    return 0;
+}
+
+uint32_t XamSessionRefObjByHandle(uint32_t handle, be<uint32_t>* object)
+{
+    if (!object)
+        return 0x80070057;
+    *object = handle;
+    return 0;
+}
+
 uint32_t NetDll_XNetGetDebugXnAddr(uint32_t caller, uint8_t* xnaddr)
 {
     return NetDll_XNetGetTitleXnAddr(caller, xnaddr);
@@ -1114,6 +1135,8 @@ GUEST_FUNCTION_HOOK(__imp__NetDll_WSASetLastError, NetDll_WSASetLastError);
 GUEST_FUNCTION_HOOK(__imp__XNetLogonGetTitleID, XNetLogonGetTitleID);
 GUEST_FUNCTION_HOOK(__imp__XNetLogonGetMachineID, XNetLogonGetMachineID);
 GUEST_FUNCTION_HOOK(__imp__XamUserGetOnlineCountryFromXUID, XamUserGetOnlineCountryFromXUID);
+GUEST_FUNCTION_HOOK(__imp__XamSessionCreateHandle, XamSessionCreateHandle);
+GUEST_FUNCTION_HOOK(__imp__XamSessionRefObjByHandle, XamSessionRefObjByHandle);
 GUEST_FUNCTION_HOOK(__imp__NetDll_XNetGetTitleXnAddr, NetDll_XNetGetTitleXnAddr);
 GUEST_FUNCTION_HOOK(__imp__NetDll_XNetGetDebugXnAddr, NetDll_XNetGetDebugXnAddr);
 GUEST_FUNCTION_HOOK(__imp__NetDll_XNetGetEthernetLinkStatus, NetDll_XNetGetEthernetLinkStatus);
