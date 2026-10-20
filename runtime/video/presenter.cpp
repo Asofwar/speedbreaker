@@ -1331,9 +1331,32 @@ void main()
         float x = (c.x + w2x / w12x) * texel.x;
         float w0 = f.y * (-0.5 + f.y * (1.0 - 0.5 * f.y)), w3 = f.y * f.y * (-0.5 + 0.5 * f.y);
         float w2 = f.y * (0.5 + f.y * (2.0 - 1.5 * f.y)), w12 = 1.0 + f.y * f.y * (-2.5 + 1.5 * f.y) + w2;
+        vec2 corner = c * texel;
+        // The clamp's 2x2 texels are also the column's two rows the middle
+        // tap and the sharpening's bilinear sample blend: one gather a
+        // channel gives all four, and those two are blended here (in float:
+        // a texture unit blends RGBA8 at its own precision, a level or two
+        // apart), 5 fetches, not 8. Not where a
+        // band's span edge cuts the 2x2 (at() would clamp a texel of it).
+        vec2 lo2 = corner, hi2 = corner + texel;
+#ifndef SB_NO_GATHER
+        if (p.bandOn == 0u || (all(greaterThanEqual(lo2, spanLo - 1e-6)) && all(lessThanEqual(hi2, spanHi + 1e-6))))
+        {
+            vec2 g = corner + 0.5 * texel;
+            vec4 gr = textureGather(src, g, 0), gg = textureGather(src, g, 1), gb = textureGather(src, g, 2);
+            vec3 a = vec3(gr.w, gg.w, gb.w), b = vec3(gr.z, gg.z, gb.z), d = vec3(gr.x, gg.x, gb.x), e = vec3(gr.y, gg.y, gb.y);
+            // (The taps' column: c's, or the next where uv rounded just below a centre.)
+            const bool next = w2x / w12x > 0.5;
+            vec3 top = next ? b : a, bottom = next ? e : d;
+            vec3 v = at(vec2(x, (c.y - 1.0) * texel.y)) * w0 + mix(top, bottom, w2 / w12) * w12 +
+                at(vec2(x, (c.y + 2.0) * texel.y)) * w3;
+            vec3 lo = min(min(a, b), min(d, e)), hi = max(max(a, b), max(d, e));
+            color = vec4(clamp(v + p.sharpen * (v - mix(top, bottom, f.y)), lo, hi), 1.0);
+            return;
+        }
+#endif
         vec3 v = at(vec2(x, (c.y - 1.0) * texel.y)) * w0 + at(vec2(x, (c.y + w2 / w12) * texel.y)) * w12 +
             at(vec2(x, (c.y + 2.0) * texel.y)) * w3;
-        vec2 corner = c * texel;
         vec3 a = at(corner), b = at(corner + vec2(texel.x, 0.0)), d = at(corner + vec2(0.0, texel.y)), e = at(corner + texel);
         vec3 lo = min(min(a, b), min(d, e)), hi = max(max(a, b), max(d, e));
         color = vec4(clamp(v + p.sharpen * (v - at(vec2(x, uv.y))), lo, hi), 1.0);
@@ -1438,6 +1461,16 @@ void main()
         constexpr bool kFastScaleByDefault = false;
 #endif
         const bool s_fastScale = [] { const char* v = std::getenv("NFSMW_FAST_SCALE"); return v ? v[0] == '1' : kFastScaleByDefault; }();
+        // The scale shader's source: NFSMW_SCALE_GATHER=0 takes its 2x2
+        // gathers out (8 fetches a pixel as before; an A/B switch).
+        std::string ScaleSource()
+        {
+            static const bool gather = [] { const char* v = std::getenv("NFSMW_SCALE_GATHER"); return !(v && v[0] == '0'); }();
+            std::string glsl = s_fastScale ? kScaleFastFs : kScaleFs;
+            if (!gather)
+                glsl.replace(glsl.find('\n') + 1, 0, "#define SB_NO_GATHER\n");
+            return glsl;
+        }
 
         // Brightness and the 360's display gamma (video/display_tone.h): the
         // scale shader in use, its main renamed scaleMain, then this main,
@@ -1641,7 +1674,7 @@ void main()
 
             VkShaderModule cs = PostModule(kAaCs, 2);
             s_post.vs = PostModule(kFullscreenVs, 0);
-            s_post.fs = PostModule(s_fastScale ? kScaleFastFs : kScaleFs, 1);
+            s_post.fs = PostModule(ScaleSource().c_str(), 1);
             if (!cs || !s_post.vs || !s_post.fs)
                 return false;
             VkComputePipelineCreateInfo cpci{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
@@ -1711,7 +1744,7 @@ void main()
             else
             {
                 s_tone.tried = true;
-                std::string glsl = ToneVariant(s_fastScale ? kScaleFastFs : kScaleFs);
+                std::string glsl = ToneVariant(ScaleSource().c_str());
                 if (glsl.empty())
                 {
                     fprintf(stderr, "[video] tone: the scale shader has no single main to wrap; Brightness is off\n");
