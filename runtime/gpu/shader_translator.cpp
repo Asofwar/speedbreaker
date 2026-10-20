@@ -172,6 +172,9 @@ float xmul(float a, float b)
     namespace
     {
         const char* kComp = "xyzw";
+        // NFSMW_VRES=0: vertex fetches read each word through vmem, as before
+        // vres (an A/B switch).
+        const bool s_vres = [] { const char* v = std::getenv("NFSMW_VRES"); return !(v && v[0] == '0'); }();
 
         struct Translator
         {
@@ -610,12 +613,15 @@ float xmul(float a, float b)
                     int(full.stride()), int(op.offset())));
                 Line("uint vendian = vf1 & 3u;");
                 // (A fetch reads at most 16 bytes: the words it reads are those.)
-                Line("uint vloc = vres(vbase, 16u);");
+                if (s_vres)
+                    Line("uint vloc = vres(vbase, 16u);");
 
                 xenos::VertexFormat format = op.data_format();
                 bool isSigned = op.is_signed();
                 bool normalized = op.is_normalized();
-                auto word = [&](int i) { return std::format("gpuSwap(vword(vloc, vbase, {}u), vendian)", i); };
+                auto word = [&](int i) {
+                    return s_vres ? std::format("gpuSwap(vword(vloc, vbase, {}u), vendian)", i) : std::format("gpuSwap(vmem(vbase + {}u), vendian)", i * 4);
+                };
                 std::string value;
                 // Packed integer formats: widths/offsets per component.
                 auto packed = [&](std::initializer_list<std::pair<int, int>> comps, int words) {
