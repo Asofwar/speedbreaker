@@ -2871,6 +2871,27 @@ void main()
             dci.pNext = &dynamicStateFeatures;
         }
 #endif
+        VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR executableFeatures{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR };
+        bool executableStats = false;
+        if (const char* v = std::getenv("NFSMW_PIPELINE_STATS"); v && v[0] == '1')
+        {
+            uint32_t n = 0;
+            vkEnumerateDeviceExtensionProperties(s_physical, nullptr, &n, nullptr);
+            std::vector<VkExtensionProperties> all(n);
+            vkEnumerateDeviceExtensionProperties(s_physical, nullptr, &n, all.data());
+            for (const VkExtensionProperties& e : all)
+                executableStats |= strcmp(e.extensionName, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME) == 0;
+            if (executableStats)
+            {
+                devExts.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+                executableFeatures.pipelineExecutableInfo = VK_TRUE;
+                executableFeatures.pNext = const_cast<void*>(dci.pNext);
+                dci.pNext = &executableFeatures;
+            }
+            fprintf(stderr, "[video] NFSMW_PIPELINE_STATS: %s\n", executableStats ? "shader statistics logged per pipeline"
+                : "no VK_KHR_pipeline_executable_properties on this device");
+        }
         dci.pEnabledFeatures = &features;
         dci.queueCreateInfoCount = 1;
         dci.pQueueCreateInfos = &qci;
@@ -2955,6 +2976,7 @@ void main()
             hostQueryReset.hostQueryReset ? (PFN_vkResetQueryPool)vkGetDeviceProcAddr(s_device, "vkResetQueryPool") : nullptr,
             mirrorClamp };
         s_context.pipelineStatistics = features.pipelineStatisticsQuery == VK_TRUE;
+        s_context.pipelineExecutableStats = executableStats;
 #ifdef VK_EXT_depth_bias_control
         if (depthBiasControl)
         {

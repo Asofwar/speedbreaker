@@ -3511,8 +3511,48 @@ shaderPreamble;
             gpci.pColorBlendState = &cb;
             gpci.pDynamicState = &ds;
             gpci.layout = layout;
+            if (s_vk->pipelineExecutableStats)
+                gpci.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
             VkPipeline pipeline = VK_NULL_HANDLE;
             VkResult r = vkCreateGraphicsPipelines(s_dev, s_pipelineCache, 1, &gpci, nullptr, &pipeline);
+            if (r == VK_SUCCESS && s_vk->pipelineExecutableStats)
+            {
+                // NFSMW_PIPELINE_STATS: one line a pipeline, each shader's
+                // statistics as the driver names them.
+                static auto getProps = reinterpret_cast<PFN_vkGetPipelineExecutablePropertiesKHR>(
+                    vkGetDeviceProcAddr(s_dev, "vkGetPipelineExecutablePropertiesKHR"));
+                static auto getStats = reinterpret_cast<PFN_vkGetPipelineExecutableStatisticsKHR>(
+                    vkGetDeviceProcAddr(s_dev, "vkGetPipelineExecutableStatisticsKHR"));
+                VkPipelineInfoKHR pi{ VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR };
+                pi.pipeline = pipeline;
+                uint32_t count = 0;
+                std::string line;
+                if (getProps && getStats && getProps(s_dev, &pi, &count, nullptr) == VK_SUCCESS)
+                {
+                    std::vector<VkPipelineExecutablePropertiesKHR> props(count, { VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR });
+                    getProps(s_dev, &pi, &count, props.data());
+                    for (uint32_t e = 0; e < count; e++)
+                    {
+                        VkPipelineExecutableInfoKHR ei{ VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR };
+                        ei.pipeline = pipeline;
+                        ei.executableIndex = e;
+                        uint32_t n = 0;
+                        getStats(s_dev, &ei, &n, nullptr);
+                        std::vector<VkPipelineExecutableStatisticKHR> st(n, { VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR });
+                        getStats(s_dev, &ei, &n, st.data());
+                        line += std::format(" | {} (subgroup {})", props[e].name, props[e].subgroupSize);
+                        for (const VkPipelineExecutableStatisticKHR& x : st)
+                        {
+                            uint64_t v = x.format == VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR ? x.value.b32
+                                : x.format == VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR ? uint64_t(x.value.i64)
+                                : x.format == VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR ? x.value.u64 : uint64_t(x.value.f64);
+                            line += std::format(" {}={}", x.name, v);
+                        }
+                    }
+                }
+                fprintf(stderr, "[pipeline-stats] vs %016llx ps %016llx raster %x%s\n", (unsigned long long)key.vs,
+                    (unsigned long long)key.ps, key.raster, line.c_str());
+            }
             if (r != VK_SUCCESS)
             {
                 fprintf(stderr, "[renderer] pipeline vs %016llx ps %016llx failed: %d\n",

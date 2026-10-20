@@ -160,6 +160,11 @@ namespace video
         // the pass profile (NFSMW_PASS_PROFILE) counts each pass's vertex and
         // fragment shader invocations (gpu/renderer.cpp).
         bool pipelineStatistics = false;
+        // NFSMW_PIPELINE_STATS=1 on a device with
+        // VK_KHR_pipeline_executable_properties: each pipeline the renderer
+        // makes logs its shaders' compiler statistics (registers, spills,
+        // instructions; gpu/renderer.cpp).
+        bool pipelineExecutableStats = false;
     };
 
     // nullptr when running headless.

@@ -105,6 +105,34 @@ uint vmem(uint byteAddress)
     return memLoad(a >> 2);
 }
 
+// A vertex fetch's words [byteAddress, + bytes), found once (vmem per word
+// tests the four snapshots for each): the ring word of its first one (bit
+// 31 set) when a snapshot holds them all, its memory word when none holds
+// any, else ~0u (a snapshot starts or ends among them: word by word).
+uint vres(uint byteAddress, uint bytes)
+{
+    uint a = byteAddress & 0x1FFFFFFFu;
+    for (int r = 0; r < 4; r++)
+    {
+        uint d = a - pc.vfRedirect[r].x;
+        if (d < pc.vfRedirect[r].y)
+            return d + bytes <= pc.vfRedirect[r].y ? ((pc.vfRedirect[r].z + d) >> 2) | 0x80000000u : 0xFFFFFFFFu;
+        if (pc.vfRedirect[r].x - a < bytes && pc.vfRedirect[r].y != 0u)
+            return 0xFFFFFFFFu;
+    }
+    return a >> 2;
+}
+
+// Word i of a fetch vres found: the same word vmem(byteAddress + i * 4) reads.
+uint vword(uint loc, uint byteAddress, uint i)
+{
+    if (loc == 0xFFFFFFFFu)
+        return vmem(byteAddress + i * 4u);
+    if ((loc & 0x80000000u) != 0u)
+        return g_ring[(loc & 0x7FFFFFFFu) + i];
+    return memLoad(loc + i);
+}
+
 bool boolConst(uint i) { return ((u.bools[i >> 7][(i >> 5) & 3u] >> (i & 31u)) & 1u) != 0u; }
 
 // Shader Model 3 multiplication: +-0 (or denormal) * anything = +0.
@@ -581,11 +609,13 @@ float xmul(float a, float b)
                 Line(std::format("uint vbase = (vf0 & 0xFFFFFFFCu) + uint(ivindex * {} + ({})) * 4u;",
                     int(full.stride()), int(op.offset())));
                 Line("uint vendian = vf1 & 3u;");
+                // (A fetch reads at most 16 bytes: the words it reads are those.)
+                Line("uint vloc = vres(vbase, 16u);");
 
                 xenos::VertexFormat format = op.data_format();
                 bool isSigned = op.is_signed();
                 bool normalized = op.is_normalized();
-                auto word = [&](int i) { return std::format("gpuSwap(vmem(vbase + {}u), vendian)", i * 4); };
+                auto word = [&](int i) { return std::format("gpuSwap(vword(vloc, vbase, {}u), vendian)", i); };
                 std::string value;
                 // Packed integer formats: widths/offsets per component.
                 auto packed = [&](std::initializer_list<std::pair<int, int>> comps, int words) {
