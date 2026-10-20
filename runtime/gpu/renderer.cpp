@@ -3800,8 +3800,17 @@ shaderPreamble;
         // Never waits; not kept in the key list.
         VkPipeline PrepassPipeline(const PipelineKey& key, VkPipelineLayout layout)
         {
+            // (Draws in a row share theirs often: the last one, as GetPipeline's.)
+            static PipelineKey lastKey{};
+            static VkPipeline lastPipeline = VK_NULL_HANDLE;
+            if (lastPipeline != VK_NULL_HANDLE && key == lastKey)
+                return lastPipeline;
             if (auto it = s_pipelines.find(key); it != s_pipelines.end())
+            {
+                lastKey = key;
+                lastPipeline = it->second.pipeline;
                 return it->second.pipeline;
+            }
             auto p = s_pendingPipelines.find(key);
             if (p == s_pendingPipelines.end())
             {
