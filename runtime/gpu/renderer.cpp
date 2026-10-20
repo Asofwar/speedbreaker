@@ -796,7 +796,7 @@ namespace gpu::renderer
         const void* s_lastConstLayoutVs = nullptr;  // the layout of that upload (see Draw)
         const void* s_lastConstLayoutPs = nullptr;
         VkCommandBuffer s_cmd = VK_NULL_HANDLE;
-        // NFSMW_PREPASS=1 (off by default): a depth pre-pass in each pass with
+        // NFSMW_PREPASS=1 (see kPrepassDefault): a depth pre-pass in each pass with
         // colour and depth targets. The pass records into two secondary
         // command buffers, run in its rendering in turn at its end: the
         // pre-pass, where each draw that writes depth (LESS_OR_EQUAL, no
@@ -816,7 +816,18 @@ namespace gpu::renderer
         // NFSMW_PREPASS=2: alpha-tested draws and those with kills too, with
         // their pixel shader in the pre-pass (a variant writing no colour:
         // only what decides the discard is left of it).
-        const uint32_t s_prepassLevel = [] { const char* v = std::getenv("NFSMW_PREPASS"); return v ? uint32_t(std::clamp(std::atoi(v), 0, 2)) : 0u; }();
+        // By default 1 on x86-64 Linux (0 turns it off): a Steam Deck at 5 W,
+        // 3 alternated pairs (deck_ab.sh): GPU busy -1.39, -1.78, -1.90 ms a
+        // frame (24.1 -> 22.3), the command processor +1.8 ms, the 7 shots
+        // within --strict, the trace hash the same. Level 2 measured worse
+        // than 1 there (the alpha-tested draws' pixel shaders run twice).
+        // Not on the tile GPUs (Apple, Turnip): unmeasured there.
+#if defined(__linux__) && defined(__x86_64__)
+        constexpr uint32_t kPrepassDefault = 1;
+#else
+        constexpr uint32_t kPrepassDefault = 0;
+#endif
+        const uint32_t s_prepassLevel = [] { const char* v = std::getenv("NFSMW_PREPASS"); return v ? uint32_t(std::clamp(std::atoi(v), 0, 2)) : kPrepassDefault; }();
         const bool s_prepassOn = s_prepassLevel >= 1;
         bool s_passSecondary = false;
         VkCommandBuffer s_primaryCmd = VK_NULL_HANDLE, s_preCmd = VK_NULL_HANDLE;
@@ -10285,7 +10296,9 @@ void main()
             Shader* ps;
             ~RestorePs() { s_ps = ps; }
         } restorePs{ s_ps };
-        if (!gpu::RunsGuestPixelShader(edramMode, s_depthOnlyGuestPs) || (s_exp & 64))
+        if (!gpu::RunsGuestPixelShader(edramMode, s_depthOnlyGuestPs))
+            s_ps = DepthOnlyPixelShader();
+        else if (s_exp & 64)  // (NFSMW_GPU_EXP: every draw's)
             s_ps = DepthOnlyPixelShader();
         s_stats.draws++;
         auto skip = [&](uint64_t key, const char* why) {
@@ -13027,8 +13040,8 @@ void main()
             log.now = frame >= log.first && frame <= log.last;
             writewatch::SetWriterFrame(frame);
         }
-        s_frame = frame;
         s_cacheFrame = frame;
+        s_frame = frame;
         if (s_vk)
             TrimTextureCache();
         // NFSMW_RESOLVE_STATS's window.
