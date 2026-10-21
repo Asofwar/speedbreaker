@@ -4,6 +4,7 @@
 #pragma once
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace winsys
 {
@@ -43,6 +44,10 @@ namespace winsys
     // UTF-8 (empty: none).
     std::string UserRegistryString(const char* key, const char* value);
     std::string MachineRegistryString(const char* key, const char* value);
+
+    // The roots of the local drives (fixed and removable, not network or
+    // optical ones, which can take long to answer): "C:\\", "D:\\", ...
+    std::vector<std::string> LocalDriveRoots();
 
     // For the system report (report/system_info.cpp): "Windows 11 Pro 24H2
     // (build 26100.1234)", the physical cores, and memory in bytes.

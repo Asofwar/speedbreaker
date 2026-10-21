@@ -67,6 +67,13 @@ if(WIN32)
     target_compile_options(SpeedBreaker PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/compat/win/win_compat.h>")
     target_compile_definitions(SpeedBreaker PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00 _FILE_OFFSET_BITS=64)
     target_link_options(SpeedBreaker PRIVATE -fuse-ld=lld -static -static-libgcc -static-libstdc++)
+    # A window, no console: the GUI subsystem, entered at the console CRT's
+    # mainCRTStartup (it calls main). The log is in the data folder's logs/;
+    # stderr still goes where a launch redirects it.
+    target_link_options(SpeedBreaker PRIVATE -Wl,--subsystem,windows -Wl,--entry,mainCRTStartup)
+    # Its icon and manifest (UTF-8 code page, long paths).
+    enable_language(RC)
+    target_sources(SpeedBreaker PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/compat/win/speedbreaker.rc)
     target_link_libraries(SpeedBreaker PRIVATE -Wl,--start-group -lstdc++ -lwinpthread -Wl,--end-group ws2_32 iphlpapi synchronization winmm imm32 version setupapi ole32 oleaut32 uuid shlwapi bcrypt advapi32 shell32 user32 gdi32 dbghelp cfgmgr32 hid)
 endif()
 find_package(SDL3 REQUIRED CONFIG)

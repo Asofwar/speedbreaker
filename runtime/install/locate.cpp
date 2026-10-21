@@ -4,6 +4,9 @@
 #include "placement.h"
 
 #include <user/paths.h>
+#ifdef _WIN32
+#include <compat/win/win_sys.h>
+#endif
 
 #include <algorithm>
 #include <cstdio>
@@ -301,6 +304,22 @@ namespace install
             if (fs::is_directory(dir, ec) && std::find(folders.begin(), folders.end(), dir) == folders.end())
                 folders.push_back(dir);
         };
+#ifdef _WIN32
+        // The profile's folders, then every local drive's root and Games
+        // folder (where an .iso is often kept: D:\, an SD card, a USB stick).
+        if (const wchar_t* profile = _wgetenv(L"USERPROFILE"); profile && *profile)
+        {
+            fs::path h = profile;
+            add(h);
+            for (const char* sub : { "Downloads", "Desktop", "Documents", "Games" })
+                add(h / sub);
+        }
+        for (const std::string& root : winsys::LocalDriveRoots())
+        {
+            add(fs::path(root));
+            add(fs::path(root) / "Games");
+        }
+#else
         if (const char* home = std::getenv("HOME"); home && *home)
         {
             fs::path h = home;
@@ -308,7 +327,9 @@ namespace install
             for (const char* sub : { "Downloads", "Desktop", "Documents", "Games" })
                 add(h / sub);
         }
-#ifdef __APPLE__
+#endif
+#if defined(_WIN32)
+#elif defined(__APPLE__)
         // /Volumes also lists the startup disk (a link to /): skip it, a scan of
         // the whole system disk is what the folders above avoid.
         std::error_code ec;

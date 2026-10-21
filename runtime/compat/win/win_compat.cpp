@@ -270,6 +270,22 @@ namespace winsys
         return cores;
     }
 
+    std::vector<std::string> LocalDriveRoots()
+    {
+        std::vector<std::string> out;
+        const DWORD drives = GetLogicalDrives();
+        for (int i = 0; i < 26; i++)
+        {
+            if (!(drives & (1u << i)))
+                continue;
+            const std::string root = std::string(1, char('A' + i)) + ":\\";
+            const UINT type = GetDriveTypeA(root.c_str());
+            if (type == DRIVE_FIXED || type == DRIVE_REMOVABLE)
+                out.push_back(root);
+        }
+        return out;
+    }
+
     Memory MemoryStatus()
     {
         MEMORYSTATUSEX m{};

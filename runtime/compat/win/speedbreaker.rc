@@ -1,0 +1,6 @@
+// SpeedBreaker Windows port: the exe's icon (scripts/macos/AppIcon.png's
+// speedometer) and manifest. GPL-3.0-or-later.
+#include <winuser.h>
+
+1 ICON "speedbreaker.ico"
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "speedbreaker.manifest"
