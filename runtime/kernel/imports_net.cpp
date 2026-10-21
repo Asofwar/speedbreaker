@@ -190,6 +190,17 @@ namespace
     // 127.0.0.3...: all of 127/8 is this machine's) and the race's port each.
     const bool s_bindLocal = std::getenv("NFSMW_NET_ADDR") != nullptr;
 
+    // The address to bind to (NFSMW_NET_ADDR's, network order): not
+    // LocalAddress(), which over Steam is a virtual one.
+    uint32_t BindAddress()
+    {
+        in_addr a{};
+        const char* v = std::getenv("NFSMW_NET_ADDR");
+        if (!v || inet_pton(AF_INET, v, &a) != 1)
+            a.s_addr = htonl(INADDR_ANY);
+        return a.s_addr;
+    }
+
     void BindLocal(int fd)
     {
         if (!s_bindLocal)
@@ -200,7 +211,7 @@ namespace
             return;  // bound already
         me = {};
         me.sin_family = AF_INET;
-        me.sin_addr.s_addr = htonl(LocalAddress());
+        me.sin_addr.s_addr = BindAddress();
         bind(fd, reinterpret_cast<sockaddr*>(&me), sizeof(me));
     }
 
@@ -784,7 +795,7 @@ int NetDll_bind(uint32_t caller, uint32_t s, const uint8_t* name, int length)
     // the game's address in the XNADDR must be reachable: bind on all interfaces whatever address it names
     // (NFSMW_NET_ADDR: on that one)
     const uint16_t port = ntohs(a.sin_port);
-    a.sin_addr.s_addr = s_bindLocal ? htonl(LocalAddress()) : htonl(INADDR_ANY);
+    a.sin_addr.s_addr = s_bindLocal ? BindAddress() : htonl(INADDR_ANY);
     if (bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0)
         return Fail();
     NETLOG("bind(socket %u, port %u)", s, port);
