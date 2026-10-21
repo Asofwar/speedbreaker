@@ -26,6 +26,7 @@
 #include <poll.h>
 #include <pwd.h>
 #include <sys/socket.h>
+#include <online/socket.h>
 #include <unistd.h>
 
 #if __has_include(<toml++/toml.hpp>)
@@ -114,7 +115,7 @@ namespace online
             }
             catch (const toml::parse_error& e)
             {
-                fprintf(stderr, "[online] %s doesn't parse (%s): its defaults\n", path.c_str(), std::string(e.description()).c_str());
+                fprintf(stderr, "[online] %s doesn't parse (%s): its defaults\n", path.string().c_str(), std::string(e.description()).c_str());
             }
         }
 
@@ -198,7 +199,7 @@ namespace online
                     }
                     s_found.notify_all();
                     fprintf(stderr, "[online] found %s's lobby at %s\n", name.c_str(), inet_ntoa(from.sin_addr));
-                    close(fd);
+                    online::CloseSocket(fd);
                     return;
                 }
             }
@@ -345,17 +346,25 @@ namespace online
         {
             if (!i->ifa_addr || i->ifa_addr->sa_family != AF_INET || !(i->ifa_flags & IFF_UP) || (i->ifa_flags & IFF_LOOPBACK))
                 continue;
-            const std::string name = i->ifa_name ? i->ifa_name : "";
+            // Linux's interface names (tailscale0, ztxxxxxx), Windows' adapter
+            // names ("Tailscale", "ZeroTier One [...]"), in lower case.
+            std::string name = i->ifa_name ? i->ifa_name : "";
+            for (char& c : name)
+                c = char(std::tolower(static_cast<unsigned char>(c)));
             // a container's or a VM's own network: no player reaches it
-            if (name.rfind("docker", 0) == 0 || name.rfind("br-", 0) == 0 || name.rfind("veth", 0) == 0 || name.rfind("virbr", 0) == 0 ||
-                name.rfind("lxc", 0) == 0 || name.rfind("podman", 0) == 0)
+            // (Windows: WSL's and Hyper-V's default switch, VirtualBox's and
+            // VMware's host-only adapters)
+            if (name.rfind("docker", 0) == 0 || name.rfind("br-", 0) == 0 || (name.rfind("veth", 0) == 0 && name.rfind("vethernet", 0) != 0) || name.rfind("virbr", 0) == 0 ||
+                name.rfind("lxc", 0) == 0 || name.rfind("podman", 0) == 0 || name.find("(wsl") != std::string::npos ||
+                name.find("default switch") != std::string::npos || name.find("virtualbox") != std::string::npos ||
+                name.find("vmware") != std::string::npos)
                 continue;
             const in_addr a = reinterpret_cast<sockaddr_in*>(i->ifa_addr)->sin_addr;
             const uint32_t h = ntohl(a.s_addr);
             std::string kind = "LAN";
             if (name.rfind("tailscale", 0) == 0 || (h & 0xFFC00000u) == 0x64400000u)  // 100.64.0.0/10
                 kind = "Tailscale";
-            else if (name.rfind("zt", 0) == 0)
+            else if (name.rfind("zt", 0) == 0 || name.rfind("zerotier", 0) == 0)
                 kind = "ZeroTier";
             out.push_back({ kind, inet_ntoa(a) });
         }

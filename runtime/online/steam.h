@@ -22,9 +22,8 @@
 #pragma once
 #include <cstddef>
 #include <cstdint>
+#include <netinet/in.h>
 #include <sys/types.h>
-
-struct sockaddr_in;
 
 namespace online::steam
 {

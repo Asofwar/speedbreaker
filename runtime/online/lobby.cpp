@@ -55,6 +55,7 @@
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <online/socket.h>
 #include <unistd.h>
 
 namespace online
@@ -257,7 +258,7 @@ namespace online
                 a.sin_addr.s_addr = htonl(INADDR_ANY);
                 if (bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0 || listen(fd, 16) != 0)
                 {
-                    close(fd);
+                    online::CloseSocket(fd);
                     return -1;
                 }
                 fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
@@ -278,7 +279,7 @@ namespace online
                 a.sin_addr.s_addr = htonl(INADDR_ANY);
                 if (bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0)
                 {
-                    close(fd);
+                    online::CloseSocket(fd);
                     return -1;
                 }
                 return fd;
@@ -419,7 +420,7 @@ namespace online
                         continue;
                     Forget(**it);
                     fprintf(stderr, "[lobby] %s (%s) leaves\n", (*it)->ip.c_str(), (*it)->Persona().c_str());
-                    close(fd);
+                    online::CloseSocket(fd);
                     m_sessions.erase(it);
                 }
                 m_closed.clear();

@@ -26,6 +26,7 @@
 #include <poll.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <online/socket.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -197,7 +198,7 @@ namespace
                 result = ntohl(me.sin_addr.s_addr);
         }
         if (s >= 0)
-            close(s);
+            online::CloseSocket(s);
         address = result;
         final = server != 0 || online::GetMode() != online::Mode::Join;
         next = now + std::chrono::seconds(3);
@@ -726,7 +727,7 @@ int NetDll_closesocket(uint32_t caller, uint32_t s)
     }
     // its pending receives end before its descriptor can be another socket's
     CancelPendingReceives(s);
-    close(sock->fd);
+    online::CloseSocket(sock->fd);
     s_sockets.erase(s);
     return 0;
 }

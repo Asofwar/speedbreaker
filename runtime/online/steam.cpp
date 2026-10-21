@@ -1,9 +1,9 @@
 // SpeedBreaker runtime. GPL-3.0-or-later (see COPYING).
 //
 // Steam's flat C API, loaded at run time (no SDK headers, no import
-// library: GPL-clean), with manual callback dispatch. Struct layouts are
-// Linux's: Steam's callback structs are packed to 4 bytes there (8 on
-// Windows), so a uint64 can follow an int32 directly.
+// library: GPL-clean), with manual callback dispatch. Steam's callback
+// structs are packed to 4 bytes on Linux and macOS, to 8 on Windows: a
+// uint64 after an int32 is at 4 or at 8 (kAfterInt32).
 #include "steam.h"
 #include "online.h"
 
@@ -28,7 +28,12 @@
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <online/socket.h>
 #include <unistd.h>
+#ifdef _WIN32
+#include <compat/win/win_sys.h>
+#include <fstream>
+#endif
 
 namespace online::steam
 {
@@ -81,6 +86,13 @@ namespace online::steam
         std::atomic<bool> s_active{ false };
         std::recursive_mutex s_steam;  // around every Steam call
 
+#ifdef _WIN32
+        constexpr size_t kAfterInt32 = 8;
+        constexpr const char* kLibrary = "steam_api64.dll";
+#else
+        constexpr size_t kAfterInt32 = 4;
+        constexpr const char* kLibrary = "libsteam_api.so";
+#endif
         constexpr int kChannelDatagram = 0, kChannelTunnel = 1;
         constexpr int kSendUnreliable = 0, kSendNoNagle = 1, kSendReliable = 8;
         constexpr int kLobbyFriends = 1, kLobbyPublic = 2;
@@ -186,7 +198,51 @@ namespace online::steam
             return lib;
         }
 
-        // A libsteam_api.so of a Steam game: most ship one.
+        // The folders Steam's games are in: on Linux under the home folder,
+        // on Windows under Steam's own folder (the registry knows it) and
+        // the other libraries its libraryfolders.vdf lists.
+        std::vector<std::filesystem::path> GameFolders()
+        {
+            std::vector<std::filesystem::path> out;
+#ifdef _WIN32
+            std::string steam = winsys::UserRegistryString("Software\\Valve\\Steam", "SteamPath");
+            if (steam.empty())
+                return out;
+            const std::filesystem::path root = std::filesystem::path(steam);
+            out.push_back(root / "steamapps" / "common");
+            // "path"		"D:\\SteamLibrary"
+            std::ifstream vdf(root / "steamapps" / "libraryfolders.vdf");
+            for (std::string line; std::getline(vdf, line);)
+            {
+                const size_t key = line.find("\"path\"");
+                if (key == std::string::npos)
+                    continue;
+                const size_t open = line.find('"', key + 6), close = line.rfind('"');
+                if (open == std::string::npos || close <= open)
+                    continue;
+                std::string path;
+                for (size_t i = open + 1; i < close; i++)
+                {
+                    if (line[i] == '\\' && i + 1 < close)
+                        i++;
+                    path += line[i];
+                }
+                const std::filesystem::path common = std::filesystem::path(path) / "steamapps" / "common";
+                if (std::find(out.begin(), out.end(), common) == out.end())
+                    out.push_back(common);
+            }
+#else
+            const char* home = std::getenv("HOME");
+            if (!home)
+                return out;
+            for (const char* root : { "/.local/share/Steam/steamapps/common", "/.steam/steam/steamapps/common", "/.steam/root/steamapps/common" })
+                out.push_back(std::string(home) + root);
+#endif
+            return out;
+        }
+
+        // A Steam game's copy of Steam's library (libsteam_api.so,
+        // steam_api64.dll): most ship one.
         void* Find()
         {
             if (const char* v = std::getenv("NFSMW_STEAM_API"); v && *v)
@@ -196,15 +252,11 @@ namespace online::steam
                     fprintf(stderr, "[steam] NFSMW_STEAM_API=%s doesn't load (%s)\n", v, dlerror());
                 return lib;
             }
-            if (void* lib = Open("libsteam_api.so"))  // on the library path
+            if (void* lib = Open(kLibrary))  // on the library path (Windows: next to the game too)
                 return lib;
-            const char* home = std::getenv("HOME");
-            if (!home)
-                return nullptr;
             std::error_code ec;
-            for (const char* root : { "/.local/share/Steam/steamapps/common", "/.steam/steam/steamapps/common", "/.steam/root/steamapps/common" })
+            for (const std::filesystem::path& base : GameFolders())
             {
-                const std::filesystem::path base = std::string(home) + root;
                 if (!std::filesystem::is_directory(base, ec))
                     continue;
                 int seen = 0;
@@ -218,11 +270,11 @@ namespace online::steam
                         it.disable_recursion_pending();
                         continue;
                     }
-                    if (it->path().filename() != "libsteam_api.so")
+                    if (it->path().filename() != kLibrary)
                         continue;
                     if (void* lib = Open(it->path().string()))
                     {
-                        fprintf(stderr, "[steam] Steam's library from %s\n", it->path().c_str());
+                        fprintf(stderr, "[steam] Steam's library from %s\n", it->path().string().c_str());
                         return lib;
                     }
                 }
@@ -235,7 +287,7 @@ namespace online::steam
             void* lib = Find();
             if (!lib)
             {
-                fprintf(stderr, "[steam] no libsteam_api.so with the flat API (a Steam game's, or NFSMW_STEAM_API=<path>)\n");
+                fprintf(stderr, "[steam] no %s with the flat API (a Steam game's, or NFSMW_STEAM_API=<path>)\n", kLibrary);
                 return false;
             }
             bool ok = Bind(lib, a.InitFlat, { "SteamAPI_InitFlat" }) && Bind(lib, a.GetHSteamPipe, { "SteamAPI_GetHSteamPipe" }) &&
@@ -372,7 +424,7 @@ namespace online::steam
                 s_tunnelPeers[ntohs(me.sin_port)] = VirtualAddress(from);
                 if (connect(fd, reinterpret_cast<sockaddr*>(&lobby), sizeof(lobby)) != 0)
                 {
-                    close(fd);
+                    online::CloseSocket(fd);
                     Tunnel t{ from, id, port };
                     TunnelSend(t, kClose);
                     return;
@@ -405,9 +457,9 @@ namespace online::steam
             else if (m[0] == kClose)
             {
                 if (it->fd >= 0)
-                    close(it->fd);
+                    online::CloseSocket(it->fd);
                 if (it->listener >= 0)
-                    close(it->listener);
+                    online::CloseSocket(it->listener);
                 s_tunnels.erase(it);
             }
         }
@@ -434,7 +486,7 @@ namespace online::steam
                 {
                     // the game connected to the proxy: open the tunnel
                     it->fd = accept(it->listener, nullptr, nullptr);
-                    close(it->listener);
+                    online::CloseSocket(it->listener);
                     it->listener = -1;
                     if (it->fd < 0)
                         continue;
@@ -451,7 +503,7 @@ namespace online::steam
                 else if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
                 {
                     TunnelSend(*it, kClose);
-                    close(it->fd);
+                    online::CloseSocket(it->fd);
                     s_tunnels.erase(it);
                 }
             }
@@ -490,6 +542,8 @@ namespace online::steam
             switch (callback)
             {
             case kLobbyCreated:  // { int32 result; uint64 lobby }
+            {
+                const uint64_t lobby = u64(kAfterInt32);
                 if (u32(0) != 1)
                 {
                     fprintf(stderr, "[steam] the lobby wasn't made (result %u)\n", u32(0));
@@ -497,17 +551,18 @@ namespace online::steam
                 }
                 {
                     std::lock_guard lock(s_steam);
-                    a.SetLobbyData(s_mm, u64(4), "speedbreaker", "1");
-                    a.SetLobbyData(s_mm, u64(4), "host", Gamertag().c_str());
+                    a.SetLobbyData(s_mm, lobby, "speedbreaker", "1");
+                    a.SetLobbyData(s_mm, lobby, "host", Gamertag().c_str());
                 }
                 {
                     std::lock_guard lock(s_mutex);
-                    s_lobby = u64(4);
+                    s_lobby = lobby;
                     s_host = s_self;
                 }
-                fprintf(stderr, "[steam] hosting Steam lobby %llu\n", (unsigned long long)u64(4));
+                fprintf(stderr, "[steam] hosting Steam lobby %llu\n", (unsigned long long)lobby);
                 s_changed.notify_all();
                 break;
+            }
             case kLobbyMatchList:  // { uint32 count }
             {
                 if (u32(0) == 0)
@@ -771,7 +826,7 @@ namespace online::steam
         proxy.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         if (bind(listener, reinterpret_cast<sockaddr*>(&proxy), sizeof(proxy)) != 0 || listen(listener, 1) != 0)
         {
-            close(listener);
+            online::CloseSocket(listener);
             return false;
         }
         socklen_t l = sizeof(proxy);
