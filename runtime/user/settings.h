@@ -91,6 +91,8 @@ namespace settings
         KeyRightStickRight, KeyRightStickRight2,
         KeyLeftStickClick, KeyLeftStickClick2,
         KeyRightStickClick, KeyRightStickClick2,
+        // Online
+        OnlineMode,  // online/online.h: Off, Host, Join
         // Advanced
         AsyncShaders,
         PerformanceOverlay,
@@ -101,7 +103,7 @@ namespace settings
     // Key: a key code of user/key_names.h (0: no key), saved by its name
     // there ("w", "left_shift", "none"); the menu takes it from a key press.
     enum class Type : uint8_t { Bool, Int, Float, Enum, Key };
-    enum class Category : uint8_t { Display, Graphics, Audio, Input, Controls, Advanced, Count };
+    enum class Category : uint8_t { Display, Graphics, Audio, Input, Controls, Online, Advanced, Count };
     enum class Apply : uint8_t { Live, Restart };
 
     // Values of the enum options (GetInt returns them).

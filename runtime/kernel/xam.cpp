@@ -3,6 +3,7 @@
 // exports are removed; input returns in Phase 6 on our own SDL3 layer.
 #include <stdafx.h>
 #include "xam.h"
+#include <online/online.h>
 #include "vfs.h"
 #include "xdm.h"
 #include <cpu/guest_thread.h>
@@ -184,12 +185,7 @@ void XamRegisterContent(uint32_t type, const std::string_view name, const std::s
 
 const char* XamGamertag()
 {
-    static const std::string name = [] {
-        std::string v = std::getenv("NFSMW_GAMERTAG") ? std::getenv("NFSMW_GAMERTAG") : "";
-        v = v.substr(0, 15);
-        return v.empty() ? std::string("Player") : v;
-    }();
-    return name.c_str();
+    return online::Gamertag().c_str();
 }
 
 uint64_t XamXuid()

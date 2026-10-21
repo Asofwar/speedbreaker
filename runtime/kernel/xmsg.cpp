@@ -6,6 +6,7 @@
 // sessions, stats) and XLiveBase (0xFC) messages fail with X_E_FAIL and a log
 // line, as Xenia's unknown messages do, unless NFSMW_FAKE_LIVE=1 (below).
 #include <stdafx.h>
+#include <online/online.h>
 #include "function.h"
 #include "overlapped.h"
 #include "xam.h"
@@ -134,7 +135,7 @@ namespace
     // layouts are Xenia's (xgi_app.cc, xlivebase_app.cc); what NFS Most
     // Wanted needs of them is what victorgbd's NFSMW Recompiled found
     // (github.com/victorgbd/NFSMW-Recompiled-Mobile, docs/diario).
-    const bool s_fakeLive = std::getenv("NFSMW_FAKE_LIVE") != nullptr;
+    bool FakeLive() { return online::Enabled(); }
 
     void LiveLogOnce(uint32_t app, uint32_t message, const char* what)
     {
@@ -223,9 +224,9 @@ namespace
     {
         if (app == 0xFA)
             return XmpDispatch(message, buffer, length);
-        if (s_fakeLive && app == 0xFB)
+        if (FakeLive() && app == 0xFB)
             return XgiDispatch(message, buffer, length);
-        if (s_fakeLive && app == 0xFC)
+        if (FakeLive() && app == 0xFC)
             return XLiveBaseDispatch(message, buffer, length);
         if (app == 0xFB || app == 0xFC)
         {

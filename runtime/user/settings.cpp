@@ -114,6 +114,12 @@ namespace settings
             { 24, "3x", "3x (2160p)" },
         };
 
+        constexpr EnumEntry kOnlineModeEntries[] = {
+            { 0, "off", "Off" },
+            { 1, "host", "Host" },
+            { 2, "join", "Join" },
+        };
+
         constexpr EnumEntry kAnisotropyEntries[] = {
             { kAnisotropyAuto, "auto", "Auto" },
             { 1, "off", "Off" },
@@ -297,6 +303,11 @@ namespace settings
             KeyOption2(Id::KeyLeftStickClick2, "left_stick_click_2", "Left Stick Click", "none"),
             KeyOption(Id::KeyRightStickClick, "right_stick_click", "Right Stick Click", "Pressing the right stick in.", "c"),
             KeyOption2(Id::KeyRightStickClick2, "right_stick_click_2", "Right Stick Click", "none"),
+            // Online
+            { .id = Id::OnlineMode, .category = Category::Online, .type = Type::Enum, .apply = Apply::Restart,
+              .table = "online", .key = "mode", .label = "Xbox Live",
+              .description = "Race others in the game's Xbox Live mode, through a lobby SpeedBreaker runs itself. Host: this copy runs it; Join: a host's (on this network, or online.toml's server).",
+              .env = "NFSMW_ONLINE", .defaultValue = 0, .entries = kOnlineModeEntries },
             // Advanced
             { .id = Id::AsyncShaders, .category = Category::Advanced, .type = Type::Bool, .apply = Apply::Live,
               .table = "advanced", .key = "async_shaders", .label = "Asynchronous Shaders",
@@ -1096,6 +1107,7 @@ namespace settings
         case Category::Audio: return "Audio";
         case Category::Input: return "Input";
         case Category::Controls: return "Controls";
+        case Category::Online: return "Online";
         case Category::Advanced: return "Advanced";
         default: return "";
         }

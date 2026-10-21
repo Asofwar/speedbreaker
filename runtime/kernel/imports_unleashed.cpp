@@ -5,6 +5,7 @@
 // removed, so those imports fall back to our loud stubs
 // (scripts/gen_import_stubs.py).
 #include <stdafx.h>
+#include <online/online.h>
 #include <kernel/overlapped.h>
 #include <cpu/ppc_context.h>
 #include <cpu/guest_thread.h>
@@ -33,7 +34,7 @@ uint32_t XGetGameRegion()
 uint32_t XamUserGetSigninState(uint32_t userIndex)
 {
     // 0 not signed in, 1 signed in locally, 2 signed in to Xbox Live. NFSMW_FAKE_LIVE=1 (a probe, see imports_user.cpp) claims Live.
-    static const bool fakeLive = std::getenv("NFSMW_FAKE_LIVE") != nullptr;
+    static const bool fakeLive = online::Enabled();
     if (fakeLive)
     {
         static bool logged = false;

@@ -9,6 +9,8 @@
 //
 // Everything the game asks is logged once with NFSMW_NET_LOG=1.
 #include <stdafx.h>
+#include <online/online.h>
+#include <online/steam.h>
 #include "dispatcher.h"
 #include "function.h"
 #include "memory.h"
@@ -155,6 +157,8 @@ namespace
     // The address the game reports for this machine.
     uint32_t LocalAddress()  // as the integer the guest holds: the four bytes read big-endian
     {
+        if (online::steam::Active())
+            return online::steam::OwnAddress();  // (its virtual address: online/steam.h)
         static const uint32_t addr = [] {
             in_addr a{};
             if (const char* v = std::getenv("NFSMW_NET_ADDR"); v && inet_pton(AF_INET, v, &a) == 1)
@@ -314,7 +318,7 @@ uint32_t NetDll_XNetGetTitleXnAddr(uint32_t caller, uint8_t* xnaddr)
             NETLOG("XNetGetTitleXnAddr: %u calls so far", n);
     }
     // NFSMW_FAKE_LIVE=1: the game's NetConn state machine waits for the Live notifications (connection changed, link state) once it has an address.
-    if (std::getenv("NFSMW_FAKE_LIVE"))
+    if (online::Enabled())
         XamNotifyLiveConnected();
     {
         static std::atomic<int> n{ 0 };
@@ -355,11 +359,12 @@ void NetOwnXnAddr(uint8_t* xnaddr)
 
 uint32_t NetServiceAddress()
 {
-    in_addr a{};
-    const char* v = std::getenv("NFSMW_NET_HOST");
-    if (!v || inet_pton(AF_INET, v, &a) != 1)
-        inet_pton(AF_INET, "127.0.0.1", &a);
-    return a.s_addr;
+    return online::ServerAddress();
+}
+
+uint32_t NetLocalAddressHost()
+{
+    return LocalAddress();
 }
 
 // The logon's identity, which the game's online code asks for once signed in
@@ -548,9 +553,7 @@ int NetDll_XNetRandom(uint8_t* buffer, uint32_t length)
 int NetDll_XNetDnsLookup(uint32_t caller, const char* host, uint32_t event, be<uint32_t>* result)
 {
     in_addr a{};
-    const char* want = std::getenv("NFSMW_NET_HOST");
-    if (!want || inet_pton(AF_INET, want, &a) != 1)
-        inet_pton(AF_INET, "127.0.0.1", &a);
+    a.s_addr = online::ServerAddress();  // (online/online.h: our lobby, a host's, or NFSMW_NET_HOST)
     const uint32_t block = ExAllocatePoolWithTag(48, 0);
     uint8_t* dns = reinterpret_cast<uint8_t*>(g_memory.Translate(block));
     memset(dns, 0, 48);
@@ -798,6 +801,14 @@ int NetDll_connect(uint32_t caller, uint32_t s, const uint8_t* name, int length)
     if (!ToHost(name, length, a))
         return (t_lastError = WSAEFAULT, SOCKET_ERROR_);
     NETLOG("connect(socket %u, %s:%u)", s, inet_ntoa(a.sin_addr), ntohs(a.sin_port));
+    // a player's virtual address over Steam: its local proxy (online/steam.h)
+    if (online::steam::IsVirtual(ntohl(a.sin_addr.s_addr)) && online::steam::Active())
+    {
+        sockaddr_in proxy;
+        if (!online::steam::Connect(ntohl(a.sin_addr.s_addr), ntohs(a.sin_port), proxy))
+            return (t_lastError = WSAEHOSTUNREACH, SOCKET_ERROR_);
+        a = proxy;
+    }
     BindLocal(fd);
     if (connect(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0)
         return Fail();
@@ -928,7 +939,9 @@ int NetDll_sendto(uint32_t caller, uint32_t s, const uint8_t* buffer, int length
     if (!ToHost(to, toLength, a))
         return (t_lastError = WSAEFAULT, SOCKET_ERROR_);
     BindLocal(fd);
-    const ssize_t n = sendto(fd, buffer, size_t(length), MSG_NOSIGNAL, reinterpret_cast<sockaddr*>(&a), sizeof(a));
+    const ssize_t n = online::steam::IsVirtual(ntohl(a.sin_addr.s_addr)) && online::steam::Active()
+        ? online::steam::Send(fd, ntohl(a.sin_addr.s_addr), ntohs(a.sin_port), buffer, size_t(length))
+        : sendto(fd, buffer, size_t(length), MSG_NOSIGNAL, reinterpret_cast<sockaddr*>(&a), sizeof(a));
     if (s_log)
     {
         // the first few to each destination
@@ -963,6 +976,7 @@ int NetDll_recvfrom(uint32_t caller, uint32_t s, uint8_t* buffer, int length, in
     while (n < 0 && (errno == ECONNREFUSED || errno == EHOSTUNREACH || errno == ENETUNREACH));
     if (n < 0)
         return Fail();
+    online::steam::TranslateSource(a);  // (a player over Steam: from its relay socket)
     if (s_log)
     {
         static std::mutex m;
@@ -1178,6 +1192,8 @@ namespace
         while (n < 0 && (errno == ECONNREFUSED || errno == EHOSTUNREACH || errno == ENETUNREACH));
         if (n <= 0)
             return n;
+        if (from)
+            online::steam::TranslateSource(*from);  // (a player over Steam: from its relay socket)
         size_t done = 0;
         for (auto& b : buffers)
         {
@@ -1340,7 +1356,9 @@ namespace
             if (!ToHost(to, toLength, a))
                 return (t_lastError = WSAEFAULT, SOCKET_ERROR_);
             BindLocal(fd);
-            n = sendto(fd, data.data(), data.size(), MSG_NOSIGNAL, reinterpret_cast<sockaddr*>(&a), sizeof(a));
+            n = online::steam::IsVirtual(ntohl(a.sin_addr.s_addr)) && online::steam::Active()
+                ? online::steam::Send(fd, ntohl(a.sin_addr.s_addr), ntohs(a.sin_port), data.data(), data.size())
+                : sendto(fd, data.data(), data.size(), MSG_NOSIGNAL, reinterpret_cast<sockaddr*>(&a), sizeof(a));
             static std::atomic<uint32_t> logged{ 0 };
             if (logged.fetch_add(1) < 30)
                 NETLOG("WSASendTo(socket %u, %zu bytes) -> %s:%u = %zd", s, data.size(), inet_ntoa(a.sin_addr), ntohs(a.sin_port), n);
@@ -1502,7 +1520,7 @@ GUEST_FUNCTION_HOOK(__imp__NetDll_WSARecv, NetDll_WSARecv);
 extern "C" PPC_FUNC(__imp__sub_828198C0);
 PPC_FUNC(sub_828198C0)
 {
-    static const bool fakeLive = std::getenv("NFSMW_FAKE_LIVE") != nullptr;
+    static const bool fakeLive = online::Enabled();
     if (fakeLive && (ctx.r3.u32 == 0 || base[ctx.r3.u32] == 0))
     {
         static const uint32_t options = [] {

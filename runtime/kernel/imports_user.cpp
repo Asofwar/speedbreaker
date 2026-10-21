@@ -6,6 +6,7 @@
 // are stored and persisted to <user path>/profile_settings.bin (with
 // NFSMW_SAVE_DIR set, that folder's: user/paths.h).
 #include <stdafx.h>
+#include <online/online.h>
 #include <kernel/function.h>
 #include <kernel/overlapped.h>
 #include <kernel/vfs.h>
@@ -296,7 +297,7 @@ uint32_t XamUserCheckPrivilege(uint32_t userIndex, uint32_t privilege, be<uint32
     if (userIndex != 0 && userIndex != 0xFF)
         return X_ERROR_NO_SUCH_USER;
     // NFSMW_FAKE_LIVE=1 (a probe of what the game's own online flow asks for): every privilege is granted, and each one asked for is logged.
-    static const bool fakeLive = std::getenv("NFSMW_FAKE_LIVE") != nullptr;
+    static const bool fakeLive = online::Enabled();
     *result = fakeLive ? 1 : 0;
     if (fakeLive)
     {

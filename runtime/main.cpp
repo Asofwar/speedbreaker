@@ -33,6 +33,7 @@
 #include <ui/installer_screen.h>
 #include <ui/ui.h>
 #include <user/paths.h>
+#include <online/online.h>
 #include <user/settings.h>
 #include <user/version_check.h>
 
@@ -474,6 +475,7 @@ int main(int argc, char** argv)
     }
 #endif
     bool settingsLoaded = settings::Load();
+    online::Start();  // online/online.h: our lobby (Host) or the search for one (Join)
     // Which version ran last: a line in the log (so a bug report shows when a
     // problem began), the "What's new" note below, and this version recorded
     // as the last (user/version_check.h).

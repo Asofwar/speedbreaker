@@ -5,9 +5,9 @@
 
 #define MSGID(Area, Number) (uint32_t)((uint16_t)(Area) << 16 | (uint16_t)(Number))
 void XamNotifyLiveConnected();
-// The signed-in profile: its gamertag (NFSMW_GAMERTAG, else "Player"; at most
-// 15 characters) and its XUID (the long-standing one for "Player", else made
-// from the gamertag, so two players on a server are told apart).
+// The signed-in profile: its gamertag (online::Gamertag(): "Player" offline)
+// and its XUID (the long-standing one for "Player", else made from the
+// gamertag, so two players on a lobby are told apart).
 const char* XamGamertag();
 uint64_t XamXuid();
 #define MSG_AREA(msgid)     (((msgid) >> 16) & 0xFFFF)
