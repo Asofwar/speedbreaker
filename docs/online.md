@@ -14,9 +14,12 @@ Everything is on the Settings > Online page:
 | Row | What it does |
 |---|---|
 | Xbox Live | **Host** on one copy, **Join** on the others (Off: no online play) |
-| Connection | **Direct** (by address) or **Steam** (see below) |
+| Connection | **Address** (the local network, Tailscale, ZeroTier, open ports) or **Steam** (see below) |
 | Gamertag | your name in the lobby; empty: the system's user name, Steam's with Connection Steam |
 | Host Address | Join: the host to connect to; empty: the first host found on the local network |
+
+Under the rows the page lists this machine's addresses (LAN, Tailscale, ZeroTier): the host
+reads one off and gives it to the others.
 
 Xbox Live and Connection take effect the next time the game starts. On a Steam Deck the
 text rows bring up Steam's on-screen keyboard. The two text rows are kept in `online.toml`
@@ -102,9 +105,11 @@ SpeedBreaker держит у себя небольшое лобби вместо
 Как играть:
 
 1. Настройки > Online: Xbox Live — на одной копии **Host**, на остальных **Join**;
-   Connection — Direct или Steam; Gamertag и Host Address — имя и адрес хоста (пусто: найти в
-   локальной сети). Режим и соединение применяются после перезапуска игры. На Steam Deck
-   текстовые строки открывают экранную клавиатуру Steam.
+   Connection — Address (локальная сеть, Tailscale, ZeroTier) или Steam; Gamertag и
+   Host Address — имя и адрес хоста (пусто: найти в локальной сети). Режим и соединение
+   применяются после перезапуска игры. На Steam Deck текстовые строки открывают экранную
+   клавиатуру Steam. Под строками страница показывает адреса этой машины: хост сообщает
+   один из них остальным.
 2. Главное меню > Xbox Live. Хост создаёт игру: «Заезд», затем «Новая игра», когда поиск ничего
    не найдёт. Остальные выбирают тот же режим и тип гонки, и быстрый поиск находит игру хоста.
 
