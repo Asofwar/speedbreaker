@@ -180,6 +180,26 @@ namespace
         return addr;
     }
 
+    // NFSMW_NET_ADDR=<address>: the sockets are bound to it, not to every
+    // interface, and a socket that sends before it is bound gets it too. Two
+    // clients on one machine then have their own addresses (127.0.0.2,
+    // 127.0.0.3...: all of 127/8 is this machine's) and the race's port each.
+    const bool s_bindLocal = std::getenv("NFSMW_NET_ADDR") != nullptr;
+
+    void BindLocal(int fd)
+    {
+        if (!s_bindLocal)
+            return;
+        sockaddr_in me{};
+        socklen_t l = sizeof(me);
+        if (getsockname(fd, reinterpret_cast<sockaddr*>(&me), &l) == 0 && me.sin_port != 0)
+            return;  // bound already
+        me = {};
+        me.sin_family = AF_INET;
+        me.sin_addr.s_addr = htonl(LocalAddress());
+        bind(fd, reinterpret_cast<sockaddr*>(&me), sizeof(me));
+    }
+
     // ---- the poller behind WSAEventSelect
     std::once_flag s_pollerOnce;
     void PollerLoop()
@@ -308,17 +328,18 @@ uint32_t NetDll_XNetGetTitleXnAddr(uint32_t caller, uint8_t* xnaddr)
         xnaddr[0] = uint8_t(ina >> 24); xnaddr[1] = uint8_t(ina >> 16); xnaddr[2] = uint8_t(ina >> 8); xnaddr[3] = uint8_t(ina);
         // a made-up but fixed hardware address derived from the address, so peers can tell machines apart
         xnaddr[10] = 0x00; xnaddr[11] = 0x22; xnaddr[12] = 0x48; xnaddr[13] = xnaddr[1]; xnaddr[14] = xnaddr[2]; xnaddr[15] = xnaddr[3];
-        // the online (Xbox Live) address: the same, and a made-up online id
-        memcpy(xnaddr + 4, xnaddr, 4);   // inaOnline
-        for (int i = 0; i < 20; i++)
-            xnaddr[16 + i] = uint8_t(0x40 + i + xnaddr[3]);  // abOnline
+        // no online (Xbox Live gateway) address, inaOnline and abOnline 0: with
+        // one, DirtySock sends all of its game traffic to the gateway (its
+        // address remap table, sub_828298E0, sends every address there) and
+        // peers never hear from each other.
     }
     static bool logged = false;
     if (!std::exchange(logged, true))
         NETLOG("XNetGetTitleXnAddr: %u.%u.%u.%u", LocalAddress() >> 24, (LocalAddress() >> 16) & 255, (LocalAddress() >> 8) & 255, LocalAddress() & 255);
-    // XNET_GET_XNADDR_ETHERNET 0x02 | STATIC 0x04 | GATEWAY 0x20 | DNS 0x40 | ONLINE 0x80. The game's NetConn state machine (sub_82819018) maps the bits to
-    // a status: GATEWAY or DNS present is "connected to an ISP" ('+isp') and lets it go on; with fewer it keeps polling ('~eth', '~dns', '~sta').
-    return 0x02 | 0x04 | 0x20 | 0x40 | 0x80;
+    // XNET_GET_XNADDR_DHCP 0x08 | GATEWAY 0x20 | DNS 0x40, as a console on a LAN with DHCP (no ONLINE: see above). The game's NetConn state machine
+    // (sub_82819018) maps the bits to a status: GATEWAY or DNS present is "connected to an ISP" ('+isp') and lets it go on; with fewer it keeps
+    // polling ('~eth', '~dns', '~sta').
+    return 0x08 | 0x20 | 0x40;
 }
 
 // For the XAM apps' Live messages (kernel/xmsg.cpp): this machine's XNADDR as
@@ -330,9 +351,6 @@ void NetOwnXnAddr(uint8_t* xnaddr)
     const uint32_t ina = LocalAddress();
     xnaddr[0] = uint8_t(ina >> 24); xnaddr[1] = uint8_t(ina >> 16); xnaddr[2] = uint8_t(ina >> 8); xnaddr[3] = uint8_t(ina);
     xnaddr[10] = 0x00; xnaddr[11] = 0x22; xnaddr[12] = 0x48; xnaddr[13] = xnaddr[1]; xnaddr[14] = xnaddr[2]; xnaddr[15] = xnaddr[3];
-    memcpy(xnaddr + 4, xnaddr, 4);
-    for (int i = 0; i < 20; i++)
-        xnaddr[16 + i] = uint8_t(0x40 + i + xnaddr[3]);
 }
 
 uint32_t NetServiceAddress()
@@ -761,8 +779,9 @@ int NetDll_bind(uint32_t caller, uint32_t s, const uint8_t* name, int length)
     int one = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     // the game's address in the XNADDR must be reachable: bind on all interfaces whatever address it names
+    // (NFSMW_NET_ADDR: on that one)
     const uint16_t port = ntohs(a.sin_port);
-    a.sin_addr.s_addr = htonl(INADDR_ANY);
+    a.sin_addr.s_addr = s_bindLocal ? htonl(LocalAddress()) : htonl(INADDR_ANY);
     if (bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0)
         return Fail();
     NETLOG("bind(socket %u, port %u)", s, port);
@@ -779,6 +798,7 @@ int NetDll_connect(uint32_t caller, uint32_t s, const uint8_t* name, int length)
     if (!ToHost(name, length, a))
         return (t_lastError = WSAEFAULT, SOCKET_ERROR_);
     NETLOG("connect(socket %u, %s:%u)", s, inet_ntoa(a.sin_addr), ntohs(a.sin_port));
+    BindLocal(fd);
     if (connect(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0)
         return Fail();
     return 0;
@@ -907,12 +927,25 @@ int NetDll_sendto(uint32_t caller, uint32_t s, const uint8_t* buffer, int length
     sockaddr_in a;
     if (!ToHost(to, toLength, a))
         return (t_lastError = WSAEFAULT, SOCKET_ERROR_);
+    BindLocal(fd);
     const ssize_t n = sendto(fd, buffer, size_t(length), MSG_NOSIGNAL, reinterpret_cast<sockaddr*>(&a), sizeof(a));
     if (s_log)
     {
-        static std::atomic<uint32_t> count{ 0 };
-        if (count.fetch_add(1) < 20)
-            NETLOG("sendto(socket %u, %d bytes) -> %s:%u = %zd", s, length, inet_ntoa(a.sin_addr), ntohs(a.sin_port), n);
+        // the first few to each destination
+        static std::mutex m;
+        static std::map<uint64_t, uint32_t> perDestination;
+        bool show;
+        {
+            std::lock_guard lock(m);
+            show = perDestination[(uint64_t(a.sin_addr.s_addr) << 16) | a.sin_port]++ < 5;
+        }
+        if (show)
+        {
+            std::string head;
+            for (int i = 0; i < std::min(length, 16); i++)
+                head += std::format("{:02X}", buffer[i]);
+            NETLOG("sendto(socket %u, %d bytes) -> %s:%u = %zd: %s", s, length, inet_ntoa(a.sin_addr), ntohs(a.sin_port), n, head.c_str());
+        }
     }
     return n < 0 ? Fail() : int(n);
 }
@@ -924,9 +957,24 @@ int NetDll_recvfrom(uint32_t caller, uint32_t s, uint8_t* buffer, int length, in
         return (t_lastError = WSAENOTSOCK, SOCKET_ERROR_);
     sockaddr_in a{};
     socklen_t l = sizeof(a);
-    const ssize_t n = recvfrom(fd, buffer, size_t(length), flags & 2 ? MSG_PEEK : 0, reinterpret_cast<sockaddr*>(&a), &l);
+    ssize_t n;
+    do  // (an ICMP "port unreachable" is no error to a console's UDP: see ReceiveInto)
+        n = recvfrom(fd, buffer, size_t(length), flags & 2 ? MSG_PEEK : 0, reinterpret_cast<sockaddr*>(&a), &l);
+    while (n < 0 && (errno == ECONNREFUSED || errno == EHOSTUNREACH || errno == ENETUNREACH));
     if (n < 0)
         return Fail();
+    if (s_log)
+    {
+        static std::mutex m;
+        static std::map<uint64_t, uint32_t> perSource;
+        bool show;
+        {
+            std::lock_guard lock(m);
+            show = perSource[(uint64_t(a.sin_addr.s_addr) << 16) | a.sin_port]++ < 5;
+        }
+        if (show)
+            NETLOG("recvfrom(socket %u) <- %s:%u: %zd bytes", s, inet_ntoa(a.sin_addr), ntohs(a.sin_port), n);
+    }
     if (from && fromLength && int32_t(*fromLength) >= 16)
     {
         ToGuest(a, from);
@@ -1082,46 +1130,292 @@ uint32_t NetDll_WSAWaitForMultipleEvents(uint32_t count, const be<uint32_t>* han
     }
 }
 
+// An OVERLAPPED (XOVERLAPPED): Internal (the status), InternalHigh (the bytes
+// moved), Offset, OffsetHigh, hEvent (+16). A receive that has nothing yet is
+// left pending (WSA_IO_PENDING) and completed by a host thread once its socket
+// has data: the bytes into the buffers, the sender's address, the status and
+// the count into the OVERLAPPED, then its event. DirtySock's ConnApi takes the
+// race's UDP traffic (port 3658) this way, on a thread of its own that waits on
+// the events (WSAWaitForMultipleEvents) and posts the next receive.
+namespace
+{
+    constexpr uint32_t WSA_IO_INCOMPLETE = 996, WSA_IO_PENDING = 997;
+    constexpr uint32_t kStatusPending = 0x103, kStatusUnsuccessful = 0xC0000001, kStatusCancelled = 0xC0000120;
+
+    using Buffers = std::vector<std::pair<uint8_t*, uint32_t>>;
+
+    // WSABUF: u_long len, char* buf (big-endian, the buffer a guest address).
+    Buffers WsaBuffers(const uint8_t* wsabufs, uint32_t count)
+    {
+        auto be32 = [](const uint8_t* q) { return (uint32_t(q[0]) << 24) | (uint32_t(q[1]) << 16) | (uint32_t(q[2]) << 8) | q[3]; };
+        Buffers out;
+        for (uint32_t i = 0; wsabufs && i < count; i++)
+        {
+            const uint32_t length = be32(wsabufs + 8 * i), address = be32(wsabufs + 8 * i + 4);
+            if (address && length)
+                out.emplace_back(g_memory.base + address, length);
+        }
+        return out;
+    }
+
+    // One receive into the buffers, without blocking: the bytes, or -1 (errno).
+    // Through a bounce buffer: the guest pages may be write-watched, and the
+    // kernel can't fault on them, an ordinary store can.
+    ssize_t ReceiveInto(int fd, const Buffers& buffers, sockaddr_in* from)
+    {
+        size_t total = 0;
+        for (auto& b : buffers)
+            total += b.second;
+        static thread_local std::vector<uint8_t> bounce;
+        bounce.resize(std::max<size_t>(total, 1));
+        socklen_t l = sizeof(sockaddr_in);
+        ssize_t n;
+        // A datagram that found no one at its address (an ICMP "port
+        // unreachable", reported to the next receive on Linux) is no error
+        // to a console's UDP: the receive goes on.
+        do
+            n = recvfrom(fd, bounce.data(), total, MSG_DONTWAIT, reinterpret_cast<sockaddr*>(from), from ? &l : nullptr);
+        while (n < 0 && (errno == ECONNREFUSED || errno == EHOSTUNREACH || errno == ENETUNREACH));
+        if (n <= 0)
+            return n;
+        size_t done = 0;
+        for (auto& b : buffers)
+        {
+            const size_t k = std::min<size_t>(b.second, size_t(n) - done);
+            memcpy(b.first, bounce.data() + done, k);
+            done += k;
+            if (done == size_t(n))
+                break;
+        }
+        return n;
+    }
+
+    void SetEventHandle(uint32_t handle)
+    {
+        if (handle && IsKernelObject(handle))
+            if (auto* e = dynamic_cast<EventObject*>(GetKernelObject(handle)))
+                e->Set();
+    }
+
+    void CompleteOverlapped(uint32_t overlapped, uint32_t status, uint32_t bytes)
+    {
+        if (!overlapped)
+            return;
+        uint8_t* base = g_memory.base;
+        PPC_STORE_U32(overlapped + 4, bytes);
+        std::atomic_thread_fence(std::memory_order_release);
+        PPC_STORE_U32(overlapped, status);
+        SetEventHandle(PPC_LOAD_U32(overlapped + 16));
+    }
+
+    struct PendingReceive
+    {
+        uint32_t socket = 0;
+        int fd = -1;
+        Buffers buffers;
+        uint8_t* from = nullptr;
+        be<int32_t>* fromLength = nullptr;
+        be<uint32_t>* flags = nullptr;
+        uint32_t overlapped = 0;
+    };
+    std::mutex s_pendingMutex;
+    std::vector<PendingReceive> s_pending;
+    std::once_flag s_completerOnce;
+
+    void Finish(PendingReceive& p, ssize_t n, const sockaddr_in& a)
+    {
+        if (n >= 0 && p.from && p.fromLength && int32_t(*p.fromLength) >= 16)
+        {
+            ToGuest(a, p.from);
+            *p.fromLength = 16;
+        }
+        if (p.flags)
+            *p.flags = 0;
+        static std::atomic<uint32_t> logged{ 0 };
+        if (logged.fetch_add(1) < 30)
+        {
+            const int err = errno;
+            NETLOG("WSARecv(From)(socket %u) <- %s:%u: %zd bytes%s%s", p.socket, inet_ntoa(a.sin_addr), ntohs(a.sin_port), n, p.overlapped ? " (overlapped)" : "",
+                n < 0 ? strerror(err) : "");
+        }
+        CompleteOverlapped(p.overlapped, n < 0 ? kStatusUnsuccessful : 0, n < 0 ? 0 : uint32_t(n));
+    }
+
+    void CompleterLoop()
+    {
+        while (true)
+        {
+            std::vector<PendingReceive> ready;
+            {
+                std::unique_lock lock(s_pendingMutex);
+                if (!s_pending.empty())
+                {
+                    std::vector<pollfd> fds;
+                    for (auto& p : s_pending)
+                        fds.push_back({ p.fd, POLLIN, 0 });
+                    if (poll(fds.data(), nfds_t(fds.size()), 0) > 0)
+                        for (size_t i = fds.size(); i-- > 0;)
+                            if (fds[i].revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL))
+                            {
+                                ready.push_back(std::move(s_pending[i]));
+                                s_pending.erase(s_pending.begin() + i);
+                            }
+                }
+            }
+            for (auto& p : ready)
+            {
+                sockaddr_in a{};
+                const ssize_t n = ReceiveInto(p.fd, p.buffers, &a);
+                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+                {
+                    std::lock_guard lock(s_pendingMutex);
+                    s_pending.push_back(std::move(p));  // another reader took it: wait again
+                    continue;
+                }
+                Finish(p, n, a);
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(500));
+        }
+    }
+
+    // A receive for WSARecvFrom and WSARecv: at once if there is data, pending
+    // with an OVERLAPPED, else as the socket's blocking mode has it.
+    int Receive(uint32_t s, const uint8_t* wsabufs, uint32_t count, be<uint32_t>* received, be<uint32_t>* flags, uint8_t* from, be<int32_t>* fromLength,
+        uint32_t overlapped)
+    {
+        int fd;
+        bool nonblocking;
+        {
+            std::lock_guard lock(s_socketsMutex);
+            Sock* sock = Find(s);
+            if (!sock)
+                return (t_lastError = WSAENOTSOCK, SOCKET_ERROR_);
+            fd = sock->fd;
+            nonblocking = sock->nonblocking || sock->eventMask != 0;
+        }
+        PendingReceive p{ s, fd, WsaBuffers(wsabufs, count), from, fromLength, flags, overlapped };
+        while (true)
+        {
+            sockaddr_in a{};
+            const ssize_t n = ReceiveInto(fd, p.buffers, &a);
+            if (n >= 0)
+            {
+                if (received)
+                    *received = uint32_t(n);
+                Finish(p, n, a);
+                return 0;
+            }
+            if (errno != EAGAIN && errno != EWOULDBLOCK)
+                return Fail();
+            if (overlapped)
+            {
+                uint8_t* base = g_memory.base;
+                PPC_STORE_U32(overlapped, kStatusPending);
+                PPC_STORE_U32(overlapped + 4, 0);
+                std::call_once(s_completerOnce, [] { std::thread(CompleterLoop).detach(); });
+                std::lock_guard lock(s_pendingMutex);
+                s_pending.push_back(std::move(p));
+                t_lastError = WSA_IO_PENDING;
+                return SOCKET_ERROR_;
+            }
+            if (nonblocking)
+                return (t_lastError = WSAEWOULDBLOCK, SOCKET_ERROR_);
+            pollfd w{ fd, POLLIN, 0 };
+            poll(&w, 1, -1);
+        }
+    }
+
+    int Send(uint32_t s, const uint8_t* wsabufs, uint32_t count, be<uint32_t>* sent, const uint8_t* to, int toLength, uint32_t overlapped)
+    {
+        const int fd = HostFd(s);
+        if (fd < 0)
+            return (t_lastError = WSAENOTSOCK, SOCKET_ERROR_);
+        std::vector<uint8_t> data;
+        for (auto& b : WsaBuffers(wsabufs, count))
+            data.insert(data.end(), b.first, b.first + b.second);
+        ssize_t n;
+        if (to)
+        {
+            sockaddr_in a;
+            if (!ToHost(to, toLength, a))
+                return (t_lastError = WSAEFAULT, SOCKET_ERROR_);
+            BindLocal(fd);
+            n = sendto(fd, data.data(), data.size(), MSG_NOSIGNAL, reinterpret_cast<sockaddr*>(&a), sizeof(a));
+            static std::atomic<uint32_t> logged{ 0 };
+            if (logged.fetch_add(1) < 30)
+                NETLOG("WSASendTo(socket %u, %zu bytes) -> %s:%u = %zd", s, data.size(), inet_ntoa(a.sin_addr), ntohs(a.sin_port), n);
+        }
+        else
+            n = send(fd, data.data(), data.size(), MSG_NOSIGNAL);
+        if (n < 0)
+            return Fail();
+        if (sent)
+            *sent = uint32_t(n);
+        CompleteOverlapped(overlapped, 0, uint32_t(n));
+        return 0;
+    }
+}
+
 int NetDll_WSAGetOverlappedResult(uint32_t caller, uint32_t s, uint32_t overlapped, be<uint32_t>* transferred, uint32_t wait, be<uint32_t>* flags)
 {
-    return 0;
+    if (!overlapped)
+        return (t_lastError = WSAEFAULT, 0);
+    uint8_t* base = g_memory.base;
+    while (PPC_LOAD_U32(overlapped) == kStatusPending)
+    {
+        if (!wait)
+            return (t_lastError = WSA_IO_INCOMPLETE, 0);
+        std::this_thread::sleep_for(std::chrono::microseconds(500));
+    }
+    std::atomic_thread_fence(std::memory_order_acquire);
+    const uint32_t status = PPC_LOAD_U32(overlapped);
+    if (transferred)
+        *transferred = PPC_LOAD_U32(overlapped + 4);
+    if (flags)
+        *flags = 0;
+    if (status != 0)
+        return (t_lastError = status == kStatusCancelled ? 995u : WSAECONNRESET, 0);  // WSA_OPERATION_ABORTED
+    return 1;
 }
 
 int NetDll_WSACancelOverlappedIO(uint32_t caller, uint32_t s)
 {
+    std::vector<PendingReceive> cancelled;
+    {
+        std::lock_guard lock(s_pendingMutex);
+        for (size_t i = s_pending.size(); i-- > 0;)
+            if (s_pending[i].socket == s)
+            {
+                cancelled.push_back(std::move(s_pending[i]));
+                s_pending.erase(s_pending.begin() + i);
+            }
+    }
+    for (auto& p : cancelled)
+        CompleteOverlapped(p.overlapped, kStatusCancelled, 0);
     return 0;
 }
 
-// WSABUF: u_long len, char* buf (big-endian guest pointer); the calls are done at once whether or not an OVERLAPPED is given.
 int NetDll_WSASendTo(uint32_t caller, uint32_t s, const uint8_t* buffers, uint32_t count, be<uint32_t>* sent, uint32_t flags, const uint8_t* to, int toLength,
     uint32_t overlapped, uint32_t completion)
 {
-    NETLOG("WSASendTo: not supported yet");
-    t_lastError = WSAEOPNOTSUPP;
-    return SOCKET_ERROR_;
+    return Send(s, buffers, count, sent, to, toLength, overlapped);
 }
 
 int NetDll_WSARecvFrom(uint32_t caller, uint32_t s, const uint8_t* buffers, uint32_t count, be<uint32_t>* received, be<uint32_t>* flags, uint8_t* from,
     be<int32_t>* fromLength, uint32_t overlapped, uint32_t completion)
 {
-    NETLOG("WSARecvFrom: not supported yet");
-    t_lastError = WSAEOPNOTSUPP;
-    return SOCKET_ERROR_;
+    return Receive(s, buffers, count, received, flags, from, fromLength, overlapped);
 }
 
 int NetDll_WSASend(uint32_t caller, uint32_t s, const uint8_t* buffers, uint32_t count, be<uint32_t>* sent, uint32_t flags, uint32_t overlapped, uint32_t completion)
 {
-    NETLOG("WSASend: not supported yet");
-    t_lastError = WSAEOPNOTSUPP;
-    return SOCKET_ERROR_;
+    return Send(s, buffers, count, sent, nullptr, 0, overlapped);
 }
 
 int NetDll_WSARecv(uint32_t caller, uint32_t s, const uint8_t* buffers, uint32_t count, be<uint32_t>* received, be<uint32_t>* flags, uint32_t overlapped,
     uint32_t completion)
 {
-    NETLOG("WSARecv: not supported yet");
-    t_lastError = WSAEOPNOTSUPP;
-    return SOCKET_ERROR_;
+    return Receive(s, buffers, count, received, flags, nullptr, nullptr, overlapped);
 }
 
 GUEST_FUNCTION_HOOK(__imp__XamAlloc, XamAlloc);
@@ -1195,3 +1489,29 @@ GUEST_FUNCTION_HOOK(__imp__NetDll_WSASendTo, NetDll_WSASendTo);
 GUEST_FUNCTION_HOOK(__imp__NetDll_WSARecvFrom, NetDll_WSARecvFrom);
 GUEST_FUNCTION_HOOK(__imp__NetDll_WSASend, NetDll_WSASend);
 GUEST_FUNCTION_HOOK(__imp__NetDll_WSARecv, NetDll_WSARecv);
+
+// NFSMW_FAKE_LIVE: DirtySock's NetConn started as with "-nosecure". The game
+// starts it with no options (sub_828198C0, NetConnStartup("")): XNet's secure
+// mode, where NetConn maps every address the sockets send to onto the EA
+// service's (SocketControl 'xmap', set up in sub_82819410), as the console's
+// secure association reaches peers through it. Here addresses are real ones
+// and there is no secure layer: with the map, a race's peers sent their
+// connection requests to the lobby server and never heard from each other.
+// "-nosecure" leaves the map out; the lobby's own address comes from the
+// directory server anyway.
+extern "C" PPC_FUNC(__imp__sub_828198C0);
+PPC_FUNC(sub_828198C0)
+{
+    static const bool fakeLive = std::getenv("NFSMW_FAKE_LIVE") != nullptr;
+    if (fakeLive && (ctx.r3.u32 == 0 || base[ctx.r3.u32] == 0))
+    {
+        static const uint32_t options = [] {
+            const uint32_t block = ExAllocatePoolWithTag(16, 0);
+            memcpy(g_memory.base + block, "-nosecure", 10);
+            return block;
+        }();
+        NETLOG("NetConnStartup: \"-nosecure\" (no XNet secure layer here)");
+        ctx.r3.u64 = options;
+    }
+    __imp__sub_828198C0(ctx, base);
+}

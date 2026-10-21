@@ -182,6 +182,30 @@ void XamRegisterContent(uint32_t type, const std::string_view name, const std::s
     XamRegisterContent(data, root);
 }
 
+const char* XamGamertag()
+{
+    static const std::string name = [] {
+        std::string v = std::getenv("NFSMW_GAMERTAG") ? std::getenv("NFSMW_GAMERTAG") : "";
+        v = v.substr(0, 15);
+        return v.empty() ? std::string("Player") : v;
+    }();
+    return name.c_str();
+}
+
+uint64_t XamXuid()
+{
+    static const uint64_t xuid = [] {
+        const std::string name = XamGamertag();
+        if (name == "Player")
+            return 0xB13EBABEBABEBABEull;
+        uint64_t h = 0xCBF29CE484222325ull;  // FNV-1a of the gamertag
+        for (char c : name)
+            h = (h ^ uint8_t(std::tolower(uint8_t(c)))) * 0x100000001B3ull;
+        return 0xB13E000000000000ull | (h & 0x0000FFFFFFFFFFFFull);
+    }();
+    return xuid;
+}
+
 uint32_t XamNotifyCreateListener(uint64_t qwAreas)
 {
     auto* listener = CreateKernelObject<XamListener>();

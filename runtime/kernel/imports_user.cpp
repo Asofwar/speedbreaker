@@ -23,7 +23,6 @@ namespace
     constexpr uint32_t X_ERROR_IO_PENDING = 0x3E5;
     constexpr uint32_t X_ERROR_NO_SUCH_USER = 0x525;
 
-    constexpr uint64_t kXuid = 0xB13EBABEBABEBABEull;  // same XUID as XamUserGetSigninInfo
 
     enum SettingType : uint32_t { CONTENT = 0, INT32 = 1, INT64 = 2, DOUBLE = 3, WSTRING = 4, FLOAT = 5, BINARY = 6, DATETIME = 7 };
 
@@ -200,7 +199,7 @@ uint32_t XamUserReadProfileSettings(uint32_t titleId, uint32_t userIndex, uint32
             memset(out, 0, sizeof(*out));
             out->settingId = id;
             if (xuids)
-                out->xuid = kXuid;
+                out->xuid = XamXuid();
             else
                 out->userIndex = userIndex;
             uint32_t type = SettingType(id);
@@ -276,7 +275,7 @@ uint32_t XamUserGetXUID(uint32_t userIndex, uint32_t typeMask, be<uint64_t>* xui
     NetLogChain("XamUserGetXUID");
     if (userIndex != 0)
         return X_ERROR_NO_SUCH_USER;
-    *xuid = kXuid;
+    *xuid = XamXuid();
     return X_ERROR_SUCCESS;
 }
 
@@ -286,7 +285,7 @@ uint32_t XamUserGetName(uint32_t userIndex, char* buffer, uint32_t bufferLength)
         return X_ERROR_NO_SUCH_USER;
     if (!buffer || bufferLength == 0)
         return X_ERROR_INVALID_PARAMETER;
-    snprintf(buffer, bufferLength, "%s", "Player");
+    snprintf(buffer, bufferLength, "%s", XamGamertag());
     return X_ERROR_SUCCESS;
 }
 

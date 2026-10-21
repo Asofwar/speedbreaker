@@ -73,9 +73,9 @@ uint32_t XamUserGetSigninInfo(uint32_t userIndex, uint32_t flags, XUSER_SIGNIN_I
     if (userIndex == 0)
     {
         memset(info, 0, sizeof(*info));
-        info->xuid = 0xB13EBABEBABEBABE;
+        info->xuid = XamXuid();
         info->SigninState = 1;
-        strcpy(info->Name, "Player");
+        snprintf(info->Name, sizeof(info->Name), "%s", XamGamertag());
         return 0;
     }
 
