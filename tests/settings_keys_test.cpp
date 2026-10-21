@@ -107,7 +107,7 @@ int main()
         CHECK(size_t(d.id) == previous + 1, "%s follows the row before it", o.key);
         previous = size_t(d.id) + 1;
     }
-    CHECK(size_t(Id::AsyncShaders) == previous + 1, "Advanced follows the keys");
+    CHECK(size_t(Id::OnlineMode) == previous + 1, "Online follows the keys");
     CHECK(EnvOverride(Id::KeyA) == nullptr, "nothing overrides a key");
 
     // A scratch folder of our own.
@@ -181,8 +181,8 @@ int main()
     // what it wrote loads back.
     CHECK(Save(file), "saves: %s", LastError().c_str());
     std::string text = ReadAll(file);
-    size_t at = text.find("\n[keys]\n"), advanced = text.find("\n[advanced]\n");
-    CHECK(at != std::string::npos && advanced != std::string::npos && at < advanced, "[keys] before [advanced]");
+    size_t at = text.find("\n[keys]\n"), advanced = text.find("\n[online]\n");
+    CHECK(at != std::string::npos && advanced != std::string::npos && at < advanced, "[keys] before [online]");
     std::string section = at == std::string::npos ? "" : text.substr(at, advanced == std::string::npos ? std::string::npos : advanced - at);
     CHECK(section.find("right_trigger = \"up\"\n") != std::string::npos, "saved by name");
     CHECK(section.find("left_trigger = \"keypad_1\"\n") != std::string::npos, "the table's case, not the file's");
