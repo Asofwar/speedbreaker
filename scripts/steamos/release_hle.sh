@@ -79,8 +79,11 @@ cp "$OUT/up/SpeedBreaker-$VERSION-third-party-source.tar.xz" "$OUT/"
 
 # 4. The notes.
 prev="$(git describe --tags --abbrev=0 --match 'v*-hle*' HEAD^ 2>/dev/null || echo "v$VERSION")"
+# A later revision without its predecessor's tag here (a checkout made from
+# a bundle of main alone) would list the whole fork as its changes.
+[ "$prev" != "v$VERSION" ] || [ "$FORK" = "hle.1" ] || { echo "release_hle.sh: no earlier v$VERSION-hle.* tag behind HEAD (fetch the tags)" >&2; exit 1; }
 {
-    echo "SpeedBreaker v$VERSION with the HLE renderer work for the Steam Deck at 5 W (fork of $UP)."
+    echo "SpeedBreaker v$VERSION with the HLE renderer work for the Steam Deck at 5 W and online races over the local network, a VPN or Steam (fork of $UP; online play: docs/online.md)."
     echo
     echo "Install: unpack \`SpeedBreaker-steamos-x86_64.tar.xz\` (for example into \`~/Games\`) and add \`SpeedBreaker/speedbreaker.sh\` to Steam as a non-Steam game; the installer asks for a backup of your own USA Xbox 360 disc. No game files are included."
     echo
