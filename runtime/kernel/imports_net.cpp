@@ -159,29 +159,49 @@ namespace
     {
         if (online::steam::Active())
             return online::steam::OwnAddress();  // (its virtual address: online/steam.h)
-        static const uint32_t addr = [] {
+        static const uint32_t fixed = [] {
             in_addr a{};
             if (const char* v = std::getenv("NFSMW_NET_ADDR"); v && inet_pton(AF_INET, v, &a) == 1)
                 return ntohl(a.s_addr);
-            // the interface a packet to the outside would leave from (a UDP connect sends nothing)
-            int s = socket(AF_INET, SOCK_DGRAM, 0);
-            sockaddr_in to{};
-            to.sin_family = AF_INET;
-            to.sin_port = htons(9);
-            inet_pton(AF_INET, "8.8.8.8", &to.sin_addr);
-            uint32_t result = 0x7F000001;
-            if (s >= 0 && connect(s, reinterpret_cast<sockaddr*>(&to), sizeof(to)) == 0)
-            {
-                sockaddr_in me{};
-                socklen_t len = sizeof(me);
-                if (getsockname(s, reinterpret_cast<sockaddr*>(&me), &len) == 0)
-                    result = ntohl(me.sin_addr.s_addr);
-            }
-            if (s >= 0)
-                close(s);
-            return result;
+            return 0u;
         }();
-        return addr;
+        if (fixed)
+            return fixed;
+        // The interface a packet to the lobby would leave from (a VPN's, when
+        // the host is reached through one), or, with no lobby known yet, to
+        // the outside: a UDP connect sends nothing. Looked at again every few
+        // seconds until the lobby is known (a Join's search can take a moment).
+        static std::mutex mutex;
+        static uint32_t address = 0;
+        static bool final = false;
+        static std::chrono::steady_clock::time_point next{};
+        std::lock_guard lock(mutex);
+        const auto now = std::chrono::steady_clock::now();
+        if (final || (address && now < next))
+            return address;
+        const uint32_t server = online::KnownServerAddress();  // network order; 0: not yet
+        int s = socket(AF_INET, SOCK_DGRAM, 0);
+        sockaddr_in to{};
+        to.sin_family = AF_INET;
+        to.sin_port = htons(9);
+        if (server && (ntohl(server) >> 24) != 127)
+            to.sin_addr.s_addr = server;
+        else
+            inet_pton(AF_INET, "8.8.8.8", &to.sin_addr);
+        uint32_t result = 0x7F000001;
+        if (s >= 0 && connect(s, reinterpret_cast<sockaddr*>(&to), sizeof(to)) == 0)
+        {
+            sockaddr_in me{};
+            socklen_t len = sizeof(me);
+            if (getsockname(s, reinterpret_cast<sockaddr*>(&me), &len) == 0)
+                result = ntohl(me.sin_addr.s_addr);
+        }
+        if (s >= 0)
+            close(s);
+        address = result;
+        final = server != 0 || online::GetMode() != online::Mode::Join;
+        next = now + std::chrono::seconds(3);
+        return address;
     }
 
     // NFSMW_NET_ADDR=<address>: the sockets are bound to it, not to every
@@ -293,7 +313,7 @@ int NetDll_WSAStartup(uint32_t caller, uint32_t version, uint8_t* data)
     NETLOG("WSAStartup(version %04X)", version);
     if (data)
     {
-        memset(data, 0, 8 + 257 + 129 + 4 + 4);
+        memset(data, 0, 400);
         data[0] = uint8_t(version & 0xFF);  // wVersion (big-endian u16 holding a little-endian WORD value: the guest stores it as given)
         data[1] = uint8_t(version >> 8);
         uint16_t v = uint16_t(version);
@@ -561,22 +581,32 @@ int NetDll_XNetRandom(uint8_t* buffer, uint32_t length)
 
 // XNDNS: INT iStatus (WSAEINPROGRESS while pending, 0 on success, else a WSA error), UINT cina, IN_ADDR aina[8]. Every name resolves to the lobby host: NFSMW_NET_HOST=<ip> (default
 // 127.0.0.1): the game's servers (EA's, long gone) are replaced by one of ours.
+// The answer can take a while (joining: the local network's search, or the
+// Steam lobby's), so it comes as on the console: the XNDNS says WSAEINPROGRESS
+// until a thread of ours fills it and sets the event.
 int NetDll_XNetDnsLookup(uint32_t caller, const char* host, uint32_t event, be<uint32_t>* result)
 {
-    in_addr a{};
-    a.s_addr = online::ServerAddress();  // (online/online.h: our lobby, a host's, or NFSMW_NET_HOST)
     const uint32_t block = ExAllocatePoolWithTag(48, 0);
     uint8_t* dns = reinterpret_cast<uint8_t*>(g_memory.Translate(block));
     memset(dns, 0, 48);
-    dns[3] = 0;  // iStatus = 0: success (WSAEINPROGRESS while pending)
-    dns[7] = 1;  // cina = 1
-    memcpy(dns + 8, &a.s_addr, 4);
-    NETLOG("XNetDnsLookup(\"%s\") -> %s", host ? host : "", inet_ntoa(a));
+    uint8_t* base = g_memory.base;
+    PPC_STORE_U32(block, WSAEINPROGRESS);
     if (result)
         *result = block;
-    if (event && IsKernelObject(event))
-        if (auto* e = dynamic_cast<EventObject*>(GetKernelObject(event)))
-            e->Set();
+    std::string name = host ? host : "";
+    std::thread([block, event, name] {
+        in_addr a{};
+        a.s_addr = online::ServerAddress();  // (online/online.h: our lobby, a host's, or NFSMW_NET_HOST)
+        uint8_t* base = g_memory.base;
+        PPC_STORE_U32(block + 4, 1);  // cina = 1
+        memcpy(base + block + 8, &a.s_addr, 4);
+        std::atomic_thread_fence(std::memory_order_release);
+        PPC_STORE_U32(block, 0);  // iStatus: done
+        NETLOG("XNetDnsLookup(\"%s\") -> %s", name.c_str(), inet_ntoa(a));
+        if (event && IsKernelObject(event))
+            if (auto* e = dynamic_cast<EventObject*>(GetKernelObject(event)))
+                e->Set();
+    }).detach();
     return 0;
 }
 
@@ -682,6 +712,8 @@ uint32_t NetDll_socket(uint32_t caller, int af, int type, int protocol)
     return id;
 }
 
+void CancelPendingReceives(uint32_t s);  // (below: the overlapped calls)
+
 int NetDll_closesocket(uint32_t caller, uint32_t s)
 {
     NETLOG("closesocket(%u)", s);
@@ -692,6 +724,8 @@ int NetDll_closesocket(uint32_t caller, uint32_t s)
         t_lastError = WSAENOTSOCK;
         return SOCKET_ERROR_;
     }
+    // its pending receives end before its descriptor can be another socket's
+    CancelPendingReceives(s);
     close(sock->fd);
     s_sockets.erase(s);
     return 0;
@@ -1268,13 +1302,16 @@ namespace
         CompleteOverlapped(p.overlapped, n < 0 ? kStatusUnsuccessful : 0, n < 0 ? 0 : uint32_t(n));
     }
 
+    // Under s_pendingMutex the whole way (the receive doesn't block): a
+    // closesocket or WSACancelOverlappedIO either finds a receive still
+    // pending or after it is done, never in between, when its descriptor
+    // could already be another socket's.
     void CompleterLoop()
     {
         while (true)
         {
-            std::vector<PendingReceive> ready;
             {
-                std::unique_lock lock(s_pendingMutex);
+                std::lock_guard lock(s_pendingMutex);
                 if (!s_pending.empty())
                 {
                     std::vector<pollfd> fds;
@@ -1284,22 +1321,14 @@ namespace
                         for (size_t i = fds.size(); i-- > 0;)
                             if (fds[i].revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL))
                             {
-                                ready.push_back(std::move(s_pending[i]));
+                                sockaddr_in a{};
+                                const ssize_t n = ReceiveInto(s_pending[i].fd, s_pending[i].buffers, &a);
+                                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+                                    continue;  // another reader took it: wait again
+                                Finish(s_pending[i], n, a);
                                 s_pending.erase(s_pending.begin() + i);
                             }
                 }
-            }
-            for (auto& p : ready)
-            {
-                sockaddr_in a{};
-                const ssize_t n = ReceiveInto(p.fd, p.buffers, &a);
-                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-                {
-                    std::lock_guard lock(s_pendingMutex);
-                    s_pending.push_back(std::move(p));  // another reader took it: wait again
-                    continue;
-                }
-                Finish(p, n, a);
             }
             std::this_thread::sleep_for(std::chrono::microseconds(500));
         }
@@ -1405,6 +1434,17 @@ int NetDll_WSAGetOverlappedResult(uint32_t caller, uint32_t s, uint32_t overlapp
     if (status != 0)
         return (t_lastError = status == kStatusCancelled ? 995u : WSAECONNRESET, 0);  // WSA_OPERATION_ABORTED
     return 1;
+}
+
+void CancelPendingReceives(uint32_t s)
+{
+    std::lock_guard lock(s_pendingMutex);
+    for (size_t i = s_pending.size(); i-- > 0;)
+        if (s_pending[i].socket == s)
+        {
+            CompleteOverlapped(s_pending[i].overlapped, kStatusCancelled, 0);
+            s_pending.erase(s_pending.begin() + i);
+        }
 }
 
 int NetDll_WSACancelOverlappedIO(uint32_t caller, uint32_t s)

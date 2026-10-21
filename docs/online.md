@@ -9,28 +9,29 @@ Up to four players. Quick Match and creating a game work. Leaderboards stay empt
 
 ## Setting it up
 
-1. Settings > Online > Xbox Live: **Host** on one copy, **Join** on the others. Restart the
-   game after changing it.
-2. Main menu > Xbox Live. The host creates a game (Race, then *New game* when the search finds
-   nothing). The others pick Race with the same mode and race type, and Quick Match finds the
-   host's game.
+Everything is on the Settings > Online page:
 
-Your name in the lobby comes from `online.toml` in the user folder
-(`~/.local/share/speedbreaker/online.toml` on Linux and the Deck). The file is created on the
-first online start:
+| Row | What it does |
+|---|---|
+| Xbox Live | **Host** on one copy, **Join** on the others (Off: no online play) |
+| Connection | **Direct** (by address) or **Steam** (see below) |
+| Gamertag | your name in the lobby; empty: the system's user name, Steam's with Connection Steam |
+| Host Address | Join: the host to connect to; empty: the first host found on the local network |
 
-```toml
-gamertag = "Racer"   # up to 15 letters, digits or spaces
-server = ""          # a host's address; empty: look for one on the local network
-transport = "direct" # or "steam"
-```
+Xbox Live and Connection take effect the next time the game starts. On a Steam Deck the
+text rows bring up Steam's on-screen keyboard. The two text rows are kept in `online.toml`
+in the user folder (`~/.local/share/speedbreaker/` on Linux and the Deck).
+
+Then, Main menu > Xbox Live. The host creates a game (Race, then *New game* when the search
+finds nothing). The others pick Race with the same mode and race type, and Quick Match finds
+the host's game.
 
 Offline the profile is still called "Player", the same as before, so your saves don't change.
 
 ## On one network
 
 Nothing to set up: a joining copy finds the host by a broadcast on the local network (UDP
-10902). If your router blocks broadcasts, put the host's address in `server`.
+10902). If your router blocks broadcasts, put the host's address in Host Address.
 
 ## Over the internet
 
@@ -38,10 +39,10 @@ There are two ways.
 
 **A virtual network (Tailscale, ZeroTier).** Every player installs it and joins the same
 network. Then it works as on one network: ZeroTier passes broadcasts, so the host is found by
-itself; with Tailscale, put the host's Tailscale address in `server`. Both relay the traffic
-when a direct connection isn't possible.
+itself; with Tailscale, put the host's Tailscale address in Host Address. Both relay the
+traffic when a direct connection isn't possible.
 
-**Steam (`transport = "steam"`).** No addresses and nothing to install besides Steam. The host
+**Steam (Connection: Steam).** No addresses and nothing to install besides Steam. The host
 creates a lobby on Steam, the others find it there, and all traffic goes through Valve's relay
 network. You need:
 
@@ -64,6 +65,7 @@ Without Steam or a virtual network the host must forward its ports: TCP 30960 an
 |---|---|
 | `NFSMW_ONLINE=off\|host\|join` | the mode for this run |
 | `NFSMW_GAMERTAG=<name>` | the gamertag |
+| `NFSMW_NET_ADDR=<address>` | this machine's address as the game reports it (and binds to); normally found by itself |
 | `NFSMW_NET_HOST=<address>` | the host to join |
 | `NFSMW_ONLINE_TRANSPORT=direct\|steam` | the transport |
 | `NFSMW_STEAM_API=<path>` | Steam's `libsteam_api.so` |
@@ -99,20 +101,21 @@ SpeedBreaker держит у себя небольшое лобби вместо
 
 Как играть:
 
-1. Настройки > Online > Xbox Live: на одной копии **Host**, на остальных **Join**. После
-   смены перезапустите игру.
+1. Настройки > Online: Xbox Live — на одной копии **Host**, на остальных **Join**;
+   Connection — Direct или Steam; Gamertag и Host Address — имя и адрес хоста (пусто: найти в
+   локальной сети). Режим и соединение применяются после перезапуска игры. На Steam Deck
+   текстовые строки открывают экранную клавиатуру Steam.
 2. Главное меню > Xbox Live. Хост создаёт игру: «Заезд», затем «Новая игра», когда поиск ничего
    не найдёт. Остальные выбирают тот же режим и тип гонки, и быстрый поиск находит игру хоста.
 
-Имя в лобби задаётся в `online.toml` в папке пользователя (`~/.local/share/speedbreaker/` на
-Linux и Deck), там же адрес сервера и транспорт. Без онлайна профиль по-прежнему называется
-«Player», сохранения не меняются.
+Имя и адрес хоста хранятся в `online.toml` в папке пользователя (`~/.local/share/speedbreaker/`
+на Linux и Deck). Без онлайна профиль по-прежнему называется «Player», сохранения не меняются.
 
 - **Одна сеть.** Ничего настраивать не нужно: подключающийся находит хоста сам (широковещание,
-  UDP 10902). Если роутер его режет, впишите адрес хоста в `server`.
+  UDP 10902). Если роутер его режет, впишите адрес хоста в Host Address.
 - **Через интернет, вариант 1.** Tailscale или ZeroTier у всех игроков. С ZeroTier хост
-  находится сам. С Tailscale впишите в `server` его адрес в Tailscale.
-- **Через интернет, вариант 2.** `transport = "steam"`. Нужен запущенный Steam (на Deck он
+  находится сам. С Tailscale впишите в Host Address его адрес в Tailscale.
+- **Через интернет, вариант 2.** Connection: Steam. Нужен запущенный Steam (на Deck он
   всегда есть) и любая установленная игра со Steam-библиотекой `libsteam_api.so`. Хост создаёт
   лобби в Steam, остальные находят его там, трафик идёт через серверы Valve. Адресов и портов
   не нужно. В Steam игра при этом отображается как Spacewar (AppID 480).

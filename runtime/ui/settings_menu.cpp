@@ -14,6 +14,7 @@
 #include "quit_game.h"
 
 #include <report/report.h>
+#include <online/online.h>
 #include <user/settings.h>
 #include <hid/key_map.h>     // the Controls page: one row per control, two keys each
 #include <user/key_names.h>  // a key's name in the file, when SDL has none
@@ -41,6 +42,13 @@ namespace ui
         Id s_described = Id::Count;  // the row the help line describes
         bool s_describedBugReport = false;  // ...or Save Bug Report's
         bool s_describedUpdate = false;     // ...or Check for Updates'
+        int s_describedOnline = -1;         // ...or an Online text row's (0: Gamertag, 1: Host Address)
+        // The Online page's text rows (online.toml): the one being edited
+        // (-1: none), its text, and a dialog to open at the window's level.
+        int s_editing = -1;
+        char s_editText[64] = {};
+        bool s_editOpen = false;
+        constexpr const char* kEditPopup = "online-text";
         bool s_opened = true;        // just opened: take focus
         // The Controls page (KeyRow). A row's two keys are cells; the chosen
         // cell is the focused row's, and a wait is for one option of one
@@ -503,6 +511,98 @@ namespace ui
                 OpenUpdateDialog();
         }
 
+        // Online: Gamertag and Host Address, online.toml's text. A (or a
+        // click) opens the dialog that edits it (DrawOnlineTextDialog).
+        void OnlineTextRow(int field, float valueWidth)
+        {
+            std::string value = field == 0 ? online::ConfiguredGamertag() : online::ConfiguredServer();
+            if (value.empty())
+                value = field == 0 ? "System name" : "Find on network";
+            else if (value.size() > 22)
+                value = value.substr(0, 21) + "...";
+            bool described = false;
+            if (ActionRow(field == 0 ? "online-gamertag" : "online-server", field == 0 ? "Gamertag" : "Host Address", value.c_str(), valueWidth, described))
+            {
+                const std::string now = field == 0 ? online::ConfiguredGamertag() : online::ConfiguredServer();
+                snprintf(s_editText, sizeof(s_editText), "%s", now.c_str());
+                s_editing = field;
+                s_editOpen = true;
+            }
+            if (described)
+                s_describedOnline = field;
+        }
+
+        // The addresses this machine is reached at (online::LocalAddresses),
+        // looked at again every few seconds (a VPN coming up).
+        void OnlineAddressesText()
+        {
+            static std::string text;
+            static double next = 0.0;
+            if (ImGui::GetTime() >= next)
+            {
+                next = ImGui::GetTime() + 3.0;
+                text.clear();
+                for (const auto& a : online::LocalAddresses())
+                    text += (text.empty() ? "" : "    ") + a.kind + " " + a.address;
+                if (text.empty())
+                    text = "none (no network)";
+            }
+            ImGui::Spacing();
+            ImGui::Indent(LabelInset());
+            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + ImGui::GetContentRegionAvail().x - LabelInset());
+            ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+            ImGui::TextWrapped("This machine's addresses: %s", text.c_str());
+            ImGui::TextWrapped("A host gives the others one of them for Host Address: the LAN one on the same network, "
+                               "the Tailscale or ZeroTier one over that VPN.");
+            ImGui::PopStyleColor();
+            ImGui::PopTextWrapPos();
+            ImGui::Unindent(LabelInset());
+        }
+
+        // The text editor of an Online row: a keyboard types (on a Steam
+        // Deck, SDL brings up Steam's on-screen keyboard while the field
+        // takes text). Enter or OK saves to online.toml; Esc, B or Cancel
+        // leaves it. True while it is open.
+        bool DrawOnlineTextDialog()
+        {
+            if (s_editOpen)
+            {
+                ImGui::OpenPopup(kEditPopup);
+                s_editOpen = false;
+            }
+            if (!ImGui::BeginPopupModal(kEditPopup, nullptr, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoTitleBar))
+                return false;
+            const bool gamertag = s_editing == 0;
+            ImGui::TextUnformatted(gamertag ? "Your gamertag in the Xbox Live lobby:" : "The host's address (empty: find one on the local network):");
+            ImGui::Spacing();
+            if (ImGui::IsWindowAppearing())
+                ImGui::SetKeyboardFocusHere();
+            ImGui::SetNextItemWidth(ImGui::CalcTextSize("M").x * 24);
+            const bool entered = ImGui::InputText("##text", s_editText, gamertag ? 16 : sizeof(s_editText), ImGuiInputTextFlags_EnterReturnsTrue);
+            ImGui::TextDisabled(gamertag ? "Letters, digits and spaces, 15 at most. Used from the next start." : "An address or a name, such as 192.168.1.20 or a Tailscale address.");
+            ImGui::Spacing();
+            bool close = false;
+            if (ImGui::Button("OK") || entered)
+            {
+                const std::string g = gamertag ? std::string(s_editText) : online::ConfiguredGamertag();
+                const std::string h = gamertag ? online::ConfiguredServer() : std::string(s_editText);
+                if (!online::Configure(g, h))
+                    fprintf(stderr, "[ui] online.toml couldn't be written\n");
+                close = true;
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel") || (!ImGui::IsAnyItemActive() && ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false)) ||
+                ImGui::IsKeyPressed(ImGuiKey_Escape, false))
+                close = true;
+            if (close)
+            {
+                s_editing = -1;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+            return true;
+        }
+
         bool QuitPromptOpen()
         {
 #if SB_QUIT_GAME
@@ -583,6 +683,14 @@ namespace ui
 
         void HelpLine()
         {
+            if (s_describedOnline >= 0)
+            {
+                ImGui::TextWrapped("%s", s_describedOnline == 0
+                        ? "Your name in the Xbox Live lobby, 15 letters, digits or spaces. Empty: the system's (Steam's with Connection Steam)."
+                        : "Join: the host to connect to. Empty: the first host found on the local network (or Steam's lobby list with Connection Steam).");
+                ImGui::TextDisabled("A: edit. Saved in online.toml in the game's data folder.");
+                return;
+            }
             if (s_describedUpdate)
             {
                 UpdateRowHelp();
@@ -719,8 +827,10 @@ namespace ui
         TitleText("Settings", "F1 / Back + Start");
 #endif
 
-        // Pages: LB/RB (Q/E) or the tabs; not under a dialog, which keeps them.
-        const bool dialog = ImGui::IsPopupOpen("reset") || UpdateDialogOpen() || QuitPromptOpen();
+        // Pages: LB/RB (Q/E) or the tabs; not under a dialog, which keeps them
+        // (Q and E are letters in an Online row's text, too).
+        const bool dialog = ImGui::IsPopupOpen("reset") || UpdateDialogOpen() || QuitPromptOpen() || ImGui::IsPopupOpen(kEditPopup) ||
+                            ImGui::GetIO().WantTextInput;
         if (int delta = dialog ? 0 : PageDelta())
         {
             Category next = s_category;
@@ -747,6 +857,7 @@ namespace ui
         s_described = Id::Count;
         s_describedBugReport = false;
         s_describedUpdate = false;
+        s_describedOnline = -1;
         if (s_waiting != Id::Count && settings::Info(s_waiting).category != s_category)
             EndWait();
         // For the B check at the end: B's nav cancel (in ImGui's NewFrame,
@@ -829,9 +940,18 @@ namespace ui
                             BugReportRow(valueWidth);
                             UpdateRow(valueWidth);
                         }
+                        if (category == Category::Online)
+                        {
+                            OnlineTextRow(0, valueWidth);
+                            OnlineTextRow(1, valueWidth);
+                        }
                         ImGui::EndTable();
                     }
                     ImGui::PopStyleVar();
+                    // Online: this machine's addresses, for the host to give
+                    // the others (a VPN's too), under the rows.
+                    if (category == Category::Online)
+                        OnlineAddressesText();
                     // Which build this is, for bug reports by hand: under
                     // the rows, lined up with their labels.
                     if (category == Category::Advanced)
@@ -917,6 +1037,8 @@ namespace ui
             ImGui::EndPopup();
         }
         if (DrawUpdateDialog())
+            popup = true;
+        if (DrawOnlineTextDialog())
             popup = true;
 #if SB_QUIT_GAME
         if (DrawQuitPrompt())

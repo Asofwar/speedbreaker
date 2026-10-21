@@ -114,6 +114,31 @@ namespace online::steam
             s_players[VirtualAddress(id)] = id;
         }
 
+        bool IsMember(uint64_t id)
+        {
+            std::lock_guard lock(s_mutex);
+            auto it = s_players.find(VirtualAddress(id));
+            return it != s_players.end() && it->second == id;
+        }
+
+        void Members(uint64_t lobby);
+
+        // A message from someone: a member of our lobby, else (a player who
+        // just joined, before its notice) after a fresh look at the members.
+        bool FromMember(uint64_t id)
+        {
+            if (IsMember(id))
+                return true;
+            uint64_t lobby;
+            {
+                std::lock_guard lock(s_mutex);
+                lobby = s_lobby;
+            }
+            if (lobby)
+                Members(lobby);
+            return IsMember(id);
+        }
+
         uint64_t PlayerAt(uint32_t address)
         {
             std::lock_guard lock(s_mutex);
@@ -250,6 +275,9 @@ namespace online::steam
 
         void Deliver(uint32_t from, uint16_t fromPort, uint16_t toPort, const uint8_t* data, size_t size)
         {
+            // only the game's own ports: the race (3658) and voice (6000)
+            if (toPort != 3658 && toPort != 6000)
+                return;
             int fd;
             {
                 std::lock_guard lock(s_relayMutex);
@@ -257,6 +285,8 @@ namespace online::steam
                 auto it = s_relays.find(key);
                 if (it == s_relays.end())
                 {
+                    if (s_relays.size() >= 64)
+                        return;  // (four players use a handful)
                     fd = socket(AF_INET, SOCK_DGRAM, 0);
                     sockaddr_in me{};
                     me.sin_family = AF_INET;
@@ -322,6 +352,14 @@ namespace online::steam
             auto it = std::find_if(s_tunnels.begin(), s_tunnels.end(), [&](const Tunnel& t) { return t.peer == from && t.id == id; });
             if (m[0] == kOpen && it == s_tunnels.end())
             {
+                bool hosting;
+                {
+                    std::lock_guard l(s_mutex);
+                    hosting = s_hosting;
+                }
+                // only to our lobby (the directory and the lobby itself), and a few at a time
+                if (!hosting || (port != 30960 && port != 10901) || s_tunnels.size() >= 32)
+                    return;
                 // the host: a player's connection to our lobby
                 const int fd = socket(AF_INET, SOCK_STREAM, 0);
                 sockaddr_in me{}, lobby{};
@@ -520,9 +558,14 @@ namespace online::steam
                 {
                     std::lock_guard lock(s_steam);
                     id = a.GetSteamID64(&i);
-                    a.AcceptSessionWithUser(s_net, &i);
                 }
-                Know(id);
+                if (!FromMember(id))
+                {
+                    fprintf(stderr, "[steam] a message from %llu, not in our lobby: refused\n", (unsigned long long)id);
+                    break;
+                }
+                std::lock_guard lock(s_steam);
+                a.AcceptSessionWithUser(s_net, &i);
                 break;
             }
             case kSessionFailed:
@@ -590,11 +633,12 @@ namespace online::steam
                         std::lock_guard lock(s_steam);
                         from = a.GetSteamID64(&m->peer);
                     }
-                    Know(from);
+                    const bool member = FromMember(from);
                     const uint8_t* d = static_cast<const uint8_t*>(m->data);
-                    if (channel == kChannelDatagram && m->size >= 4)
+                    // (a stranger's message, not one of our lobby's members: dropped)
+                    if (member && channel == kChannelDatagram && m->size >= 4)
                         Deliver(VirtualAddress(from), uint16_t(d[0] << 8 | d[1]), uint16_t(d[2] << 8 | d[3]), d + 4, size_t(m->size - 4));
-                    else if (channel == kChannelTunnel)
+                    else if (member && channel == kChannelTunnel)
                         TunnelMessage(from, d, size_t(m->size));
                     std::lock_guard lock(s_steam);
                     a.Release(m);

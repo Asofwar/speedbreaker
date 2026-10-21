@@ -44,7 +44,8 @@ namespace online
 
         std::mutex s_mutex;
         std::condition_variable s_found;
-        std::string s_configGamertag, s_configServer, s_configTransport;
+        std::string s_configGamertag, s_configServer;
+        bool s_configRead = false;
         uint32_t s_discovered = 0;  // network order; 0: none yet
         std::string s_discoveredName;
         bool s_started = false;
@@ -89,6 +90,7 @@ namespace online
 
         void ReadConfig()
         {
+            s_configRead = true;
             const auto path = ConfigPath();
             std::error_code ec;
             if (!std::filesystem::exists(path, ec))
@@ -99,12 +101,9 @@ namespace online
                     f << "# SpeedBreaker online play (Settings > Online picks Host or Join).\n"
                          "# gamertag: your name in Xbox Live's lobby (15 letters, digits or spaces).\n"
                          "# server: a host's address to join; empty: find one on the local network.\n"
-                         "# transport: \"direct\" (addresses: the local network, a VPN such as Tailscale,\n"
-                         "#   open ports) or \"steam\" (no addresses: Steam lobbies and Valve's relay;\n"
-                         "#   Steam must be running, and a Steam game's libsteam_api.so installed).\n"
+                         "# (Settings > Online edits both; Connection there picks Direct or Steam.)\n"
                       << "gamertag = " << Quoted(SystemUser()) << "\n"
-                      << "server = \"\"\n"
-                      << "transport = \"direct\"\n";
+                      << "server = \"\"\n";
                 return;
             }
             try
@@ -112,7 +111,6 @@ namespace online
                 toml::table t = toml::parse_file(path.string());
                 s_configGamertag = Clean(t["gamertag"].value_or(std::string()));
                 s_configServer = t["server"].value_or(std::string());
-                s_configTransport = t["transport"].value_or(std::string());
             }
             catch (const toml::parse_error& e)
             {
@@ -207,6 +205,57 @@ namespace online
         }
     }
 
+    std::string CleanGamertag(const std::string& name) { return Clean(name); }
+
+    std::string ConfiguredGamertag()
+    {
+        std::lock_guard lock(s_mutex);
+        if (!s_configRead)
+            ReadConfig();
+        return s_configGamertag;
+    }
+
+    std::string ConfiguredServer()
+    {
+        std::lock_guard lock(s_mutex);
+        if (!s_configRead)
+            ReadConfig();
+        return s_configServer;
+    }
+
+    bool Configure(const std::string& gamertag, const std::string& server)
+    {
+        std::string name = Clean(gamertag), host = server;
+        while (!host.empty() && std::isspace(uint8_t(host.back())))
+            host.pop_back();
+        while (!host.empty() && std::isspace(uint8_t(host.front())))
+            host.erase(0, 1);
+        const auto path = ConfigPath();
+        const auto temporary = path.string() + ".new";
+        {
+            std::ofstream f(temporary, std::ios::trunc);
+            if (!f)
+                return false;
+            f << "# SpeedBreaker online play (Settings > Online).\n"
+                 "# gamertag: your name in Xbox Live's lobby (15 letters, digits or spaces).\n"
+                 "# server: a host's address to join; empty: find one on the local network.\n"
+              << "gamertag = " << Quoted(name) << "\n"
+              << "server = " << Quoted(host) << "\n";
+            if (!f.flush())
+                return false;
+        }
+        std::error_code ec;
+        std::filesystem::rename(temporary, path, ec);
+        if (ec)
+            return false;
+        std::lock_guard lock(s_mutex);
+        s_configRead = true;
+        s_configGamertag = name;
+        s_configServer = host;
+        fprintf(stderr, "[online] online.toml: gamertag \"%s\", server \"%s\"\n", name.c_str(), host.c_str());
+        return true;
+    }
+
     Mode GetMode()
     {
         const int32_t v = settings::GetInt(settings::Id::OnlineMode);
@@ -236,7 +285,21 @@ namespace online
                 if (std::string c = Clean(steam::PersonaName()); !c.empty())
                     return c;
             std::string user = SystemUser();
-            return user.empty() ? std::string("Player") : user;
+            if (!user.empty())
+                return user;
+            // No name to go by (a Steam Deck's user is "deck"): one of this
+            // machine's own, so two of them in a lobby (and their XUIDs,
+            // made from it) differ.
+            std::string id;
+            for (const char* path : { "/etc/machine-id", "/var/lib/dbus/machine-id" })
+                if (std::ifstream f(path); f && std::getline(f, id) && !id.empty())
+                    break;
+            uint32_t h = 2166136261u;
+            for (char c : id.empty() ? std::to_string(getpid()) : id)
+                h = (h ^ uint8_t(c)) * 16777619u;
+            char name[16];
+            snprintf(name, sizeof(name), "Racer%04X", h & 0xFFFF);
+            return std::string(name);
         }();
         return name;
     }
@@ -272,6 +335,50 @@ namespace online
         return a.s_addr;
     }
 
+    std::vector<Address> LocalAddresses()
+    {
+        std::vector<Address> out;
+        ifaddrs* list = nullptr;
+        if (getifaddrs(&list) != 0)
+            return out;
+        for (ifaddrs* i = list; i; i = i->ifa_next)
+        {
+            if (!i->ifa_addr || i->ifa_addr->sa_family != AF_INET || !(i->ifa_flags & IFF_UP) || (i->ifa_flags & IFF_LOOPBACK))
+                continue;
+            const std::string name = i->ifa_name ? i->ifa_name : "";
+            // a container's or a VM's own network: no player reaches it
+            if (name.rfind("docker", 0) == 0 || name.rfind("br-", 0) == 0 || name.rfind("veth", 0) == 0 || name.rfind("virbr", 0) == 0 ||
+                name.rfind("lxc", 0) == 0 || name.rfind("podman", 0) == 0)
+                continue;
+            const in_addr a = reinterpret_cast<sockaddr_in*>(i->ifa_addr)->sin_addr;
+            const uint32_t h = ntohl(a.s_addr);
+            std::string kind = "LAN";
+            if (name.rfind("tailscale", 0) == 0 || (h & 0xFFC00000u) == 0x64400000u)  // 100.64.0.0/10
+                kind = "Tailscale";
+            else if (name.rfind("zt", 0) == 0)
+                kind = "ZeroTier";
+            out.push_back({ kind, inet_ntoa(a) });
+        }
+        freeifaddrs(list);
+        return out;
+    }
+
+    uint32_t KnownServerAddress()
+    {
+        if (const char* v = std::getenv("NFSMW_NET_HOST"); v && *v)
+            return Resolve(v);
+        if (GetMode() != Mode::Join)
+            return 0;
+        std::lock_guard lock(s_mutex);
+        if (!s_configServer.empty())
+        {
+            in_addr a{};
+            if (inet_pton(AF_INET, s_configServer.c_str(), &a) == 1)
+                return a.s_addr;
+        }
+        return s_discovered;
+    }
+
     void Start()
     {
         {
@@ -286,10 +393,8 @@ namespace online
             std::lock_guard lock(s_mutex);
             ReadConfig();
         }
-        std::string transport = s_configTransport;
-        if (const char* v = std::getenv("NFSMW_ONLINE_TRANSPORT"); v && *v)
-            transport = v;
-        if (mode != Mode::Off && transport == "steam" && !steam::Start(mode == Mode::Host))
+        const bool overSteam = settings::GetInt(settings::Id::OnlineTransport) == 1;
+        if (mode != Mode::Off && overSteam && !steam::Start(mode == Mode::Host))
             fprintf(stderr, "[online] no Steam: direct addresses instead\n");
         fprintf(stderr, "[online] %s%s, as \"%s\"\n", mode == Mode::Host ? "hosting" : mode == Mode::Join ? "joining" : "a lobby run apart (NFSMW_FAKE_LIVE)",
             steam::Active() ? " over Steam" : "", Gamertag().c_str());

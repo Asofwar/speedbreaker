@@ -120,6 +120,11 @@ namespace settings
             { 2, "join", "Join" },
         };
 
+        constexpr EnumEntry kOnlineTransportEntries[] = {
+            { 0, "direct", "Address" },
+            { 1, "steam", "Steam" },
+        };
+
         constexpr EnumEntry kAnisotropyEntries[] = {
             { kAnisotropyAuto, "auto", "Auto" },
             { 1, "off", "Off" },
@@ -308,6 +313,10 @@ namespace settings
               .table = "online", .key = "mode", .label = "Xbox Live",
               .description = "Race others in the game's Xbox Live mode, through a lobby SpeedBreaker runs itself. Host: this copy runs it; Join: a host's (on this network, or online.toml's server).",
               .env = "NFSMW_ONLINE", .defaultValue = 0, .entries = kOnlineModeEntries },
+            { .id = Id::OnlineTransport, .category = Category::Online, .type = Type::Enum, .apply = Apply::Restart,
+              .table = "online", .key = "transport", .label = "Connection",
+              .description = "Address: the local network, or a VPN such as Tailscale or ZeroTier, or open ports (your addresses are below). Steam: Steam's lobbies and relay, no address (Steam running, and a Steam game's libsteam_api.so).",
+              .env = "NFSMW_ONLINE_TRANSPORT", .defaultValue = 0, .entries = kOnlineTransportEntries },
             // Advanced
             { .id = Id::AsyncShaders, .category = Category::Advanced, .type = Type::Bool, .apply = Apply::Live,
               .table = "advanced", .key = "async_shaders", .label = "Asynchronous Shaders",

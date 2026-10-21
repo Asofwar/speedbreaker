@@ -26,6 +26,7 @@
 #pragma once
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace online
 {
@@ -48,6 +49,27 @@ namespace online
     // Join without a server named waits a few seconds for the local network's
     // answer the first time.
     uint32_t ServerAddress();
+    // The same, if it is known without waiting (0: not yet).
+    uint32_t KnownServerAddress();
+
+    // online.toml's gamertag and host address as written there ("": not set),
+    // for the settings menu; and writing them. The address applies to the
+    // next lookup, the gamertag at the next start. False if it can't be
+    // written.
+    std::string ConfiguredGamertag();
+    std::string ConfiguredServer();
+    bool Configure(const std::string& gamertag, const std::string& server);
+    // A gamertag as the 360 has them (letters, digits, spaces; 15 at most).
+    std::string CleanGamertag(const std::string& name);
+
+    // This machine's addresses a player could reach it at, each with what it
+    // is: "LAN", "Tailscale" (its 100.64/10 addresses, tailscale0),
+    // "ZeroTier" (its zt* interfaces). Containers' and VMs' bridges left out.
+    struct Address
+    {
+        std::string kind, address;
+    };
+    std::vector<Address> LocalAddresses();
 
     // After settings::Load(): reads online.toml (writing it with its defaults
     // when there is none), starts the lobby (Host) or the search (Join).

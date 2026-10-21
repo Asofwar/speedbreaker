@@ -92,7 +92,8 @@ namespace settings
         KeyLeftStickClick, KeyLeftStickClick2,
         KeyRightStickClick, KeyRightStickClick2,
         // Online
-        OnlineMode,  // online/online.h: Off, Host, Join
+        OnlineMode,       // online/online.h: Off, Host, Join
+        OnlineTransport,  // online/online.h: Direct, Steam
         // Advanced
         AsyncShaders,
         PerformanceOverlay,

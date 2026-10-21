@@ -107,6 +107,14 @@ namespace online
             return out;
         }
 
+        // A small decimal number from the peer, or -1 (too long, not digits).
+        int Number(const std::string& v)
+        {
+            if (v.empty() || v.size() > 9 || !std::all_of(v.begin(), v.end(), [](char c) { return c >= '0' && c <= '9'; }))
+                return -1;
+            return std::atoi(v.c_str());
+        }
+
         std::string Now()
         {
             const std::time_t t = std::time(nullptr);
@@ -150,6 +158,7 @@ namespace online
             std::string ip, local;  // the player's address; the lobby's, as it reached us
             std::string name = "USER", persona, maddr, auxi;
             bool authenticated = false;
+            bool self = false;  // the host's own game (at 127.0.0.1): to each player, at the address that player reaches us at
             int room = 0;                    // the room it is in (0: none)
             std::shared_ptr<Game> game;      // the race it is in
             std::map<std::string, int> sets;  // user sets it follows: room name -> slot
@@ -170,6 +179,7 @@ namespace online
         {
             int ident = 0;
             std::string name, host, room;
+            Session* hostSession = nullptr;
             std::map<std::string, std::string> fields;  // as gcre and gset gave them
             std::vector<Session*> players;
             std::string seed, when;
@@ -313,6 +323,7 @@ namespace online
                     s->ip = Ip(htonl(player));
                     s->local = Ip(htonl(NetLocalAddressHost()));
                 }
+                s->self = peer.sin_addr.s_addr == htonl(INADDR_LOOPBACK) && !steam::Active();
                 fprintf(stderr, "[lobby] %s connects (%s)\n", s->ip.c_str(), lobby ? "lobby" : "directory");
                 m_sessions.push_back(std::move(s));
             }
@@ -375,7 +386,16 @@ namespace online
                     const std::string command = s.in.substr(0, 4);
                     const Fields fields = Parse(s.in.data() + 12, length - 12);
                     s.in.erase(0, length);
-                    Handle(s, command, fields);
+                    try
+                    {
+                        Handle(s, command, fields);
+                    }
+                    catch (const std::exception& e)
+                    {
+                        fprintf(stderr, "[lobby] %s: '%s' failed (%s): dropped\n", s.ip.c_str(), command.c_str(), e.what());
+                        m_closed.push_back(s.fd);
+                        return;
+                    }
                 }
             }
 
@@ -407,9 +427,15 @@ namespace online
 
             // ---- records
 
-            std::string UserRecord(const Session& s, const char* command = "+who")
+            // A player's address as `viewer` sees it: the host's own game at the
+            // address the viewer reaches the lobby at (its address on the
+            // viewer's network: a LAN's, a VPN's, the public one).
+            static const std::string& AddressFor(const Session& s, const Session& viewer) { return s.self && !viewer.self ? viewer.local : s.ip; }
+
+            std::string UserRecord(const Session& s, const Session& viewer, const char* command = "+who")
             {
-                return Pack(command, { { "I", std::to_string(s.id) }, { "M", s.name }, { "N", s.Persona() }, { "MA", s.maddr }, { "A", s.ip }, { "LA", s.ip },
+                const std::string& a = AddressFor(s, viewer);
+                return Pack(command, { { "I", std::to_string(s.id) }, { "M", s.name }, { "N", s.Persona() }, { "MA", s.maddr }, { "A", a }, { "LA", a },
                                          { "G", s.game ? std::to_string(s.game->ident) : "0" }, { "P", "1" }, { "F", "U" }, { "LO", "enUS" }, { "PRES", "1" },
                                          { "X", s.auxi } });
             }
@@ -443,7 +469,8 @@ namespace online
                 {
                     const Session& p = *g.players[i];
                     const std::string n = std::to_string(i);
-                    f.insert(f.end(), { { "OPPO" + n, p.Persona() }, { "OPID" + n, std::to_string(p.id) }, { "ADDR" + n, p.ip }, { "LADDR" + n, p.ip },
+                    const std::string& a = AddressFor(p, viewer);
+                    f.insert(f.end(), { { "OPPO" + n, p.Persona() }, { "OPID" + n, std::to_string(p.id) }, { "ADDR" + n, a }, { "LADDR" + n, a },
                                           { "MADDR" + n, p.maddr }, { "OPPART" + n, "0" }, { "OPPARAM" + n, "" }, { "OPFLAG" + n, "0" }, { "PRES" + n, "0" } });
                 }
                 return f;
@@ -518,11 +545,12 @@ namespace online
                     return;
                 std::erase(g->players, &s);
                 s.game.reset();
-                if (g->players.empty() || g->host == s.Persona())
+                if (g->players.empty() || g->hostSession == &s)
                 {
                     for (Session* p : g->players)
                         p->game.reset();
-                    m_games.erase(g->name);
+                    if (auto it = m_games.find(g->name); it != m_games.end() && it->second == g)
+                        m_games.erase(it);
                     fprintf(stderr, "[lobby] race %s closed\n", g->name.c_str());
                 }
                 else
@@ -578,12 +606,12 @@ namespace online
                 else if (command == "sele")
                 {
                     reply.push_back(Pack("sele", f));
-                    reply.push_back(UserRecord(s));
+                    reply.push_back(UserRecord(s, s));
                     for (auto& [k, v] : f)
                     {
-                        if (k.rfind("USERSET", 0) != 0 || k.size() == 7 || !std::all_of(k.begin() + 7, k.end(), ::isdigit))
+                        const int slot = k.rfind("USERSET", 0) == 0 ? Number(k.substr(7)) : -1;
+                        if (slot < 0 || slot > 8)
                             continue;
-                        const int slot = std::stoi(k.substr(7));
                         std::erase_if(s.sets, [slot](auto& e) { return e.second == slot; });
                         if (v.empty())
                             continue;
@@ -639,7 +667,7 @@ namespace online
                     s.sets[r.name] = 0;
                     fprintf(stderr, "[lobby] %s opens room %s\n", me.c_str(), r.name.c_str());
                     reply.push_back(Pack("ucre", RoomRecord(r)));
-                    reply.push_back(UserRecord(s, "+usr"));
+                    reply.push_back(UserRecord(s, s, "+usr"));
                     reply.push_back(MemberRecord(s, 0, false));
                 }
                 else if (command == "uadm")
@@ -670,8 +698,8 @@ namespace online
                 {
                     Room* r = nullptr;
                     for (const char* key : { "I", "IDENT", "ROOM" })
-                        if (std::string v = Get(f, key); !v.empty() && std::all_of(v.begin(), v.end(), ::isdigit))
-                            if (auto it = m_rooms.find(std::stoi(v)); it != m_rooms.end())
+                        if (int id = Number(Get(f, key)); id >= 0)
+                            if (auto it = m_rooms.find(id); it != m_rooms.end())
                                 r = &it->second;
                     if (!r)
                         r = RoomByName(Get(f, "NAME", Get(f, "N")));
@@ -686,10 +714,10 @@ namespace online
                         for (Session* o : Members(*r))
                             if (o != &s)
                             {
-                                Send(*o, UserRecord(s, "+usr"));
-                                reply.push_back(UserRecord(*o, "+usr"));
+                                Send(*o, UserRecord(s, *o, "+usr"));
+                                reply.push_back(UserRecord(*o, s, "+usr"));
                             }
-                        reply.push_back(UserRecord(s, "+usr"));
+                        reply.push_back(UserRecord(s, s, "+usr"));
                         for (auto& m : NotifySet(*r, s, &s, false))
                             reply.push_back(std::move(m));
                     }
@@ -727,6 +755,7 @@ namespace online
                     g->ident = ++m_nextId;
                     g->name = Get(f, "NAME", me);
                     g->host = me;
+                    g->hostSession = &s;
                     g->room = std::to_string(s.room);
                     for (auto& [k, v] : f)
                         if (k != "NAME")
@@ -739,7 +768,7 @@ namespace online
                     s.game = g;
                     fprintf(stderr, "[lobby] %s opens race %s\n", me.c_str(), g->name.c_str());
                     reply.push_back(Pack("gcre", GameRecord(*g, s)));
-                    reply.push_back(UserRecord(s));
+                    reply.push_back(UserRecord(s, s));
                 }
                 else if (command == "gjoi")
                 {
@@ -757,7 +786,7 @@ namespace online
                         fprintf(stderr, "[lobby] %s joins race %s (%zu players)\n", me.c_str(), g->name.c_str(), g->players.size());
                         NotifyGame(*g, "+mgm", &s);
                         reply.push_back(Pack("gjoi", GameRecord(*g, s)));
-                        reply.push_back(UserRecord(s));
+                        reply.push_back(UserRecord(s, s));
                     }
                 }
                 else if (command == "gset")
@@ -795,8 +824,8 @@ namespace online
                     {
                         for (Session* o : Members(it->second))
                             if (o != &s)
-                                Send(*o, UserRecord(s, "+usr"));
-                        reply.push_back(UserRecord(s, "+usr"));
+                                Send(*o, UserRecord(s, *o, "+usr"));
+                        reply.push_back(UserRecord(s, s, "+usr"));
                         for (auto& m : NotifySet(it->second, s, &s, false))
                             reply.push_back(std::move(m));
                     }

@@ -264,13 +264,53 @@ EXPORT uint64_t SteamAPI_ISteamMatchmaking_JoinLobby(void* self, uint64_t lobby)
 {
     uint8_t enter[20] = { 0 };  // LobbyEnter_t, packed to 4: { uint64 lobby; uint32 perms; bool locked; uint32 response }
     uint32_t response = OwnerOf(lobby) ? 1 : 2;
+    if (response == 1)
+    {
+        char path[512];
+        LobbyPath(lobby, path, sizeof(path));
+        FILE* f = fopen(path, "a");
+        if (f)
+        {
+            fprintf(f, "member=%llu\n", (unsigned long long)self_id);
+            fclose(f);
+        }
+    }
     memcpy(enter, &lobby, 8);
     memcpy(enter + 16, &response, 4);
     return Finish(504, enter, 20);
 }
 
-EXPORT int SteamAPI_ISteamMatchmaking_GetNumLobbyMembers(void* self, uint64_t lobby) { return 2; }
-EXPORT uint64_t SteamAPI_ISteamMatchmaking_GetLobbyMemberByIndex(void* self, uint64_t lobby, int i) { return i == 0 ? OwnerOf(lobby) : self_id; }
+// the members: the owner (the file's first line), then each "member=" line
+static int MembersOf(uint64_t lobby, uint64_t* out, int max)
+{
+    int n = 0;
+    uint64_t owner = OwnerOf(lobby);
+    if (owner && n < max)
+        out[n++] = owner;
+    char path[512], line[128];
+    LobbyPath(lobby, path, sizeof(path));
+    FILE* f = fopen(path, "r");
+    if (!f)
+        return n;
+    while (fgets(line, sizeof(line), f) && n < max)
+        if (strncmp(line, "member=", 7) == 0)
+            out[n++] = strtoull(line + 7, NULL, 10);
+    fclose(f);
+    return n;
+}
+
+EXPORT int SteamAPI_ISteamMatchmaking_GetNumLobbyMembers(void* self, uint64_t lobby)
+{
+    uint64_t m[8];
+    return MembersOf(lobby, m, 8);
+}
+
+EXPORT uint64_t SteamAPI_ISteamMatchmaking_GetLobbyMemberByIndex(void* self, uint64_t lobby, int i)
+{
+    uint64_t m[8];
+    int n = MembersOf(lobby, m, 8);
+    return i >= 0 && i < n ? m[i] : 0;
+}
 
 EXPORT void SteamAPI_SteamNetworkingIdentity_SetSteamID64(Identity* i, uint64_t id)
 {
