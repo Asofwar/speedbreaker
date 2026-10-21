@@ -62,9 +62,14 @@ The measurements, including the ideas that didn't help, are in
 
 Online races work again: the game's own Xbox Live mode, without EA's servers. One player hosts
 the lobby in their copy of the game, the others join on the same network, over a VPN or
-through Steam. How to set it up: [docs/online.md](docs/online.md). The scripts used on the
-Deck are in [survey/hle/deck](survey/hle/deck). Everything below this section is the original
-README.
+through Steam. How to set it up: [docs/online.md](docs/online.md).
+
+There is a Windows build too (`SpeedBreaker-windows-x86_64.zip` on the Releases page): unzip it
+and start `SpeedBreaker.exe`. It began as [rafidwayne's port](https://github.com/SpeedBreakerProject/speedbreaker/pull/39);
+what it needs and how it is built: [docs/windows.md](docs/windows.md).
+
+The scripts used on the Deck are in [survey/hle/deck](survey/hle/deck). Everything below this
+section is the original README.
 
 **По-русски.** Это форк [SpeedBreaker](https://github.com/SpeedBreakerProject/speedbreaker),
 порта Need for Speed: Most Wanted (2005) с Xbox 360 на Steam Deck, Linux и Mac. Здесь я
@@ -84,6 +89,9 @@ README.
 Вернулись онлайн-гонки: собственный режим Xbox Live игры, без серверов EA. Один игрок держит
 лобби в своей копии игры, остальные подключаются в той же сети, через VPN или через Steam.
 Как настроить: [docs/online.md](docs/online.md).
+
+Есть и сборка под Windows (`SpeedBreaker-windows-x86_64.zip` в релизах): распакуйте и запустите
+`SpeedBreaker.exe`. Подробности и сборка: [docs/windows.md](docs/windows.md).
 
 Как поставить на Steam Deck: скачайте `SpeedBreaker-steamos-x86_64.tar.xz` из релизов,
 распакуйте в `~/Games`, добавьте `~/Games/SpeedBreaker/speedbreaker.sh` в Steam как стороннюю

@@ -8,7 +8,8 @@ include, software by others under their own licenses, listed here. The license t
 
 The downloads carry these notices too: the Mac app in `SpeedBreaker.app/Contents/Resources/licenses`,
 each SteamOS download in its `licenses/` folder (with the license of every library it bundles,
-collected when the bundle is made), and the iPhone and iPad IPA in `SpeedBreaker.app/licenses`.
+collected when the bundle is made), the Windows download in `SpeedBreaker/licenses`, and the
+iPhone and iPad IPA in `SpeedBreaker.app/licenses`.
 
 ## Compiled into SpeedBreaker (every platform)
 
@@ -42,6 +43,13 @@ collected when the bundle is made), and the iPhone and iPad IPA in `SpeedBreaker
 | **Vulkan Loader**: The Khronos Group Inc., Valve Corporation, LunarG, Inc. | In the Mac app (SteamOS has its own). It includes cJSON (Copyright (c) 2009-2017 Dave Gamble and cJSON contributors). | Apache-2.0; cJSON: MIT | [`LICENSES/Apache-2.0.txt`](LICENSES/Apache-2.0.txt); [`LICENSES/cJSON-MIT.txt`](LICENSES/cJSON-MIT.txt) |
 | **Vulkan-Headers** and **SPIRV-Headers**: The Khronos Group Inc. | Headers the game, the Vulkan Loader, glslang and SPIRV-Tools are built with. | Apache-2.0 or MIT (Vulkan-Headers); MIT (SPIRV-Headers) | [`LICENSES/Apache-2.0.txt`](LICENSES/Apache-2.0.txt) or [`LICENSES/Vulkan-Headers-MIT.txt`](LICENSES/Vulkan-Headers-MIT.txt); [`LICENSES/SPIRV-Headers.txt`](LICENSES/SPIRV-Headers.txt) |
 | **GNU C Library** (glibc) and **GCC's runtime libraries** (libstdc++, libgcc_s) | In the SteamOS x86-64 download only, from the Arch Linux packages it was built with (the download's `licenses/README.txt` names each package and version). The Steam Frame download uses SteamOS's own. | glibc: LGPL-2.1-or-later. GCC's runtime: GPL-3.0 with the GCC Runtime Library Exception | in the download's `licenses/` |
+
+The Windows download (the HLE fork's) has no libraries of its own: SDL3, glslang, SPIRV-Tools and
+FFmpeg are compiled into `SpeedBreaker.exe`, with the **mingw-w64** runtime (its C runtime and
+winpthreads; BSD-style, MIT and other permissive licenses, listed in `licenses/mingw-w64/`) and **GCC's runtime libraries**
+(libstdc++, libgcc; GPL-3.0 with the GCC Runtime Library Exception, `licenses/libstdc++/` and
+`licenses/libgcc/`). [`scripts/windows/deps.sh`](scripts/windows/deps.sh) builds the libraries
+from their projects' sources at the versions its `licenses/README.txt` names.
 
 Every SteamOS download's `licenses/` folder also holds the license files of the exact packages its
 libraries came from. The Mac app's libraries (all but MoltenVK) are built from their projects' own
