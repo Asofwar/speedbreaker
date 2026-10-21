@@ -300,11 +300,19 @@ namespace online
                 s->id = m_nextSession++;
                 // The host's own game reaches us at 127.0.0.1: the others must
                 // be given its address on the network instead.
-                s->ip = peer.sin_addr.s_addr == htonl(INADDR_LOOPBACK) ? Ip(htonl(NetLocalAddressHost())) : Ip(peer.sin_addr.s_addr);
-                // a player over Steam: the tunnel knows its virtual address
-                if (uint32_t player; peer.sin_addr.s_addr == htonl(INADDR_LOOPBACK) && steam::TunnelPeer(ntohs(peer.sin_port), player))
+                const bool fromHere = (ntohl(peer.sin_addr.s_addr) >> 24) == 127;
+                s->ip = peer.sin_addr.s_addr == htonl(INADDR_LOOPBACK) || (fromHere && steam::Active()) ? Ip(htonl(NetLocalAddressHost()))
+                                                                                                         : Ip(peer.sin_addr.s_addr);
+                // the lobby's address for this player (@dir, news): the one it
+                // reached us at
+                s->local = Ip(local.sin_addr.s_addr);
+                // a player over Steam: the tunnel knows its virtual address,
+                // and it reaches us at ours (through its tunnel)
+                if (uint32_t player; fromHere && steam::TunnelPeer(ntohs(peer.sin_port), player))
+                {
                     s->ip = Ip(htonl(player));
-                s->local = local.sin_addr.s_addr == htonl(INADDR_LOOPBACK) ? Ip(htonl(NetLocalAddressHost())) : Ip(local.sin_addr.s_addr);
+                    s->local = Ip(htonl(NetLocalAddressHost()));
+                }
                 fprintf(stderr, "[lobby] %s connects (%s)\n", s->ip.c_str(), lobby ? "lobby" : "directory");
                 m_sessions.push_back(std::move(s));
             }

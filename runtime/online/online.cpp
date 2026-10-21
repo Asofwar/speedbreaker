@@ -16,8 +16,11 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <poll.h>
@@ -156,12 +159,23 @@ namespace online
             fprintf(stderr, "[online] looking for a host on the local network\n");
             for (int round = 0;; round++)
             {
-                for (const char* to : { "255.255.255.255", "127.0.0.1" })
+                // 255.255.255.255 leaves by the default route only: also every
+                // network's own broadcast address (a VPN's, such as ZeroTier's)
+                std::vector<in_addr_t> targets = { htonl(INADDR_BROADCAST), htonl(INADDR_LOOPBACK) };
+                ifaddrs* list = nullptr;
+                if (getifaddrs(&list) == 0)
+                {
+                    for (ifaddrs* i = list; i; i = i->ifa_next)
+                        if (i->ifa_addr && i->ifa_addr->sa_family == AF_INET && (i->ifa_flags & IFF_BROADCAST) && i->ifa_broadaddr)
+                            targets.push_back(reinterpret_cast<sockaddr_in*>(i->ifa_broadaddr)->sin_addr.s_addr);
+                    freeifaddrs(list);
+                }
+                for (in_addr_t to : targets)
                 {
                     sockaddr_in a{};
                     a.sin_family = AF_INET;
                     a.sin_port = htons(kSearchPort);
-                    inet_pton(AF_INET, to, &a.sin_addr);
+                    a.sin_addr.s_addr = to;
                     sendto(fd, kSearch, strlen(kSearch), 0, reinterpret_cast<sockaddr*>(&a), sizeof(a));
                 }
                 pollfd p{ fd, POLLIN, 0 };

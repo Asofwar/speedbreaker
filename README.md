@@ -58,7 +58,11 @@ What changed:
 - Smaller vertex shaders.
 
 The measurements, including the ideas that didn't help, are in
-[docs/hle-renderer-study.md](docs/hle-renderer-study.md) (in Russian). The scripts used on the
+[docs/hle-renderer-study.md](docs/hle-renderer-study.md) (in Russian).
+
+Online races work again: the game's own Xbox Live mode, without EA's servers. One player hosts
+the lobby in their copy of the game, the others join on the same network, over a VPN or
+through Steam. How to set it up: [docs/online.md](docs/online.md). The scripts used on the
 Deck are in [survey/hle/deck](survey/hle/deck). Everything below this section is the original
 README.
 
@@ -76,6 +80,10 @@ README.
 - вершинные шейдеры стали легче.
 
 Замеры и то, что не сработало, описаны в [docs/hle-renderer-study.md](docs/hle-renderer-study.md).
+
+Вернулись онлайн-гонки: собственный режим Xbox Live игры, без серверов EA. Один игрок держит
+лобби в своей копии игры, остальные подключаются в той же сети, через VPN или через Steam.
+Как настроить: [docs/online.md](docs/online.md).
 
 Как поставить на Steam Deck: скачайте `SpeedBreaker-steamos-x86_64.tar.xz` из релизов,
 распакуйте в `~/Games`, добавьте `~/Games/SpeedBreaker/speedbreaker.sh` в Steam как стороннюю

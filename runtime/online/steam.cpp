@@ -272,7 +272,13 @@ namespace online::steam
             }
             sockaddr_in to{};
             to.sin_family = AF_INET;
-            to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            // the game's sockets: on NFSMW_NET_ADDR's address when set (two copies on one machine)
+            static const in_addr_t game = [] {
+                in_addr g{};
+                const char* v = std::getenv("NFSMW_NET_ADDR");
+                return v && inet_pton(AF_INET, v, &g) == 1 ? g.s_addr : htonl(INADDR_LOOPBACK);
+            }();
+            to.sin_addr.s_addr = game;
             to.sin_port = htons(toPort);
             sendto(fd, data, size, 0, reinterpret_cast<sockaddr*>(&to), sizeof(to));
         }
