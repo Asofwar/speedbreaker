@@ -285,8 +285,11 @@ fi
 # (-DCMAKE_SKIP_BUILD_RPATH=ON, as the README's Steam Frame line does).
 folders=(-e "$SRC" -e "$BUILD")
 for d in tools ppc; do [ -L "$SRC/$d" ] && folders+=(-e "$(dirname "$(readlink -f "$SRC/$d")")"); done
-[ "${#HOME}" -gt 1 ] && folders+=(-e "$HOME/")
-leaks="$(grep -aoF "${folders[@]}" "$GAME" | sort | uniq -c || true)"
+home=""
+# The home folder only where a path starts: /root/ is also the middle of
+# ~/.steam/root/steamapps, where online play looks for Steam's library.
+[ "${#HOME}" -gt 1 ] && home="$(grep -aoP "(?<![[:alnum:]._/-])\Q$HOME/\E" "$GAME" || true)"
+leaks="$( { grep -aoF "${folders[@]}" "$GAME" || true; printf '%s\n' "$home"; } | grep -v '^$' | sort | uniq -c || true)"
 if [ -n "$leaks" ]; then
     echo "make_bundle.sh: the binary names the build machine's folders (for a library folder, configure with -DCMAKE_SKIP_BUILD_RPATH=ON):" >&2
     echo "$leaks" >&2
