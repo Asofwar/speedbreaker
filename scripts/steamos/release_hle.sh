@@ -1,7 +1,13 @@
 #!/bin/bash
-# release_hle.sh <tag> [build dir] [--publish]: the SteamOS x86-64 release of
-# the HLE fork (Asofwar/speedbreaker-hle), from a Linux build on Arch
-# (scripts/steamos/make_bundle.sh's requirements; the sb-build container).
+# release_hle.sh <tag> [build dir] [--windows <deps prefix>] [--publish]: the
+# SteamOS x86-64 release of the HLE fork (Asofwar/speedbreaker-hle), from a
+# Linux build on Arch (scripts/steamos/make_bundle.sh's requirements; the
+# sb-build container), and with --windows the Windows x86-64 download too:
+# scripts/windows/build.sh builds this checkout into build-windows with the
+# libraries scripts/windows/deps.sh put in <deps prefix>, and
+# scripts/windows/package.sh makes SpeedBreaker-windows-x86_64.zip. Its
+# FFmpeg is the same 7.1.1 with the same patch, so the third-party source
+# archive covers it too.
 #
 # The bundle is make_bundle.sh's, with its GNU C Library and GCC runtime
 # (lib/glibc, lib/cxx) and their license files taken from the original
@@ -18,10 +24,19 @@
 # (dist/<tag>/notes.md: the fork's section of README.md and the commits since
 # the previous release tag).
 set -euo pipefail
-TAG="${1:?usage: release_hle.sh <tag> [build dir] [--publish]}"
-BUILD="${2:-build}"
+TAG="${1:?usage: release_hle.sh <tag> [build dir] [--windows <deps prefix>] [--publish]}"
+shift
+BUILD=build
 PUBLISH=0
-for a in "$@"; do [ "$a" = "--publish" ] && PUBLISH=1; done
+WIN_DEPS=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --publish) PUBLISH=1 ;;
+        --windows) WIN_DEPS="${2:?--windows needs the prefix of scripts/windows/deps.sh}"; shift ;;
+        *) BUILD="$1" ;;
+    esac
+    shift
+done
 REPO="Asofwar/speedbreaker-hle"
 UP="SpeedBreakerProject/speedbreaker"
 cd "$(dirname "$0")/../.."
@@ -76,6 +91,14 @@ tar -C "$OUT/bundle" --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$
     xz -T0 -9 > "$OUT/SpeedBreaker-steamos-x86_64.tar.xz"
 cp "$OUT/up/SpeedBreaker-$VERSION-third-party-source.tar.xz" "$OUT/"
 (cd "$OUT" && for f in SpeedBreaker-steamos-x86_64.tar.xz "SpeedBreaker-$VERSION-third-party-source.tar.xz"; do sha256sum "$f" > "$f.sha256"; done)
+ASSETS=("$OUT/SpeedBreaker-steamos-x86_64.tar.xz" "$OUT/SpeedBreaker-steamos-x86_64.tar.xz.sha256")
+if [ -n "$WIN_DEPS" ]; then
+    scripts/windows/build.sh "$WIN_DEPS" "$ROOT/build-windows"
+    scripts/windows/package.sh "$WIN_DEPS" "$ROOT/build-windows" "$OUT/windows"
+    cp "$OUT/windows/SpeedBreaker-windows-x86_64.zip" "$OUT/windows/SpeedBreaker-windows-x86_64.zip.sha256" "$OUT/"
+    ASSETS+=("$OUT/SpeedBreaker-windows-x86_64.zip" "$OUT/SpeedBreaker-windows-x86_64.zip.sha256")
+fi
+ASSETS+=("$OUT/SpeedBreaker-$VERSION-third-party-source.tar.xz" "$OUT/SpeedBreaker-$VERSION-third-party-source.tar.xz.sha256")
 
 # 4. The notes.
 prev="$(git describe --tags --abbrev=0 --match 'v*-hle*' HEAD^ 2>/dev/null || echo "v$VERSION")"
@@ -89,6 +112,12 @@ prev="$(git describe --tags --abbrev=0 --match 'v*-hle*' HEAD^ 2>/dev/null || ec
     echo
     echo "Установка: распакуйте \`SpeedBreaker-steamos-x86_64.tar.xz\` (например в \`~/Games\`) и добавьте \`SpeedBreaker/speedbreaker.sh\` в Steam как стороннюю игру; установщик попросит образ вашего собственного диска Xbox 360 (США). Файлы игры в сборку не входят."
     echo
+    if [ -n "$WIN_DEPS" ]; then
+        echo "Windows: unzip \`SpeedBreaker-windows-x86_64.zip\` anywhere and start \`SpeedBreaker/SpeedBreaker.exe\` (Windows 10 or 11, a Vulkan driver); the same first-run installer asks for your disc image. Details: docs/windows.md."
+        echo
+        echo "Windows: распакуйте \`SpeedBreaker-windows-x86_64.zip\` куда угодно и запустите \`SpeedBreaker/SpeedBreaker.exe\` (Windows 10 или 11, драйвер с Vulkan); установщик при первом запуске так же попросит образ диска. Подробнее: docs/windows.md."
+        echo
+    fi
     echo "Changes since $prev:"
     git log --format='- %s' "$prev..HEAD" --no-merges | head -80
     echo
@@ -97,7 +126,5 @@ prev="$(git describe --tags --abbrev=0 --match 'v*-hle*' HEAD^ 2>/dev/null || ec
 
 ls -la "$OUT"
 if [ "$PUBLISH" = 1 ]; then
-    gh release create "$TAG" -R "$REPO" --title "SpeedBreaker HLE $TAG" --notes-file "$OUT/notes.md" \
-        "$OUT/SpeedBreaker-steamos-x86_64.tar.xz" "$OUT/SpeedBreaker-steamos-x86_64.tar.xz.sha256" \
-        "$OUT/SpeedBreaker-$VERSION-third-party-source.tar.xz" "$OUT/SpeedBreaker-$VERSION-third-party-source.tar.xz.sha256"
+    gh release create "$TAG" -R "$REPO" --title "SpeedBreaker HLE $TAG" --notes-file "$OUT/notes.md" "${ASSETS[@]}"
 fi
