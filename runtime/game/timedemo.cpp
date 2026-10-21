@@ -219,11 +219,11 @@ namespace
         if (ec)
         {
             fprintf(stderr, "[timedemo] capture: can't snapshot the save from %s into %s: %s (copy save/ and "
-                "profile_settings.bin there yourself before replaying)\n", root.c_str(), snapshot.c_str(), ec.message().c_str());
+                "profile_settings.bin there yourself before replaying)\n", root.string().c_str(), snapshot.string().c_str(), ec.message().c_str());
             fs::remove_all(building, ec);
             return;
         }
-        fprintf(stderr, "[timedemo] capture: the save (%s) snapshot in %s\n", root.c_str(), snapshot.c_str());
+        fprintf(stderr, "[timedemo] capture: the save (%s) snapshot in %s\n", root.string().c_str(), snapshot.string().c_str());
     }
 
     void CaptureFrame(uint32_t loop)
@@ -310,7 +310,7 @@ namespace
         int64_t step = timedemo::WorldStep();
         if (strcmp(kind, "exe") == 0)
             Fatal("%s was captured with another build of the game (\"Joylog captured with %%s, you're running %%s\": "
-                "DbgBreakPoint from 823B7D48): capture it again", timedemo::File().c_str());
+                "DbgBreakPoint from 823B7D48): capture it again", timedemo::File().string().c_str());
         // The log ran out inside the frame's checksum reads, which then
         // compared zeros: its end (ReplayFrame says so), not a divergence.
         if (strcmp(kind, "checksum") == 0 && Load(kReplaying) == 0)
@@ -430,7 +430,7 @@ namespace timedemo
         std::filesystem::path host = target.route == detail::JoylogRoute::LogFile ? File() : Sibling(".absent");
         static std::atomic<bool> s_said[3];
         if (!s_said[size_t(name)].exchange(true, std::memory_order_relaxed))
-            fprintf(stderr, "[timedemo] \"%.*s\" is %s%s\n", int(guestPath.size()), guestPath.data(), host.c_str(),
+            fprintf(stderr, "[timedemo] \"%.*s\" is %s%s\n", int(guestPath.size()), guestPath.data(), host.string().c_str(),
                 target.route == detail::JoylogRoute::Absent ? " (hidden in this mode)" : target.readOnly ? " (read-only)" : "");
         return host;
     }
@@ -458,7 +458,7 @@ namespace timedemo
                     "frames come less often than 60 a second (NFSMW_FRAME_RATE=60)\n",
                     settings::FormatValue(settings::Id::FrameRate, settings::GetValue(settings::Id::FrameRate)).c_str());
             int64_t steps = detail::CaptureSteps(c);
-            fprintf(stderr, "[timedemo] capture to %s: %s, %s\n", file.c_str(),
+            fprintf(stderr, "[timedemo] capture to %s: %s, %s\n", file.string().c_str(),
                 c.fixed ? "1/60 s a frame (NFSMW_TIMEDEMO_FIXED)" : "frames as timed (NFSMW_TIMEDEMO_FIXED=0)",
                 steps ? std::format("{} world steps after the race loads", steps).c_str() : "until the quit");
             std::filesystem::create_directories(file.parent_path(), ec);
@@ -470,20 +470,20 @@ namespace timedemo
         else
         {
             if (!std::filesystem::is_regular_file(file, ec))
-                Fatal("replay: %s not found (NFSMW_TIMEDEMO_FILE)", file.c_str());
-            fprintf(stderr, "[timedemo] replay of %s%s\n", file.c_str(),
+                Fatal("replay: %s not found (NFSMW_TIMEDEMO_FILE)", file.string().c_str());
+            fprintf(stderr, "[timedemo] replay of %s%s\n", file.string().c_str(),
                 c.uncapped ? ": uncapped, swaps released without a vblank" : "");
             if (!SaveDirOverride())
                 fprintf(stderr, "[timedemo] replay without NFSMW_SAVE_DIR: the game reads, and may autosave over, the "
                     "player's own save, and a save other than the capture's (%s) puts the replay out of step\n",
-                    Sibling(".save").c_str());
+                    Sibling(".save").string().c_str());
             const CapturedLoops& captured = Captured();
             if (captured.end)
                 fprintf(stderr, "[timedemo] the capture: race at loop %s, log to loop %u, valid until loop %s\n",
                     captured.race ? std::to_string(*captured.race).c_str() : "(none)", *captured.end,
                     captured.validUntil ? std::to_string(*captured.validUntil).c_str() : "(none)");
             else
-                fprintf(stderr, "[timedemo] no %s: the capture's loops aren't known\n", Sibling(".json").c_str());
+                fprintf(stderr, "[timedemo] no %s: the capture's loops aren't known\n", Sibling(".json").string().c_str());
         }
         if (const char* saveDir = SaveDirOverride())
             fprintf(stderr, "[timedemo] saves in %s (NFSMW_SAVE_DIR)\n", saveDir);
@@ -560,7 +560,7 @@ namespace timedemo
             fprintf(stderr, "[timedemo] capture: the game didn't write its log out within 3 s (no game frames ran): "
                 "the log ends at its last write-out%s\n", flushed.any ? std::format(", loop {}", flushed.loop).c_str() : " (none)");
         if (flushed.any && size != flushed.position)
-            fprintf(stderr, "[timedemo] capture: %s is %llu bytes, the game wrote %u\n", file.c_str(), (unsigned long long)size,
+            fprintf(stderr, "[timedemo] capture: %s is %llu bytes, the game wrote %u\n", file.string().c_str(), (unsigned long long)size,
                 flushed.position);
 
         detail::Meta meta;
@@ -590,13 +590,13 @@ namespace timedemo
         std::filesystem::path metaPath = Sibling(".json");
         if (std::string error = vfs::WriteAtomically(metaPath, json.data(), json.size()); !error.empty())
         {
-            fprintf(stderr, "[timedemo] capture: can't write %s: %s\n", metaPath.c_str(), error.c_str());
+            fprintf(stderr, "[timedemo] capture: can't write %s: %s\n", metaPath.string().c_str(), error.c_str());
             return;
         }
         auto loopText = [](const std::optional<uint32_t>& v) { return v ? std::to_string(*v) : std::string("none"); };
         fprintf(stderr, "[timedemo] capture saved: %s (%llu bytes; race at loop %s, log to loop %s, valid until loop %s) and %s\n",
-            file.c_str(), (unsigned long long)meta.size, loopText(meta.raceLoop).c_str(), loopText(meta.endLoop).c_str(),
-            loopText(meta.validUntilLoop).c_str(), metaPath.filename().c_str());
+            file.string().c_str(), (unsigned long long)meta.size, loopText(meta.raceLoop).c_str(), loopText(meta.endLoop).c_str(),
+            loopText(meta.validUntilLoop).c_str(), metaPath.filename().string().c_str());
     }
 
     bool OnSystemUi(bool shown)
@@ -668,18 +668,18 @@ PPC_FUNC(sub_823B7D90)
         uint32_t on = Load(kCapturing), log = Load(kCaptureLog);
         if (on != 1 || !log)
             Fatal("capture didn't start: [0x82A2CC88]=%u [0x82A2CC90]=%08X (the game couldn't open d:\\CaptureJoylog.jlg, "
-                "%s: see its [file] line)", on, log, file.c_str());
+                "%s: see its [file] line)", on, log, file.string().c_str());
         s_captureOn.store(true, std::memory_order_release);
-        fprintf(stderr, "[timedemo] capture on: %s\n", file.c_str());
+        fprintf(stderr, "[timedemo] capture on: %s\n", file.string().c_str());
     }
     else
     {
         uint32_t on = Load(kReplaying), log = Load(kReplayLog);
         if (on != 1 || !log)
             Fatal("replay didn't start: [0x82A2CC84]=%u [0x82A2CC8C]=%08X (the game didn't find d:\\ReplayJoylog.jlg, %s)", on,
-                log, file.c_str());
+                log, file.string().c_str());
         s_replayOn.store(true, std::memory_order_release);
-        fprintf(stderr, "[timedemo] replay on: %s (%u bytes)\n", file.c_str(), Load(log + kLogFileSize));
+        fprintf(stderr, "[timedemo] replay on: %s (%u bytes)\n", file.string().c_str(), Load(log + kLogFileSize));
     }
 }
 

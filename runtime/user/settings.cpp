@@ -1356,10 +1356,10 @@ namespace settings
         size_t fromFile = 0;
         ReadStatus status = ReadFile(path, text, readError);
         if (status == ReadStatus::Missing)
-            fprintf(stderr, "[settings] no %s yet: defaults\n", path.c_str());
+            fprintf(stderr, "[settings] no %s yet: defaults\n", path.string().c_str());
         else if (status == ReadStatus::Failed)
         {
-            fprintf(stderr, "[settings] can't read %s: %s; defaults\n", path.c_str(), readError.c_str());
+            fprintf(stderr, "[settings] can't read %s: %s; defaults\n", path.string().c_str(), readError.c_str());
             lastError = std::format("Couldn't read {}: {}. The settings are at their defaults.", path.string(), readError);
         }
         else
@@ -1405,7 +1405,7 @@ namespace settings
                 const toml::table* table = tableNode.as_table();
                 if (!table)
                 {
-                    fprintf(stderr, "[settings] %s: %s outside a table; ignored\n", path.filename().c_str(),
+                    fprintf(stderr, "[settings] %s: %s outside a table; ignored\n", path.filename().string().c_str(),
                         std::string(tableKey.str()).c_str());
                     continue;
                 }
@@ -1417,7 +1417,7 @@ namespace settings
                         if (auto v = node.as_string())
                             notices = ParseRates(v->get());
                         else
-                            fprintf(stderr, "[settings] %s: %s = %s isn't a list of rates; ignored\n", path.filename().c_str(), name.c_str(),
+                            fprintf(stderr, "[settings] %s: %s = %s isn't a list of rates; ignored\n", path.filename().string().c_str(), name.c_str(),
                                 NodeText(node).c_str());
                         continue;
                     }
@@ -1426,14 +1426,14 @@ namespace settings
                         if (auto v = node.as_string())
                             lastVersion = v->get();
                         else
-                            fprintf(stderr, "[settings] %s: %s = %s isn't a version; ignored\n", path.filename().c_str(), name.c_str(),
+                            fprintf(stderr, "[settings] %s: %s = %s isn't a version; ignored\n", path.filename().string().c_str(), name.c_str(),
                                 NodeText(node).c_str());
                         continue;
                     }
                     const Option* o = Find(tableKey.str(), key.str());
                     if (!o)
                     {
-                        fprintf(stderr, "[settings] %s: unknown key %s; ignored\n", path.filename().c_str(), name.c_str());
+                        fprintf(stderr, "[settings] %s: unknown key %s; ignored\n", path.filename().string().c_str(), name.c_str());
                         continue;
                     }
                     std::string source = std::format("{}: {} = {}", path.filename().string(), name, NodeText(node));
@@ -1445,7 +1445,7 @@ namespace settings
                 }
             }
             if (error.empty())
-                fprintf(stderr, "[settings] %s: %zu value%s from the file\n", path.c_str(), fromFile, fromFile == 1 ? "" : "s");
+                fprintf(stderr, "[settings] %s: %zu value%s from the file\n", path.string().c_str(), fromFile, fromFile == 1 ? "" : "s");
         }
 
         std::vector<Id> changed;
@@ -1512,7 +1512,7 @@ namespace settings
             fprintf(stderr, "[settings] %s\n", error.c_str());
             return false;
         }
-        fprintf(stderr, "[settings] saved %s\n", path.c_str());
+        fprintf(stderr, "[settings] saved %s\n", path.string().c_str());
         return true;
     }
 
@@ -1558,7 +1558,7 @@ namespace settings
         ReadStatus status = ReadFile(path, text, error);
         if (status == ReadStatus::Failed)
         {
-            fprintf(stderr, "[settings] the version isn't recorded: can't read %s: %s\n", path.c_str(), error.c_str());
+            fprintf(stderr, "[settings] the version isn't recorded: can't read %s: %s\n", path.string().c_str(), error.c_str());
             return false;
         }
         if (status == ReadStatus::Missing)
@@ -1616,7 +1616,7 @@ namespace settings
         ReadStatus status = ReadFile(path, text, error);
         if (status == ReadStatus::Failed)
         {
-            fprintf(stderr, "[settings] the refresh notice's %d Hz isn't recorded: can't read %s: %s\n", hz, path.c_str(), error.c_str());
+            fprintf(stderr, "[settings] the refresh notice's %d Hz isn't recorded: can't read %s: %s\n", hz, path.string().c_str(), error.c_str());
             return false;
         }
         if (status == ReadStatus::Missing)

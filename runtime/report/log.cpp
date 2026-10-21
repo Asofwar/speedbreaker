@@ -349,7 +349,7 @@ namespace report
                 break;
         }
         if (file < 0)
-            fprintf(stderr, "[log] can't create a session log in %s: %s\n", dir.c_str(), strerror(errno));
+            fprintf(stderr, "[log] can't create a session log in %s: %s\n", dir.string().c_str(), strerror(errno));
         else if (file <= 2)
         {
             // Launched with stderr (or stdin, stdout) closed, open() hands
@@ -421,7 +421,7 @@ namespace report
         // The first lines of the file.
         fprintf(stderr, "[build] SpeedBreaker %s\n", BuildString());
         if (file >= 0)
-            fprintf(stderr, "[log] session %s (pid %d): %s\n", s_sessionName, int(getpid()), s_logPath.c_str());
+            fprintf(stderr, "[log] session %s (pid %d): %s\n", s_sessionName, int(getpid()), s_logPath.string().c_str());
     }
 
     void StartLogWriter()

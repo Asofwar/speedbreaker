@@ -448,7 +448,7 @@ namespace install
                 entries.push_back(*it);
             if (ec)
             {
-                fprintf(stderr, "[install] cannot list %s: %s\n", from.c_str(), ec.message().c_str());
+                fprintf(stderr, "[install] cannot list %s: %s\n", from.string().c_str(), ec.message().c_str());
                 return false;
             }
 
@@ -471,15 +471,15 @@ namespace install
                 fs::path target = to / name;
                 if (Present(target))
                 {
-                    fprintf(stderr, "[install] cannot move %s: the new install already has %s\n", entry.path().c_str(),
-                        target.c_str());
+                    fprintf(stderr, "[install] cannot move %s: the new install already has %s\n", entry.path().string().c_str(),
+                        target.string().c_str());
                     complete = false;
                     continue;
                 }
                 fs::rename(entry.path(), target, typeEc);
                 if (typeEc)
                 {
-                    fprintf(stderr, "[install] cannot move %s into the new install: %s\n", entry.path().c_str(),
+                    fprintf(stderr, "[install] cannot move %s into the new install: %s\n", entry.path().string().c_str(),
                         typeEc.message().c_str());
                     complete = false;
                 }
@@ -495,13 +495,13 @@ namespace install
             if (!CarryOver(layout.previous, layout.destination, "", manifest))
             {
                 fprintf(stderr, "[install] kept the previous install at %s: it still holds files that could not be moved "
-                    "into %s\n", layout.previous.c_str(), layout.destination.c_str());
+                    "into %s\n", layout.previous.string().c_str(), layout.destination.string().c_str());
                 return;
             }
             std::error_code ec;
             fs::remove_all(layout.previous, ec);
             if (ec)
-                fprintf(stderr, "[install] could not delete the previous install at %s: %s\n", layout.previous.c_str(),
+                fprintf(stderr, "[install] could not delete the previous install at %s: %s\n", layout.previous.string().c_str(),
                     ec.message().c_str());
         }
 
@@ -517,7 +517,7 @@ namespace install
                 // Nothing took its place: put it back (a rename replaces an
                 // empty folder).
                 fs::rename(layout.previous, layout.destination, ec);
-                fprintf(stderr, "[install] restored %s from an interrupted reinstall%s%s\n", layout.destination.c_str(),
+                fprintf(stderr, "[install] restored %s from an interrupted reinstall%s%s\n", layout.destination.string().c_str(),
                     ec ? ": " : "", ec ? ec.message().c_str() : "");
             }
             else if (ReadInstallMarker(layout.destination))
@@ -910,7 +910,7 @@ namespace install
         platform::ios::ExcludeFromBackup(layout.destination);
 #endif
         fprintf(stderr, "[install] installed %zu files (%s) to %s\n", manifest.files.size(),
-            FormatSize(manifest.totalBytes).c_str(), layout.destination.c_str());
+            FormatSize(manifest.totalBytes).c_str(), layout.destination.string().c_str());
         return {};
     }
 

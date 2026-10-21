@@ -442,10 +442,10 @@ namespace bench
                 : s_limitLoop >= 0 ? std::format("to loop {} (the meta's {} less {})", s_limitLoop, until, kLimitMargin)
                 : std::string("to the log's end (no meta file)");
             fprintf(stderr, "[bench] armed \"%s\": from step %lld of the race, %s; %zu rows reserved; report to %s%s\n",
-                config.label.c_str(), (long long)config.from, window.c_str(), rows, s_outDir.c_str(),
+                config.label.c_str(), (long long)config.from, window.c_str(), rows, s_outDir.string().c_str(),
                 config.timeoutS > 0 ? std::format("; timeout {:.0f} s", config.timeoutS).c_str() : "; no timeout");
             if (!s_meta.found)
-                fprintf(stderr, "[bench] no meta file next to %s: race_loop isn't checked\n", timedemo::File().c_str());
+                fprintf(stderr, "[bench] no meta file next to %s: race_loop isn't checked\n", timedemo::File().string().c_str());
 
             if (!config.shots.empty())
             {
@@ -456,7 +456,7 @@ namespace bench
                     s_shots[i].step = config.shots[i];
                     steps += (i ? "," : "") + std::to_string(config.shots[i]);
                 }
-                fprintf(stderr, "[bench] shots at steps %s, into %s\n", steps.c_str(), s_outDir.c_str());
+                fprintf(stderr, "[bench] shots at steps %s, into %s\n", steps.c_str(), s_outDir.string().c_str());
             }
 
             s_deadline = std::chrono::steady_clock::now()
@@ -543,7 +543,7 @@ namespace bench
                 shot.why = failed;
                 if (failed.empty())
                     fprintf(stderr, "[bench] shot %lld: frame at loop %u (step %lld), swap %llu: %s (%ux%u)\n", (long long)step, shot.loop,
-                        (long long)shot.frameStep, (unsigned long long)shot.swap, path.c_str(), width, height);
+                        (long long)shot.frameStep, (unsigned long long)shot.swap, path.string().c_str(), width, height);
                 else
                     fprintf(stderr, "[bench] shot %lld: %s\n", (long long)step, failed.c_str());
             }
@@ -579,7 +579,7 @@ namespace bench
                 shot.shownHeight = frame.height;
                 shot.shownWhy = failed;
                 if (failed.empty())
-                    fprintf(stderr, "[bench] shot %lld as shown: %s (%ux%u)\n", (long long)step, path.c_str(), frame.width, frame.height);
+                    fprintf(stderr, "[bench] shot %lld as shown: %s (%ux%u)\n", (long long)step, path.string().c_str(), frame.width, frame.height);
                 else
                     fprintf(stderr, "[bench] shot %lld as shown: %s\n", (long long)step, failed.c_str());
             }
@@ -667,13 +667,13 @@ namespace bench
             FILE* f = fopen(path.c_str(), "wb");
             if (!f)
             {
-                fprintf(stderr, "[bench] can't write %s: %s\n", path.c_str(), strerror(errno));
+                fprintf(stderr, "[bench] can't write %s: %s\n", path.string().c_str(), strerror(errno));
                 return false;
             }
             bool ok = fwrite(text.data(), 1, text.size(), f) == text.size();
             ok = fclose(f) == 0 && ok;
             if (!ok)
-                fprintf(stderr, "[bench] writing %s failed: %s\n", path.c_str(), strerror(errno));
+                fprintf(stderr, "[bench] writing %s failed: %s\n", path.string().c_str(), strerror(errno));
             return ok;
         }
 
@@ -1052,7 +1052,7 @@ namespace bench
             std::filesystem::create_directories(s_outDir, error);
             bool written = !error;
             if (error)
-                fprintf(stderr, "[bench] can't create %s: %s\n", s_outDir.c_str(), error.message().c_str());
+                fprintf(stderr, "[bench] can't create %s: %s\n", s_outDir.string().c_str(), error.message().c_str());
             else
             {
                 written = WriteFile(s_outDir / "summary.json", json.Finish()) && written;
@@ -1076,7 +1076,7 @@ namespace bench
                 " | wait %.1f ms | trace %.4s..%s%s | %s%s\n",
                 config.label.c_str(), StatusName(status), mains.size(), mainSeconds, timedemoFps, frames.low1Fps,
                 frames.p50, frames.p99, frames.max, waitTotalMs, traceHex.c_str(), traceHex.substr(14).c_str(), why.c_str(),
-                s_outDir.c_str(), written ? "" : " (not written)");
+                s_outDir.string().c_str(), written ? "" : " (not written)");
 
             s_status.store(status, std::memory_order_release);
             if (config.exit)

@@ -164,7 +164,7 @@ namespace install
         {
             std::optional<std::string> marker = ReadInstallMarker(user);
             fprintf(stderr, "[install] %s is not a current install (marker %s, manifest %.*s): reinstall\n",
-                user.c_str(), marker ? marker->c_str() : "missing", int(manifest.version.size()), manifest.version.data());
+                user.string().c_str(), marker ? marker->c_str() : "missing", int(manifest.version.size()), manifest.version.data());
         }
         return std::nullopt;
     }

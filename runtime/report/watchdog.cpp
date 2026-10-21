@@ -263,9 +263,9 @@ namespace report
             }
             detail::KeepNewest(dir.string(), "hang-", ".txt", 5);
             if (saved)
-                fprintf(stderr, "[hang] %s. Hang report: %s\n", reason.c_str(), path.c_str());
+                fprintf(stderr, "[hang] %s. Hang report: %s\n", reason.c_str(), path.string().c_str());
             else
-                fprintf(stderr, "[hang] %s. Couldn't write the hang report to %s\n", reason.c_str(), path.c_str());
+                fprintf(stderr, "[hang] %s. Couldn't write the hang report to %s\n", reason.c_str(), path.string().c_str());
             ui::Toast(std::format("The game seems to have stopped. A hang report was saved; to send it: {}.", detail::kSaveBugReportHint), 20.0);
         }
 

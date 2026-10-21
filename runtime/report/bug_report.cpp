@@ -340,7 +340,7 @@ namespace report
             // no): the data folder, where the logs are, is ours.
             if (!failed.empty() && !std::getenv("NFSMW_BUG_REPORT_DIR") && folder != GetUserPath())
             {
-                fprintf(stderr, "[bugreport] couldn't save in %s (%s); trying the data folder\n", folder.c_str(), failed.c_str());
+                fprintf(stderr, "[bugreport] couldn't save in %s (%s); trying the data folder\n", folder.string().c_str(), failed.c_str());
                 std::filesystem::path fallback = GetUserPath();
                 std::filesystem::path fallbackPath = fallback / path.filename();
                 if (std::string again = saveTo(fallback, fallbackPath); again.empty())
@@ -362,7 +362,7 @@ namespace report
             double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
             std::string size = archive.size() < (1 << 20) ? std::format("{} KB", (archive.size() + 1023) >> 10)
                                                           : std::format("{:.1f} MB", double(archive.size()) / (1 << 20));
-            fprintf(stderr, "[bugreport] saved %s (%zu files, %s, %.1f s)\n", path.c_str(), zip.Entries(), size.c_str(), seconds);
+            fprintf(stderr, "[bugreport] saved %s (%zu files, %s, %.1f s)\n", path.string().c_str(), zip.Entries(), size.c_str(), seconds);
             std::string where = Describe(path);
             SetMessage("Saved to " + where);
             s_state.store(BugReportState::Saved);

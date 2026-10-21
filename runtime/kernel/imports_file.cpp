@@ -331,7 +331,7 @@ uint32_t NtCreateFile(be<uint32_t>* handleOut, uint32_t desiredAccess, XOBJECT_A
             if (file->fd < 0)
             {
                 fprintf(stderr, "[file] open \"%s\": can't write %s: %s\n", guestPath->c_str(),
-                    staged ? staged->temp.c_str() : resolved->host.c_str(), strerror(error));
+                    staged ? staged->temp.string().c_str() : resolved->host.string().c_str(), strerror(error));
                 DestroyKernelObject(file);
                 return fail(STATUS_ACCESS_DENIED, 0);
             }
@@ -349,7 +349,7 @@ uint32_t NtCreateFile(be<uint32_t>* handleOut, uint32_t desiredAccess, XOBJECT_A
     }
 
     *handleOut = GetKernelHandle(file);
-    fprintf(stderr, "[file] open \"%s\" -> %s%s\n", guestPath->c_str(), resolved->host.c_str(),
+    fprintf(stderr, "[file] open \"%s\" -> %s%s\n", guestPath->c_str(), resolved->host.string().c_str(),
         action == FILE_CREATED ? " (created)" : "");
     Complete(iosb, STATUS_SUCCESS, action);
     return STATUS_SUCCESS;

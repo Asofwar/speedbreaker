@@ -517,7 +517,7 @@ namespace report
             s_reportFd = marker::Arm(s_pendingPath);
         }
         if (s_reportFd < 0)
-            fprintf(stderr, "[crash] can't prepare a crash report file in %s: %s\n", dir.c_str(), strerror(errno));
+            fprintf(stderr, "[crash] can't prepare a crash report file in %s: %s\n", dir.string().c_str(), strerror(errno));
         UseCrashStack();
 
         std::string header = std::format(
@@ -707,7 +707,7 @@ namespace report
         }
         if (seen == newest)
             return;
-        fprintf(stderr, "[crash] an earlier session crashed: %s\n", (dir / newest).c_str());
+        fprintf(stderr, "[crash] an earlier session crashed: %s\n", (dir / newest).string().c_str());
         ui::Toast(std::format("The game crashed last time and saved a crash report. To send it: {}.", detail::kSaveBugReportHint), 15.0);
         std::ofstream out(seenPath, std::ios::trunc);
         out << newest << "\n";

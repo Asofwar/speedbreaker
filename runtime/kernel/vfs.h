@@ -156,14 +156,19 @@ namespace vfs
     }
 
     // Flushes a folder's entries (a rename or a new file in it). Best
-    // effort: some file systems refuse fsync on a directory.
+    // effort: some file systems refuse fsync on a directory. Windows has no
+    // such call: its rename (compat/win) writes through instead.
     inline void SyncDirectory(const std::filesystem::path& dir)
     {
+#ifdef _WIN32
+        (void)dir;
+#else
         if (int fd = open(dir.empty() ? "." : dir.c_str(), O_RDONLY | O_CLOEXEC); fd >= 0)
         {
             fsync(fd);
             close(fd);
         }
+#endif
     }
 
     // Puts `temp`, flushed already, in place of `target` and flushes the
@@ -438,7 +443,7 @@ namespace vfs
                 error = ReplaceDurably(from, staged.target);
             if (error)
             {
-                fprintf(stderr, "[vfs] %s not saved (%s): the previous file is kept\n", staged.target.c_str(),
+                fprintf(stderr, "[vfs] %s not saved (%s): the previous file is kept\n", staged.target.string().c_str(),
                     staged.failed ? "a write to it failed" : strerror(error));
                 if (last || !staged.failed)
                     unlink(from.c_str());  // (not the rewrite itself while it goes on)
