@@ -57,8 +57,10 @@
 #define ESRCH 3
 #endif
 
+// A bit of its own (Linux's value), for sockets' fcntl (compat/win/sb_net.h);
+// open() leaves it out.
 #ifndef O_NONBLOCK
-#define O_NONBLOCK 0
+#define O_NONBLOCK 0x800
 #endif
 #ifndef EDQUOT
 #define EDQUOT 122
@@ -72,6 +74,8 @@
 #ifndef SIGURG
 #define SIGURG 23
 #endif
+#define F_GETFL 3
+#define F_SETFL 4
 #define F_SETFD 2
 #define FD_CLOEXEC 1
 #define F_DUPFD_CLOEXEC 1030
@@ -107,15 +111,29 @@ inline int sigaction(int, const struct sigaction*, struct sigaction* old)
 inline int kill(int, int) { errno = ESRCH; return -1; }
 inline int fsync(int fd) { return _commit(fd); }
 inline int pipe(int fds[2]) { return _pipe(fds, 1 << 16, _O_BINARY); }
+namespace sbnet
+{
+    int Fcntl(int fd, int cmd, long arg);  // compat/win/win_net.cpp
+}
 inline int fcntl(int fd, int cmd, ...)
 {
+    long arg = 0;
+    if (cmd == F_SETFL || cmd == F_DUPFD_CLOEXEC)
+    {
+        va_list ap;
+        va_start(ap, cmd);
+        arg = va_arg(ap, int);
+        va_end(ap);
+    }
+    if (cmd == F_GETFL || cmd == F_SETFL)
+        return sbnet::Fcntl(fd, cmd, arg);
     if (cmd == F_DUPFD_CLOEXEC) return dup(fd);
     return 0;
 }
 // Windows paths are wide: std::filesystem::path::c_str() is a wchar_t*.
 inline int _stat64(const wchar_t* p, struct _stat64* st) { return _wstat64(p, st); }
-inline int open(const wchar_t* p, int flags, int mode = 0) { return _wopen(p, flags | _O_BINARY, mode); }
-inline int open(const char* p, int flags, int mode = 0) { return _open(p, flags | _O_BINARY, mode); }
+inline int open(const wchar_t* p, int flags, int mode = 0) { return _wopen(p, (flags & ~O_NONBLOCK) | _O_BINARY, mode); }
+inline int open(const char* p, int flags, int mode = 0) { return _open(p, (flags & ~O_NONBLOCK) | _O_BINARY, mode); }
 inline FILE* fopen(const wchar_t* p, const char* mode)
 {
     std::wstring w;
@@ -125,7 +143,9 @@ inline FILE* fopen(const wchar_t* p, const char* mode)
 inline int access(const wchar_t* p, int mode) { return _waccess(p, mode & 6); }
 inline int mkdir(const wchar_t* p, int) { return _wmkdir(p); }
 inline int unlink(const wchar_t* p) { return _wunlink(p); }
-inline int rename(const wchar_t* a, const wchar_t* b) { return _wrename(a, b); }
+// POSIX's rename: replaces `b` if it is there (_wrename fails then, and every
+// atomic save after the first would). compat/win/win_compat.cpp.
+int rename(const wchar_t* a, const wchar_t* b);
 inline int remove(const wchar_t* p) { return _wremove(p); }
 ssize_t pread(int fd, void* buf, size_t count, long long offset);
 ssize_t pwrite(int fd, const void* buf, size_t count, long long offset);
@@ -134,6 +154,14 @@ ssize_t pwrite(int fd, const void* buf, size_t count, long long offset);
 inline int flock(int, int) { return 0; }
 struct ucontext_t { int unused; };
 inline struct tm* localtime_r(const time_t* t, struct tm* out) { return localtime_s(out, t) == 0 ? out : nullptr; }
+inline struct tm* gmtime_r(const time_t* t, struct tm* out) { return gmtime_s(out, t) == 0 ? out : nullptr; }
+inline int setenv(const char* name, const char* value, int overwrite)
+{
+    if (!overwrite && std::getenv(name))
+        return 0;
+    return _putenv_s(name, value) == 0 ? 0 : -1;
+}
+inline int unsetenv(const char* name) { return _putenv_s(name, "") == 0 ? 0 : -1; }
 }
 #endif
 #endif

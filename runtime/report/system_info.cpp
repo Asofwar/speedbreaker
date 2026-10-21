@@ -17,6 +17,9 @@
 
 #include <sys/utsname.h>
 #include <unistd.h>
+#ifdef _WIN32
+#include <compat/win/win_sys.h>
+#endif
 #ifdef __APPLE__
 #include <sys/sysctl.h>
 #endif
@@ -113,6 +116,9 @@ namespace report
 
         std::string OsText()
         {
+#ifdef _WIN32
+            return winsys::OsDescription() + ", x86_64";
+#endif
             struct utsname u{};
             uname(&u);
             std::string kernel = std::format("{} {} {}", u.sysname, u.release, u.machine);
@@ -139,6 +145,9 @@ namespace report
             return Sysctl("hw.machine");  // e.g. iPad14,6 (hw.model is the board name)
 #elif defined(__APPLE__)
             return Sysctl("hw.model");
+#elif defined(_WIN32)
+            constexpr const char* kBios = "HARDWARE\\DESCRIPTION\\System\\BIOS";
+            return Trim(winsys::MachineRegistryString(kBios, "SystemManufacturer") + " " + winsys::MachineRegistryString(kBios, "SystemProductName"));
 #else
             std::string vendor = Trim(ReadFile("/sys/class/dmi/id/sys_vendor", 256));
             std::string product = Trim(ReadFile("/sys/class/dmi/id/product_name", 256));
@@ -163,6 +172,12 @@ namespace report
             if (perf > 0 && eff > 0)
                 return std::format("{}, {} performance + {} efficiency cores", model, perf, eff);
             return std::format("{}, {} cores / {} threads", model, SysctlInt("hw.physicalcpu"), logical);
+#elif defined(_WIN32)
+            std::string model = Trim(winsys::MachineRegistryString("HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", "ProcessorNameString"));
+            const unsigned cores = winsys::PhysicalCores();
+            if (!cores)
+                return std::format("{}, {} threads", model.empty() ? "unknown CPU" : model, logical);
+            return std::format("{}, {} cores / {} threads", model.empty() ? "unknown CPU" : model, cores, logical);
 #else
             std::string info = ReadFile("/proc/cpuinfo", 4 << 20);
             std::string model;
@@ -194,6 +209,10 @@ namespace report
             constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
 #ifdef __APPLE__
             return std::format("{:.1f} GB", double(SysctlInt("hw.memsize")) / kGiB);
+#elif defined(_WIN32)
+            const winsys::Memory m = winsys::MemoryStatus();
+            return std::format("{:.1f} GB ({:.1f} GB available at startup), page file {:.1f} GB", double(m.total) / kGiB,
+                double(m.available) / kGiB, double(m.pageFile) / kGiB);
 #else
             std::string info = ReadFile("/proc/meminfo");
             auto field = [&](const char* key) -> double {

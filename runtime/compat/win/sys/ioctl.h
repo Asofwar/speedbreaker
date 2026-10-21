@@ -1,3 +1,8 @@
 #pragma once
 #define FIONREAD 0x541B
-inline int ioctl(int, unsigned long, int*) { return -1; }
+namespace sbnet
+{
+    int Ioctl(int fd, unsigned long request, int* value);  // compat/win/win_net.cpp
+}
+// A socket's FIONREAD.
+inline int ioctl(int fd, unsigned long request, int* value) { return sbnet::Ioctl(fd, request, value); }

@@ -11,6 +11,7 @@
 #include "stdafx.h"
 #ifdef _WIN32
 #include <compat/win/win_mem.h>
+#include <compat/win/win_sys.h>
 #endif
 #include "kernel/arena.h"
 #include "kernel/memory_status.h"
@@ -348,6 +349,19 @@ namespace
     }
 }
 
+#ifdef _WIN32
+// Windows: the write watch's access violations, from a vectored exception
+// handler (compat/win/win_compat.cpp), as SIGSEGV's handler takes them
+// elsewhere.
+static void InstallFaultHandler()
+{
+    winseh::Install([](const void* address, bool write, const void* pc) {
+        writewatch::t_faultPc = pc;
+        return writewatch::HandleFault(address, write);
+    });
+}
+#endif
+
 int main(int argc, char** argv)
 {
 #if defined(__APPLE__) && TARGET_OS_IOS
@@ -432,10 +446,8 @@ int main(int argc, char** argv)
     report::PrepareCrashReports();
 #ifdef _WIN32
     _fmode = _O_BINARY;
-    winseh::Install([](const void* address, bool write, const void* pc) {
-        writewatch::t_faultPc = pc;
-        return writewatch::HandleFault(address, write);
-    });
+    winsys::PreciseTimers();
+    InstallFaultHandler();
 #else
     struct sigaction sa{};
     sa.sa_sigaction = CrashHandler;

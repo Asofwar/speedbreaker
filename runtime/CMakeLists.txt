@@ -14,9 +14,19 @@ target_include_directories(XenonUtilsLite PUBLIC ${XR}/XenonUtils ${XR}/thirdpar
     PRIVATE ${XR}/thirdparty/libmspack/libmspack/mspack ${XR}/thirdparty/tiny-AES-c ${XR}/thirdparty/TinySHA1)
 target_compile_definitions(XenonUtilsLite PRIVATE NOMINMAX)
 target_compile_options(XenonUtilsLite PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-include cstdlib>)
+if(WIN32)
+    # XenonUtils' <Windows.h>, on a case-sensitive file system (compat/win/sdk).
+    target_include_directories(XenonUtilsLite PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/compat/win/sdk)
+endif()
 
 file(GLOB_RECURSE RUNTIME_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*.cpp)
 list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/thirdparty/")
+if(WIN32)
+    # C: compat/win/win_sleep.c replaces winpthreads' nanosleep.
+    list(APPEND RUNTIME_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/compat/win/win_sleep.c)
+else()
+    list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/compat/win/")
+endif()
 # Nayuki's QR Code generator (thirdparty/qrcodegen, vendored, C): the
 # download page's code in Check for Updates. Part of the runtime itself, not
 # a library of its own, so the iOS app (scripts/ios/build.sh) links it too.
@@ -57,7 +67,7 @@ if(WIN32)
     target_compile_options(SpeedBreaker PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/compat/win/win_compat.h>")
     target_compile_definitions(SpeedBreaker PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00 _FILE_OFFSET_BITS=64)
     target_link_options(SpeedBreaker PRIVATE -fuse-ld=lld -static -static-libgcc -static-libstdc++)
-    target_link_libraries(SpeedBreaker PRIVATE -Wl,--start-group -lstdc++ -lwinpthread -Wl,--end-group ws2_32 winmm imm32 version setupapi ole32 oleaut32 uuid shlwapi bcrypt advapi32 shell32 user32 gdi32 dbghelp cfgmgr32 hid)
+    target_link_libraries(SpeedBreaker PRIVATE -Wl,--start-group -lstdc++ -lwinpthread -Wl,--end-group ws2_32 iphlpapi synchronization winmm imm32 version setupapi ole32 oleaut32 uuid shlwapi bcrypt advapi32 shell32 user32 gdi32 dbghelp cfgmgr32 hid)
 endif()
 find_package(SDL3 REQUIRED CONFIG)
 if(IOS)

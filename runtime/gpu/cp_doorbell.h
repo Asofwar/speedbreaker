@@ -42,6 +42,9 @@
 #include <chrono>
 #include <cstdint>
 #include <thread>
+#ifdef _WIN32
+#include <compat/win/win_sys.h>
+#endif
 #ifdef __linux__
 #include <linux/futex.h>
 #include <sys/syscall.h>
@@ -54,7 +57,7 @@ namespace gpu
     class alignas(64) Doorbell
     {
     public:
-#ifdef __linux__
+#if defined(__linux__) || defined(_WIN32)
         static constexpr bool kBlocking = true;
 #else
         static constexpr bool kBlocking = false;
@@ -95,6 +98,8 @@ namespace gpu
                 // Returns at once when the count has moved on (EAGAIN), when
                 // woken, at the timeout, or on a signal (EINTR).
                 syscall(SYS_futex, Word(), FUTEX_WAIT_PRIVATE, rings, &ts, nullptr, 0);
+#elif defined(_WIN32)
+                winsys::WaitOnValue(Word(), rings, timeout.count());
 #else
                 std::this_thread::sleep_for(timeout);
 #endif
@@ -121,6 +126,8 @@ namespace gpu
         {
 #ifdef __linux__
             syscall(SYS_futex, Word(), FUTEX_WAKE_PRIVATE, 1, nullptr, nullptr, 0);
+#elif defined(_WIN32)
+            winsys::WakeOne(Word());
 #endif
         }
 
@@ -172,6 +179,8 @@ namespace gpu
 #ifdef __linux__
                 struct timespec ts{ time_t(timeout.count() / 1'000'000'000), long(timeout.count() % 1'000'000'000) };
                 syscall(SYS_futex, Word(), FUTEX_WAIT_PRIVATE, rings, &ts, nullptr, 0);
+#elif defined(_WIN32)
+                winsys::WaitOnValue(Word(), rings, timeout.count());
 #else
                 std::this_thread::sleep_for(timeout);
 #endif
@@ -184,6 +193,8 @@ namespace gpu
         {
 #ifdef __linux__
             syscall(SYS_futex, Word(), FUTEX_WAKE_PRIVATE, 0x7FFFFFFF, nullptr, nullptr, 0);
+#elif defined(_WIN32)
+            winsys::WakeAll(Word());
 #endif
         }
 

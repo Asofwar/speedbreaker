@@ -36,7 +36,7 @@ inline std::filesystem::path GetGamePath()
 // speedbreaker (Linux), nfsmw-recomp until 2026-10. MigrateUserFolders
 // (user/paths.cpp, first thing at startup) renames an old folder; where that
 // fails, the old one is used as it is.
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(_WIN32)
 inline constexpr const char* kUserFolderName = "SpeedBreaker";
 #else
 inline constexpr const char* kUserFolderName = "speedbreaker";
@@ -73,9 +73,20 @@ inline const char* XdgBaseDir(const char* name)
 //   iOS: the same in the app's container; $XDG_DATA_HOME and
 //        $XDG_CACHE_HOME when set (test runs: iOS sets HOME itself)
 //   Linux: $XDG_DATA_HOME or ~/.local/share, $XDG_CACHE_HOME or ~/.cache
-// (the XDG variables only when absolute: XdgBaseDir).
+//   (the XDG variables only when absolute: XdgBaseDir)
+//   Windows: %LOCALAPPDATA% (not roaming: the installed game is in it);
+//   the cache in a folder of SpeedBreaker's own there (HomeCachePath)
 inline std::filesystem::path UserDataBase()
 {
+#ifdef _WIN32
+    // Wide: the narrow environment is in the ANSI code page, which can't
+    // spell every user name.
+    if (const wchar_t* local = _wgetenv(L"LOCALAPPDATA"); local && *local)
+        return local;
+    if (const wchar_t* profile = _wgetenv(L"USERPROFILE"); profile && *profile)
+        return std::filesystem::path(profile) / "AppData" / "Local";
+    return ".";
+#endif
     const char* home = std::getenv("HOME");
     std::filesystem::path base = home ? home : ".";
 #ifdef __APPLE__
@@ -117,7 +128,11 @@ inline std::filesystem::path HomeUserPath()
 
 inline std::filesystem::path HomeCachePath()
 {
+#ifdef _WIN32
+    return UserDataBase() / CacheFolderName() / "cache";
+#else
     return CacheBase() / CacheFolderName();
+#endif
 }
 
 // Per-user data: saves, settings, logs and (by default) the installed game.
